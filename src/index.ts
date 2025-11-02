@@ -130,14 +130,24 @@ export class Agent {
       if (toolCalls.length === 0) break;
 
       // ---- parallel local tools (file-system only) ----
-      const results = await Promise.allSettled(
-        toolCalls.map(async (call) => {
-          yield { type: "tool_call_start", data: { tool_name: call.name, tool_args: call.args } };
-          const out = await this.runTool(call.name, call.args);
-          yield { type: "tool_result", data: { result: out, execution_time_ms: 0 } };
-          return { call, out };
-        })
-      );
+      const toolPromises = toolCalls.map(async (call) => {
+        const out = await this.runTool(call.name, call.args);
+        return { call, out };
+      });
+
+      // Yield tool call events before executing
+      for (const call of toolCalls) {
+        yield { type: "tool_call_start", data: { tool_name: call.name, tool_args: call.args } };
+      }
+
+      const results = await Promise.allSettled(toolPromises);
+
+      // Yield results after execution
+      for (const r of results) {
+        if (r.status === "fulfilled") {
+          yield { type: "tool_result", data: { result: r.value.out, execution_time_ms: 0 } };
+        }
+      }
 
       history.push({ role: "model", parts: [{ text: chunkText }] });
       for (const r of results) {

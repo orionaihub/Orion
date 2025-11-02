@@ -3,12 +3,22 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Suna-like Agent – Free-Tier</title>
-  <link rel="stylesheet" href="styles.css" /> <!-- same CSS file, no changes -->
+  <title>Suna Agent – Free Tier</title>
+  <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
   <div class="app-container">
-    <!-- sidebar id/mode buttons identical -->
+    <!-- SIDEBAR -->
+    <div id="sidebar" class="sidebar">
+      <div class="sidebar-header">
+        <h2>💬 Chats</h2>
+        <button id="new-chat-btn" title="New chat">＋</button>
+      </div>
+      <div id="sessions-list" class="sessions-list"></div>
+      <button id="toggle-sidebar-btn" class="toggle-sidebar">☰</button>
+    </div>
+
+    <!-- MAIN CHAT AREA -->
     <div class="main-area">
       <div class="chat-header">
         <div style="display:flex;align-items:center;gap:1rem">
@@ -30,7 +40,12 @@
     </div>
   </div>
 
-  <!-- traces panel identical -->
+  <!-- TRACES PANEL -->
+  <div id="traces-panel" class="traces-panel">
+    <button id="traces-close-btn" title="Close">✕</button>
+    <div id="traces-content"></div>
+  </div>
+
   <script src="chat.js"></script>
 </body>
 </html>

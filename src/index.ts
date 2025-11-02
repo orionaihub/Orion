@@ -1,11 +1,6 @@
 /**
- * Suna-like Autonomous Agent – Cloudflare Workers Free Tier
- *  - Sequential tool execution (one at a time)
- *  - Respects 10ms CPU wall time by yielding to event loop
- *  - Persistent workspace via Durable Object SQLite
- *  - Gemini 2.0 Flash with native search & code execution
- *  - Proper error handling & streaming
- *  - 30s wall-clock timeout for free tier
+ * Suna Autonomous Agent - Cloudflare Workers Free Tier
+ * Sequential execution, CPU compliant, NO YIELD ERRORS
  */
 
 import { GoogleGenerativeAI, GenerativeModel } from "@google/generative-ai";
@@ -17,12 +12,11 @@ export interface Env {
   CLOUDFLARE_AI_GATEWAY_NAME?: string;
 }
 
-// ---------- MAIN WORKER -----------------------------------------------------
+// ---------- WORKER ----------------------------------------------------------
 export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(req.url);
 
-    // API routes
     if (url.pathname === "/api/agent" && req.method === "POST") {
       const sessionId = getSessionId(req) ?? crypto.randomUUID();
       const id = env.Agent.idFromName(sessionId);
@@ -90,12 +84,10 @@ export default {
       });
     }
 
-    // Let Cloudflare serve static assets from /public directory
     return env.ASSETS.fetch(req);
   },
 } satisfies ExportedHandler<Env>;
 
-// ---------- HELPERS ---------------------------------------------------------
 function getSessionId(req: Request): string | null {
   const c = req.headers.get("Cookie");
   if (!c) return null;
@@ -103,29 +95,11 @@ function getSessionId(req: Request): string | null {
   return m ? m[1] : null;
 }
 
-// Helper to yield control back to event loop (respects 10ms CPU limit)
-async function yieldToEventLoop(): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, 0));
+async function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// ---------- TYPES -----------------------------------------------------------
-interface StreamEvent {
-  type: string;
-  data?: any;
-}
-
-interface ConversationPart {
-  text?: string;
-  functionCall?: { name: string; args: Record<string, any> };
-  functionResponse?: { name: string; response: any };
-}
-
-interface HistoryItem {
-  role: "user" | "model" | "function";
-  parts: ConversationPart[];
-}
-
-// ---------- DURABLE OBJECT ---------------------------------------------------
+// ---------- DURABLE OBJECT --------------------------------------------------
 export class Agent {
   private sql: SqlStorage;
   private model: GenerativeModel | null = null;
@@ -157,18 +131,18 @@ export class Agent {
     this.cleanupOldTraces();
   }
 
-  // ======  PUBLIC API  ========================================================
-  async *fetchAgentStream(userPrompt: string): AsyncGenerator<StreamEvent> {
+  // === MAIN GENERATOR (ONLY PLACE WITH YIELD) ================================
+  async *fetchAgentStream(userPrompt: string): AsyncGenerator<any> {
     const startTime = Date.now();
     const maxIter = 15;
-    const wallClockTimeout = 28_000;
+    const timeout = 28000;
 
     yield { type: "start", data: { ts: startTime, prompt: userPrompt } };
     this.logTrace(startTime, "user", userPrompt);
 
     try {
       const model = this.getModel();
-      const history: HistoryItem[] = [];
+      const history: any[] = [];
       let iter = 0;
       let fullResponse = "";
 
@@ -176,89 +150,56 @@ export class Agent {
         iter++;
         yield { type: "iteration", data: { iteration: iter } };
 
-        if (Date.now() - startTime > wallClockTimeout) {
-          yield {
-            type: "warning",
-            data: { reason: "Approaching 30s wall-clock timeout", elapsed: Date.now() - startTime },
-          };
+        if (Date.now() - startTime > timeout) {
+          yield { type: "warning", data: { reason: "Timeout approaching", elapsed: Date.now() - startTime } };
           break;
         }
 
-        await yieldToEventLoop();
+        await sleep(0);
 
         const prompt = iter === 1 ? userPrompt : "";
-        const { response, chunks } = await this.streamWithChunks(model, history, prompt);
+        const streamResult = await this.streamResponse(model, history, prompt);
 
-        for (const chunk of chunks) {
+        for (const chunk of streamResult.chunks) {
           yield { type: "response_chunk", data: { text: chunk } };
           fullResponse += chunk;
         }
 
-        await yieldToEventLoop();
+        await sleep(0);
 
-        const functionCalls = response.functionCalls();
+        const fnCalls = streamResult.response.functionCalls();
         
-        if (!functionCalls || functionCalls.length === 0) {
+        if (!fnCalls || fnCalls.length === 0) {
           yield { type: "complete", data: { final_response: fullResponse } };
           break;
         }
 
         history.push({
           role: "model",
-          parts: functionCalls.map((fc) => ({
+          parts: fnCalls.map((fc: any) => ({
             functionCall: { name: fc.name, args: fc.args },
           })),
         });
 
-        const toolResults: Array<{ name: string; response: any; execution_time_ms: number }> = [];
+        const toolResults = [];
 
-        for (const fc of functionCalls) {
-          yield {
-            type: "function_call",
-            data: { name: fc.name, args: fc.args },
-          };
+        for (const fc of fnCalls) {
+          yield { type: "function_call", data: { name: fc.name, args: fc.args } };
 
-          await yieldToEventLoop();
+          await sleep(0);
 
-          const toolStart = Date.now();
-          try {
-            const result = await this.executeTool(fc.name, fc.args);
-            const toolResult = {
-              name: fc.name,
-              response: { success: true, result },
-              execution_time_ms: Date.now() - toolStart,
-            };
-            toolResults.push(toolResult);
+          const result = await this.runTool(fc.name, fc.args);
+          toolResults.push(result);
 
-            yield {
-              type: "function_result",
-              data: toolResult,
-            };
-          } catch (error) {
-            const err = error as Error;
-            const toolResult = {
-              name: fc.name,
-              response: { success: false, error: err.message },
-              execution_time_ms: Date.now() - toolStart,
-            };
-            toolResults.push(toolResult);
+          yield { type: "function_result", data: result };
 
-            yield {
-              type: "function_result",
-              data: toolResult,
-            };
-          }
-
-          await yieldToEventLoop();
+          await sleep(0);
         }
 
         history.push({
           role: "function",
-          parts: toolResults.map((result) => ({
-            functionResponse: {
-              name: result.name,
-              response: result.response,
-            },
+          parts: toolResults.map((r) => ({
+            functionResponse: { name: r.name, response: r.response },
           })),
         });
       }
@@ -268,23 +209,16 @@ export class Agent {
 
       yield {
         type: "done",
-        data: {
-          iterations: iter,
-          elapsed: endTime - startTime,
-          response_length: fullResponse.length,
-        },
+        data: { iterations: iter, elapsed: endTime - startTime, response_length: fullResponse.length },
       };
     } catch (error) {
       const err = error as Error;
-      yield {
-        type: "error",
-        data: { message: err.message, stack: err.stack },
-      };
+      yield { type: "error", data: { message: err.message, stack: err.stack } };
       this.logTrace(Date.now(), "error", err.message);
     }
   }
 
-  // ======  GEMINI INTEGRATION  ===============================================
+  // === HELPER METHODS (NO YIELD HERE) ========================================
   private getModel(): GenerativeModel {
     if (this.model) return this.model;
 
@@ -298,68 +232,51 @@ export class Agent {
       {
         model: "gemini-2.0-flash-exp",
         systemInstruction:
-          "You are Suna, an autonomous AI assistant. You have access to a persistent file system and can use tools to help accomplish user goals. " +
-          "When working with files, always use absolute paths or paths relative to the current directory. " +
-          "Use the available tools step by step to complete tasks efficiently. " +
-          "Call only ONE tool at a time - do not make parallel function calls.",
+          "You are Suna, an autonomous AI assistant with a persistent file system. " +
+          "Use tools step by step. Call only ONE tool at a time.",
         tools: [
           {
             functionDeclarations: [
               {
                 name: "read_file",
-                description: "Read the contents of a file from the persistent workspace",
+                description: "Read a file from the workspace",
                 parameters: {
                   type: "OBJECT" as const,
                   properties: {
-                    path: {
-                      type: "STRING" as const,
-                      description: "The path to the file to read",
-                    },
+                    path: { type: "STRING" as const, description: "File path" },
                   },
                   required: ["path"],
                 },
               },
               {
                 name: "write_file",
-                description: "Write or update a file in the persistent workspace",
+                description: "Write or update a file",
                 parameters: {
                   type: "OBJECT" as const,
                   properties: {
-                    path: {
-                      type: "STRING" as const,
-                      description: "The path where the file should be written",
-                    },
-                    content: {
-                      type: "STRING" as const,
-                      description: "The content to write to the file",
-                    },
+                    path: { type: "STRING" as const, description: "File path" },
+                    content: { type: "STRING" as const, description: "File content" },
                   },
                   required: ["path", "content"],
                 },
               },
               {
                 name: "list_files",
-                description: "List all files in the workspace, optionally filtered by path prefix",
+                description: "List files in workspace",
                 parameters: {
                   type: "OBJECT" as const,
                   properties: {
-                    prefix: {
-                      type: "STRING" as const,
-                      description: "Optional path prefix to filter files (e.g., 'src/' to list files in src directory)",
-                    },
+                    prefix: { type: "STRING" as const, description: "Path prefix filter" },
                   },
                 },
               },
               {
                 name: "delete_file",
-                description: "Delete a file from the workspace",
+                description: "Delete a file",
                 parameters: {
                   type: "OBJECT" as const,
                   properties: {
-                    path: {
-                      type: "STRING" as const,
-                      description: "The path to the file to delete",
-                    },
+                    path: { type: "STRING" as const, description: "File path" },
                   },
                   required: ["path"],
                 },
@@ -376,32 +293,40 @@ export class Agent {
     return this.model;
   }
 
-  private async streamWithChunks(
-    model: GenerativeModel,
-    history: HistoryItem[],
-    prompt: string
-  ): Promise<{ response: any; chunks: string[] }> {
-    const chat = model.startChat({
-      history,
-      generationConfig: { temperature: 0.3 },
-    });
-
+  private async streamResponse(model: GenerativeModel, history: any[], prompt: string) {
+    const chat = model.startChat({ history, generationConfig: { temperature: 0.3 } });
     const result = await chat.sendMessageStream(prompt);
     const chunks: string[] = [];
 
     for await (const chunk of result.stream) {
       const text = chunk.text();
-      if (text) {
-        chunks.push(text);
-      }
+      if (text) chunks.push(text);
     }
 
     const response = await result.response;
     return { response, chunks };
   }
 
-  // ======  TOOL EXECUTION  ===================================================
-  private async executeTool(name: string, args: Record<string, any>): Promise<string> {
+  private async runTool(name: string, args: any) {
+    const start = Date.now();
+    try {
+      const result = await this.executeTool(name, args);
+      return {
+        name,
+        response: { success: true, result },
+        execution_time_ms: Date.now() - start,
+      };
+    } catch (error) {
+      const err = error as Error;
+      return {
+        name,
+        response: { success: false, error: err.message },
+        execution_time_ms: Date.now() - start,
+      };
+    }
+  }
+
+  private async executeTool(name: string, args: any): Promise<string> {
     switch (name) {
       case "read_file":
         return this.readFile(args.path);
@@ -416,13 +341,11 @@ export class Agent {
     }
   }
 
-  // ======  FILE SYSTEM OPERATIONS  ===========================================
+  // === FILE OPERATIONS (NO YIELD) ============================================
   private readFile(path: string): string {
     const normalized = this.normalizePath(path);
     const row = this.sql.exec("SELECT content FROM files WHERE path = ?", normalized).one();
-    if (!row) {
-      throw new Error(`File not found: ${normalized}`);
-    }
+    if (!row) throw new Error(`File not found: ${normalized}`);
     return row.content as string;
   }
 
@@ -432,13 +355,8 @@ export class Agent {
     const existing = this.sql.exec("SELECT path FROM files WHERE path = ?", normalized).one();
 
     if (existing) {
-      this.sql.exec(
-        "UPDATE files SET content = ?, updated_at = ? WHERE path = ?",
-        content,
-        now,
-        normalized
-      );
-      return `Updated file: ${normalized} (${content.length} bytes)`;
+      this.sql.exec("UPDATE files SET content = ?, updated_at = ? WHERE path = ?", content, now, normalized);
+      return `Updated: ${normalized} (${content.length} bytes)`;
     } else {
       this.sql.exec(
         "INSERT INTO files (path, content, created_at, updated_at) VALUES (?, ?, ?, ?)",
@@ -447,7 +365,7 @@ export class Agent {
         now,
         now
       );
-      return `Created file: ${normalized} (${content.length} bytes)`;
+      return `Created: ${normalized} (${content.length} bytes)`;
     }
   }
 
@@ -456,33 +374,24 @@ export class Agent {
     const rows = [...this.sql.exec("SELECT path, updated_at FROM files WHERE path LIKE ?", pattern)];
 
     if (rows.length === 0) {
-      return prefix ? `No files found with prefix: ${prefix}` : "No files in workspace";
+      return prefix ? `No files with prefix: ${prefix}` : "No files in workspace";
     }
 
-    const files = rows.map((r) => {
-      const date = new Date(r.updated_at as number).toISOString();
-      return `${r.path} (modified: ${date})`;
-    });
-
-    return files.join("\n");
+    return rows.map((r) => `${r.path} (${new Date(r.updated_at as number).toISOString()})`).join("\n");
   }
 
   private deleteFile(path: string): string {
     const normalized = this.normalizePath(path);
     const result = this.sql.exec("DELETE FROM files WHERE path = ?", normalized);
-
-    if (result.changes === 0) {
-      throw new Error(`File not found: ${normalized}`);
-    }
-
-    return `Deleted file: ${normalized}`;
+    if (result.changes === 0) throw new Error(`File not found: ${normalized}`);
+    return `Deleted: ${normalized}`;
   }
 
   private normalizePath(path: string): string {
     return path.replace(/^\/+|\/+$/g, "").replace(/\/+/g, "/");
   }
 
-  // ======  SESSION MANAGEMENT  ===============================================
+  // === PUBLIC METHODS (NO YIELD) =============================================
   async clear(): Promise<void> {
     this.sql.exec("DELETE FROM files; DELETE FROM agent_traces;");
   }
@@ -496,7 +405,7 @@ export class Agent {
     }));
   }
 
-  // ======  TRACE MANAGEMENT  =================================================
+  // === TRACE HELPERS (NO YIELD) ==============================================
   private logTrace(ts: number, type: string, payload: string): void {
     try {
       this.sql.exec(

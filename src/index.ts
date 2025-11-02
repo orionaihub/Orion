@@ -213,13 +213,16 @@ export class Agent {
           })),
         });
 
+        // Yield function call events
+        for (const fc of functionCalls) {
+          yield {
+            type: "function_call",
+            data: { name: fc.name, args: fc.args },
+          };
+        }
+
         // Execute function calls
-        const toolResults = await this.executeTools(functionCalls, (event) => {
-          // Yield tool events during execution
-          if (event.type === "function_call") {
-            yield event;
-          }
-        });
+        const toolResults = await this.executeTools(functionCalls);
 
         // Add function responses to history
         history.push({
@@ -383,16 +386,11 @@ export class Agent {
 
   // ======  TOOL EXECUTION  ===================================================
   private async executeTools(
-    functionCalls: any[],
-    onEvent: (event: StreamEvent) => void
+    functionCalls: any[]
   ): Promise<Array<{ name: string; response: any; execution_time_ms: number }>> {
     const results = await Promise.all(
       functionCalls.map(async (fc) => {
         const start = Date.now();
-        onEvent({
-          type: "function_call",
-          data: { name: fc.name, args: fc.args },
-        });
 
         try {
           const result = await this.executeTool(fc.name, fc.args);

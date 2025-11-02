@@ -1,0 +1,29 @@
+name = "suna-pure-agent"
+main = "src/index.ts"
+compatibility_date = "2025-11-03"
+compatibility_flags = ["nodejs_compat"]
+
+[assets]
+directory = "public"          # your front-end
+
+[[durable_objects.bindings]]
+name = "Agent"
+class_name = "Agent"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Agent"]
+
+[vars]
+GOOGLE_API_KEY = "YOUR_GEMINI_KEY"
+CLOUDFLARE_ACCOUNT_ID = "YOUR_ACCOUNT_ID"
+CLOUDFLARE_AI_GATEWAY_NAME = "your-gateway"
+
+# Pyodide 0.25 WASM (~800 kB gz) shipped as text blob
+[[text_blobs]]
+PYODIDE_SCRIPT = "pyodide-0.25.js"
+
+# Optional: 1 cron to prune old traces (keeps you forever-free)
+[[triggers.crons]]
+schedule = "0 4 * * *"
+# In Worker add: if (req.cf?.cron) { await DO.clearOldTraces(); return new Response("OK"); }

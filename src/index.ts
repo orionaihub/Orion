@@ -154,7 +154,6 @@ export class Agent {
       );
       CREATE INDEX IF NOT EXISTS idx_ts ON agent_traces(ts);
     `);
-    // Auto-cleanup old traces on startup
     this.cleanupOldTraces();
   }
 
@@ -162,7 +161,7 @@ export class Agent {
   async *fetchAgentStream(userPrompt: string): AsyncGenerator<StreamEvent> {
     const startTime = Date.now();
     const maxIter = 15;
-    const wallClockTimeout = 28_000; // 28s wall-clock (leave 2s buffer)
+    const wallClockTimeout = 28_000;
 
     yield { type: "start", data: { ts: startTime, prompt: userPrompt } };
     this.logTrace(startTime, "user", userPrompt);
@@ -177,7 +176,6 @@ export class Agent {
         iter++;
         yield { type: "iteration", data: { iteration: iter } };
 
-        // Check wall-clock timeout
         if (Date.now() - startTime > wallClockTimeout) {
           yield {
             type: "warning",
@@ -186,32 +184,25 @@ export class Agent {
           break;
         }
 
-        // Yield to event loop before heavy computation (respects 10ms CPU limit)
         await yieldToEventLoop();
 
-        // Send message (first iteration uses user prompt, subsequent use empty to continue)
         const prompt = iter === 1 ? userPrompt : "";
         const { response, chunks } = await this.streamWithChunks(model, history, prompt);
 
-        // Yield response chunks (stream already yields to event loop naturally)
         for (const chunk of chunks) {
           yield { type: "response_chunk", data: { text: chunk } };
           fullResponse += chunk;
         }
 
-        // Yield to event loop after streaming
         await yieldToEventLoop();
 
-        // Check for function calls
         const functionCalls = response.functionCalls();
         
         if (!functionCalls || functionCalls.length === 0) {
-          // No more function calls - conversation complete
           yield { type: "complete", data: { final_response: fullResponse } };
           break;
         }
 
-        // Add model's function call to history
         history.push({
           role: "model",
           parts: functionCalls.map((fc) => ({
@@ -219,7 +210,6 @@ export class Agent {
           })),
         });
 
-        // Execute function calls sequentially (one at a time)
         const toolResults: Array<{ name: string; response: any; execution_time_ms: number }> = [];
 
         for (const fc of functionCalls) {
@@ -228,7 +218,6 @@ export class Agent {
             data: { name: fc.name, args: fc.args },
           };
 
-          // Yield to event loop before tool execution
           await yieldToEventLoop();
 
           const toolStart = Date.now();
@@ -260,11 +249,9 @@ export class Agent {
             };
           }
 
-          // Yield to event loop after each tool execution
           await yieldToEventLoop();
         }
 
-        // Add function responses to history
         history.push({
           role: "function",
           parts: toolResults.map((result) => ({
@@ -399,7 +386,6 @@ export class Agent {
       generationConfig: { temperature: 0.3 },
     });
 
-    // sendMessageStream is async and yields naturally to event loop
     const result = await chat.sendMessageStream(prompt);
     const chunks: string[] = [];
 
@@ -408,7 +394,6 @@ export class Agent {
       if (text) {
         chunks.push(text);
       }
-      // Async iteration naturally yields to event loop
     }
 
     const response = await result.response;
@@ -417,7 +402,6 @@ export class Agent {
 
   // ======  TOOL EXECUTION  ===================================================
   private async executeTool(name: string, args: Record<string, any>): Promise<string> {
-    // Tool execution is I/O bound (SQL queries), naturally yields to event loop
     switch (name) {
       case "read_file":
         return this.readFile(args.path);
@@ -435,7 +419,6 @@ export class Agent {
   // ======  FILE SYSTEM OPERATIONS  ===========================================
   private readFile(path: string): string {
     const normalized = this.normalizePath(path);
-    // SQL exec is synchronous but fast (<1ms typically)
     const row = this.sql.exec("SELECT content FROM files WHERE path = ?", normalized).one();
     if (!row) {
       throw new Error(`File not found: ${normalized}`);
@@ -446,7 +429,6 @@ export class Agent {
   private writeFile(path: string, content: string): string {
     const normalized = this.normalizePath(path);
     const now = Date.now();
-    // Check if file exists (fast query)
     const existing = this.sql.exec("SELECT path FROM files WHERE path = ?", normalized).one();
 
     if (existing) {
@@ -471,7 +453,6 @@ export class Agent {
 
   private listFiles(prefix?: string): string {
     const pattern = prefix ? `${this.normalizePath(prefix)}%` : "%";
-    // SQL query is fast, results are small (just filenames)
     const rows = [...this.sql.exec("SELECT path, updated_at FROM files WHERE path LIKE ?", pattern)];
 
     if (rows.length === 0) {
@@ -498,7 +479,6 @@ export class Agent {
   }
 
   private normalizePath(path: string): string {
-    // Simple string operation, <1ms
     return path.replace(/^\/+|\/+$/g, "").replace(/\/+/g, "/");
   }
 
@@ -519,7 +499,6 @@ export class Agent {
   // ======  TRACE MANAGEMENT  =================================================
   private logTrace(ts: number, type: string, payload: string): void {
     try {
-      // Fast insert, payload limited to 1000 chars
       this.sql.exec(
         "INSERT INTO agent_traces (ts, type, payload) VALUES (?, ?, ?)",
         ts,
@@ -533,8 +512,7 @@ export class Agent {
 
   private cleanupOldTraces(): void {
     try {
-      const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000; // 7 days
-      // Fast DELETE with index
+      const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
       this.sql.exec("DELETE FROM agent_traces WHERE ts < ?", cutoff);
     } catch (error) {
       console.error("Failed to cleanup traces:", error);

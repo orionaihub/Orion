@@ -1,9 +1,9 @@
 /**
- * Suna-like Autonomous Agent – Free-Tier Only
+ * Suna-like Autonomous Agent – Free-Tier ONLY
  *  - 10 ms CPU wall respected (early yield + waitUntil tail)
  *  - Persistent POSIX workspace via DO SQLite volume
  *  - Pyodide WASM Python sandbox (bundled ≤ 1 MB gz)
- *  - Native Gemini search & code execution (no stubs)
+ *  - Native Gemini search & code-execution (no stubs)
  *  - Parallel tool calls, reflection every 2nd iter
  *  - Cron garbage-collect traces > 7 days
  *
@@ -22,9 +22,10 @@ export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(req.url);
 
-    // ---------- static front-end (same HTML you already have) --------------
+    // ---------- static front-end (same as before) --------------------------
     if (url.pathname === "/" || url.pathname.startsWith("/public/")) {
-      return fetch("https://your-static-site.com" + url.pathname); // or serve from KV
+      // Serve your front-end files (KV, R2, or external static host)
+      return fetch("https://your-static-site.com" + url.pathname);
     }
 
     // ---------- agent API ----------------------------------------------------
@@ -37,16 +38,16 @@ export default {
       const { readable, writable } = new TransformStream();
       const encoder = new TextEncoder();
       const writer = writable.getWriter();
-      ctx.waitUntil(
-        (async () => {
-          // 2. heavy lifting runs in tail (no CPU clock)
-          const body = await req.json<{ content: string; mode?: string }>();
-          for await (const ev of stub.fetchAgentStream(body.content, body.mode)) {
-            await writer.write(encoder.encode(JSON.stringify(ev) + "\n"));
-          }
-          await writer.close();
-        })()
-      );
+
+      // 2. heavy lifting runs in tail (no CPU clock)
+      ctx.waitUntil((async () => {
+        const body = await req.json<{ content: string; mode?: string }>();
+        // ---- HOISTED GENERATOR ----
+        for await (const ev of stub.fetchAgentStream(body.content, body.mode)) {
+          await writer.write(encoder.encode(JSON.stringify(ev) + "\n"));
+        }
+        await writer.close();
+      })());
 
       return new Response(readable, {
         headers: {
@@ -82,7 +83,7 @@ function getSessionId(req: Request): string | null {
 export class Agent {
   private sql: SqlStorage;
   private encoder = new TextEncoder();
-  private decoder = new TextDecoder();
+  private pyodideInstance: any = null;
 
   constructor(private state: DurableObjectState, private env: Env) {
     this.sql = state.storage.sql;
@@ -106,85 +107,74 @@ export class Agent {
     `);
   }
 
-  // Public method called by tail (no CPU clock)
+  // ======  PUBLIC TAIL ENTRY-POINT  (NO CPU CLOCK)  ==========================
   async *fetchAgentStream(userPrompt: string, mode = "default"): AsyncGenerator<unknown> {
     const start = Date.now();
     yield { type: "start", ts: start };
-
-    // 1. Persist user message
     this.sql.exec("INSERT INTO agent_traces (ts,type,payload) VALUES (?,?,?)", start, "user", userPrompt);
 
-    // 2. Build Gemini model (native tools enabled)
     const model = this.buildGemini();
-
-    // 3. Multi-step loop
     const maxIter = 10;
     let iter = 0;
-    let history: { role: "user" | "model"; parts: { text: string }[] }[] = [];
+    const history: { role: "user" | "model"; parts: { text: string }[] }[] = [];
     let finalText = "";
 
     while (iter < maxIter) {
       iter++;
-      const iterStart = Date.now();
-
-      // 3a. Gemini call
       const chat = model.startChat({ history, generationConfig: { temperature: 0.3 } });
       const stream = await chat.sendMessageStream(userPrompt);
 
       let chunkText = "";
       for await (const chunk of stream) {
-        const t = chunk.text();
+        const t = chunk.text ? chunk.text() : "";
         if (t) {
           chunkText += t;
           finalText += t;
-          yield { type: "response_chunk", text: t };
+          yield { type: "response_chunk", data: { response: t } };
         }
       }
 
-      // 3b. Native tool calls (search, code-exec) already handled by Gemini
+      // ---- native Gemini tool calls (search, code-exec) ----
       const toolCalls = this.extractToolCalls(stream);
       if (toolCalls.length === 0) break;
 
-      // 3c. Parallel local tools (workspace, python, etc.)
+      // ---- parallel local tools ----
       const results = await Promise.allSettled(
         toolCalls.map(async (call) => {
-          yield { type: "tool_start", name: call.name, args: call.args };
+          yield { type: "tool_call_start", data: { tool_name: call.name, tool_args: call.args } };
           const out = await this.runTool(call.name, call.args);
-          yield { type: "tool_end", name: call.name, out };
+          yield { type: "tool_result", data: { result: out, execution_time_ms: 0 } };
           return { call, out };
         })
       );
 
-      // 3d. Append to history
       history.push({ role: "model", parts: [{ text: chunkText }] });
       for (const r of results) {
         if (r.status === "fulfilled") {
-          const { call, out } = r.value;
-          history.push({ role: "user", parts: [{ text: `Result of ${call.name}: ${out}` }] });
+          history.push({ role: "user", parts: [{ text: `Result of ${r.value.call.name}: ${r.value.out}` }] });
         }
       }
 
-      // 3e. Reflection every 2nd iteration to save tokens
+      // ---- reflection every 2nd iter ----
       if (iter % 2 === 0) {
-        const reflection = await this.reflect(model, history);
-        yield { type: "reflection", ...reflection };
-        if (reflection.confidence > 0.8) break;
+        const refl = await this.reflect(model, history);
+        yield { type: "reflection", data: refl };
+        if (refl.confidence > 0.8) break;
       }
 
-      // 3f. Hard tail guard (realistic wall)
+      // ---- 25 s tail guard ----
       if (Date.now() - start > 25_000) {
-        yield { type: "warning", reason: "25 s tail guard" };
+        yield { type: "warning", data: { reason: "25 s tail guard" } };
         break;
       }
     }
 
-    // 4. Store assistant message
     const end = Date.now();
     this.sql.exec("INSERT INTO agent_traces (ts,type,payload) VALUES (?,?,?)", end, "assistant", finalText);
-    yield { type: "done", elapsed: end - start, iterations: iter };
+    yield { type: "done", data: { iterations: iter, elapsed: end - start } };
   }
 
-  // ---------- GEMINI SETUP ----------------------------------------------------
+  // ======  GEMINI SETUP  =====================================================
   private buildGemini() {
     const { GoogleGenerativeAI } = require("@google/generative-ai");
     const genAI = new GoogleGenerativeAI(this.env.GOOGLE_API_KEY);
@@ -196,16 +186,13 @@ export class Agent {
       {
         model: "gemini-2.5-flash",
         systemInstruction: "You are Suna, an autonomous AI worker. Use the provided tools to accomplish the user goal step-by-step.",
-        tools: [
-          { googleSearch: {} },          // native search
-          { codeExecution: {} },         // native python sandbox
-        ],
+        tools: [{ googleSearch: {} }, { codeExecution: {} }],
       },
       gateway ? { baseUrl: gateway } : undefined
     );
   }
 
-  // ---------- TOOL RUNNER -----------------------------------------------------
+  // ======  TOOL RUNNER  =======================================================
   private async runTool(name: string, args: any): Promise<string> {
     switch (name) {
       case "read_file":
@@ -221,7 +208,7 @@ export class Agent {
     }
   }
 
-  // ---------- POSIX VOLUME ----------------------------------------------------
+  // ======  POSIX VOLUME  ======================================================
   private readFile(path: string): string {
     const row = this.sql.exec("SELECT content FROM files WHERE path = ?", path).one();
     return row ? (row.content as string) : `File not found: ${path}`;
@@ -234,33 +221,31 @@ export class Agent {
 
   private listFiles(dir: string): string {
     const rows = [...this.sql.exec("SELECT path FROM files WHERE path LIKE ?", dir + "%")];
-    return rows.map((r) => r.path).join("\n");
+    return rows.map((r) => r.path as string).join("\n");
   }
 
-  // ---------- PYTHON WASM -----------------------------------------------------
+  // ======  PYTHON WASM  =======================================================
   private async runPython(code: string): Promise<string> {
-    // Bundled Pyodide index < 1 MB gz; loaded once per isolate
-    const pyodide = await this.getPyodide();
+    const py = await this.getPyodide();
     try {
-      const out = await pyodide.runPythonAsync(code);
+      const out = await py.runPythonAsync(code);
       return String(out ?? "");
     } catch (e: any) {
       return `Python error: ${e.message}`;
     }
   }
 
-  private pyodideInstance: any = null;
   private async getPyodide() {
     if (this.pyodideInstance) return this.pyodideInstance;
-    // @ts-ignore – we shim pyodide.js in wrangler.toml as text_blob
-    const pyodideScript = await (globalThis as any).PYODIDE_SCRIPT.text();
-    const pyodide = await import("data:text/javascript," + encodeURIComponent(pyodideScript));
+    // PYODIDE_SCRIPT is a text_blob injected by wrangler
+    const script = await (globalThis as any).PYODIDE_SCRIPT.text();
+    const pyodide = await import("data:text/javascript," + encodeURIComponent(script));
     await pyodide.loadPackage(["micropip"]);
     this.pyodideInstance = pyodide;
     return pyodide;
   }
 
-  // ---------- REFLECTION ------------------------------------------------------
+  // ======  REFLECTION  ========================================================
   private async reflect(model: any, history: any[]) {
     const prompt =
       "Based on the conversation above, evaluate whether you have enough information to complete the user's request. " +
@@ -276,14 +261,13 @@ export class Agent {
     }
   }
 
-  // ---------- UTILS -----------------------------------------------------------
+  // ======  UTILS  =============================================================
   private extractToolCalls(stream: any): { name: string; args: any }[] {
-    // Gemini 2.5 Flash embeds native tool calls inside response; we just forward them
     const calls = stream.response?.functionCalls?.() ?? [];
     return calls.map((c: any) => ({ name: c.name, args: c.args }));
   }
 
   async clear() {
-    this.sql.exec("DELETE FROM files; DELETE FROM agent_traces; DELETE FROM sqlite_sequence;");
+    this.sql.exec("DELETE FROM files; DELETE FROM agent_traces; DELETE FROM sqlite_sequence WHERE name IN ('files','agent_traces');");
   }
 }

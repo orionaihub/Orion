@@ -1,5 +1,5 @@
 {
-  "name": "suna-pure-agent",
+  "name": "ubix-agent",
   "version": "2.0.0",
   "description": "Suna-like autonomous agent on Cloudflare Workers free-tier — real Python, POSIX workspace, zero external cost",
   "type": "module",
@@ -22,7 +22,7 @@
     "wasm",
     "free-tier"
   ],
-  "author": "kortix",
+  "author": "Ubix",
   "license": "MIT",
   "devDependencies": {
     "@biomejs/biome": "^2.2.5",

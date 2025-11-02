@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Suna-like Agent – Free-Tier</title>
+  <link rel="stylesheet" href="styles.css" /> <!-- same CSS file, no changes -->
+</head>
+<body>
+  <div class="app-container">
+    <!-- sidebar id/mode buttons identical -->
+    <div class="main-area">
+      <div class="chat-header">
+        <div style="display:flex;align-items:center;gap:1rem">
+          <button id="toggle-sidebar-btn-mobile" title="Toggle sidebar">☰</button>
+          <h1 id="chat-title">Welcome</h1>
+        </div>
+        <div class="chat-actions">
+          <button id="toggle-traces-btn" style="display:none">📊 Traces</button>
+          <button id="clear-btn">Clear</button>
+        </div>
+      </div>
+
+      <div class="chat-messages" id="chat-messages"></div>
+
+      <div class="message-input">
+        <textarea id="user-input" placeholder="Ask anything… (Shift+Enter newline)" rows="1" autofocus></textarea>
+        <button id="send-button" title="Send">📤</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- traces panel identical -->
+  <script src="chat.js"></script>
+</body>
+</html>

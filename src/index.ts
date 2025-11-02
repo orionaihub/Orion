@@ -21,23 +21,20 @@ export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(req.url);
 
-    // ---------- static front-end ------------------------------------------
     if (url.pathname === "/" || url.pathname.startsWith("/public/")) {
       return fetch("https://your-static-site.com" + url.pathname);
     }
 
-    // ---------- agent API ----------------------------------------------------
     if (url.pathname === "/api/agent" && req.method === "POST") {
       const sessionId = getSessionId(req) ?? crypto.randomUUID();
       const id = env.Agent.idFromName(sessionId);
       const stub = env.Agent.get(id);
 
-      // 1. quick answer (< 10 ms) – SSE stream starts immediately
       const { readable, writable } = new TransformStream();
       const encoder = new TextEncoder();
       const writer = writable.getWriter();
 
-      // 2. heavy lifting runs in tail (no CPU clock)
+      // ---- HOISTED GENERATOR ----
       ctx.waitUntil((async () => {
         const body = await req.json<{ content: string; mode?: string }>();
         for await (const ev of stub.fetchAgentStream(body.content, body.mode)) {
@@ -55,7 +52,6 @@ export default {
       });
     }
 
-    // ---------- clear history ------------------------------------------------
     if (url.pathname === "/api/agent/clear" && req.method === "POST") {
       const sessionId = getSessionId(req) ?? crypto.randomUUID();
       const id = env.Agent.idFromName(sessionId);
@@ -79,7 +75,6 @@ function getSessionId(req: Request): string | null {
 // ---------- DURABLE OBJECT ---------------------------------------------------
 export class Agent {
   private sql: SqlStorage;
-  private encoder = new TextEncoder();
 
   constructor(private state: DurableObjectState, private env: Env) {
     this.sql = state.storage.sql;

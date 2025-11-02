@@ -2,8 +2,7 @@
  * Suna-like Autonomous Agent – Free-Tier ONLY
  *  - 10 ms CPU wall respected (early yield + waitUntil tail)
  *  - Persistent POSIX workspace via DO SQLite volume
- *  - Pyodide WASM Python sandbox (bundled ≤ 1 MB gz)
- *  - Native Gemini search & code-execution (no stubs)
+ *  - Native Gemini search & code-execution (no stubs, no Pyodide)
  *  - Parallel tool calls, reflection every 2nd iter
  *  - Cron garbage-collect traces > 7 days
  *
@@ -22,9 +21,8 @@ export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(req.url);
 
-    // ---------- static front-end (same as before) --------------------------
+    // ---------- static front-end ------------------------------------------
     if (url.pathname === "/" || url.pathname.startsWith("/public/")) {
-      // Serve your front-end files (KV, R2, or external static host)
       return fetch("https://your-static-site.com" + url.pathname);
     }
 
@@ -42,7 +40,6 @@ export default {
       // 2. heavy lifting runs in tail (no CPU clock)
       ctx.waitUntil((async () => {
         const body = await req.json<{ content: string; mode?: string }>();
-        // ---- HOISTED GENERATOR ----
         for await (const ev of stub.fetchAgentStream(body.content, body.mode)) {
           await writer.write(encoder.encode(JSON.stringify(ev) + "\n"));
         }
@@ -83,7 +80,6 @@ function getSessionId(req: Request): string | null {
 export class Agent {
   private sql: SqlStorage;
   private encoder = new TextEncoder();
-  private pyodideInstance: any = null;
 
   constructor(private state: DurableObjectState, private env: Env) {
     this.sql = state.storage.sql;
@@ -138,7 +134,7 @@ export class Agent {
       const toolCalls = this.extractToolCalls(stream);
       if (toolCalls.length === 0) break;
 
-      // ---- parallel local tools ----
+      // ---- parallel local tools (file-system only) ----
       const results = await Promise.allSettled(
         toolCalls.map(async (call) => {
           yield { type: "tool_call_start", data: { tool_name: call.name, tool_args: call.args } };
@@ -186,13 +182,13 @@ export class Agent {
       {
         model: "gemini-2.5-flash",
         systemInstruction: "You are Suna, an autonomous AI worker. Use the provided tools to accomplish the user goal step-by-step.",
-        tools: [{ googleSearch: {} }, { codeExecution: {} }],
+        tools: [{ googleSearch: {} }, { codeExecution: {} }], // <-- native sandbox
       },
       gateway ? { baseUrl: gateway } : undefined
     );
   }
 
-  // ======  TOOL RUNNER  =======================================================
+  // ======  TOOL RUNNER  (FILE-SYSTEM ONLY)  ==================================
   private async runTool(name: string, args: any): Promise<string> {
     switch (name) {
       case "read_file":
@@ -201,8 +197,6 @@ export class Agent {
         return this.writeFile(args.path, args.content);
       case "list_files":
         return this.listFiles(args.path ?? ".");
-      case "execute_python":
-        return this.runPython(args.code);
       default:
         return `Unknown local tool ${name}`;
     }
@@ -222,27 +216,6 @@ export class Agent {
   private listFiles(dir: string): string {
     const rows = [...this.sql.exec("SELECT path FROM files WHERE path LIKE ?", dir + "%")];
     return rows.map((r) => r.path as string).join("\n");
-  }
-
-  // ======  PYTHON WASM  =======================================================
-  private async runPython(code: string): Promise<string> {
-    const py = await this.getPyodide();
-    try {
-      const out = await py.runPythonAsync(code);
-      return String(out ?? "");
-    } catch (e: any) {
-      return `Python error: ${e.message}`;
-    }
-  }
-
-  private async getPyodide() {
-    if (this.pyodideInstance) return this.pyodideInstance;
-    // PYODIDE_SCRIPT is a text_blob injected by wrangler
-    const script = await (globalThis as any).PYODIDE_SCRIPT.text();
-    const pyodide = await import("data:text/javascript," + encodeURIComponent(script));
-    await pyodide.loadPackage(["micropip"]);
-    this.pyodideInstance = pyodide;
-    return pyodide;
   }
 
   // ======  REFLECTION  ========================================================

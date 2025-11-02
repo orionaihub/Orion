@@ -1,4 +1,4 @@
-name = "suna-pure-agent"
+name = "ubix-agent"
 main = "src/index.ts"
 compatibility_date = "2025-11-03"
 compatibility_flags = ["nodejs_compat"]
@@ -15,9 +15,9 @@ tag = "v1"
 new_sqlite_classes = ["Agent"]
 
 [vars]
-GOOGLE_API_KEY = "YOUR_GEMINI_KEY"
-CLOUDFLARE_ACCOUNT_ID = "YOUR_ACCOUNT_ID"
-CLOUDFLARE_AI_GATEWAY_NAME = "your-gateway"
+GOOGLE_API_KEY = "AIzaSyDxD7WiixJUVw6h0HWqW6lS8pHpVihnNTM"
+CLOUDFLARE_ACCOUNT_ID = "4b4ec8bb6f23f3dcf72d173347ada9e2"
+CLOUDFLARE_AI_GATEWAY_NAME = "xgateway"
 
 # Pyodide 0.25 WASM (~800 kB gz) shipped as text blob
 [[text_blobs]]

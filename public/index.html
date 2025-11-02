@@ -1,49 +1,43 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Suna Agent – Free Tier</title>
-  <link rel="stylesheet" href="styles.css" />
+  <title>Autonomous Agent Chat</title>
+  <link rel="stylesheet" href="style.css" />
 </head>
 <body>
-  <div class="app-container">
-    <!-- SIDEBAR -->
-    <div id="sidebar" class="sidebar">
+  <div class="app">
+    <!-- Sidebar -->
+    <aside id="sidebar" class="sidebar">
       <div class="sidebar-header">
         <h2>💬 Chats</h2>
-        <button id="new-chat-btn" title="New chat">＋</button>
+        <button id="close-sidebar" class="close-btn">✕</button>
       </div>
       <div id="sessions-list" class="sessions-list"></div>
-      <button id="toggle-sidebar-btn" class="toggle-sidebar">☰</button>
-    </div>
+      <button id="new-chat-btn" class="new-chat-btn">+ New Chat</button>
+    </aside>
 
-    <!-- MAIN CHAT AREA -->
-    <div class="main-area">
-      <div class="chat-header">
-        <div style="display:flex;align-items:center;gap:1rem">
-          <button id="toggle-sidebar-btn-mobile" title="Toggle sidebar">☰</button>
-          <h1 id="chat-title">Welcome</h1>
-        </div>
-        <div class="chat-actions">
-          <button id="toggle-traces-btn" style="display:none">📊 Traces</button>
-          <button id="clear-btn">Clear</button>
-        </div>
-      </div>
+    <!-- Main Chat Area -->
+    <main class="chat-container">
+      <header class="chat-header">
+        <button id="toggle-sidebar" class="menu-btn">☰</button>
+        <h1>Autonomous Agent</h1>
+      </header>
 
-      <div class="chat-messages" id="chat-messages"></div>
+      <div id="chat-messages" class="chat-messages"></div>
 
-      <div class="message-input">
-        <textarea id="user-input" placeholder="Ask anything… (Shift+Enter newline)" rows="1" autofocus></textarea>
-        <button id="send-button" title="Send">📤</button>
-      </div>
-    </div>
-  </div>
-
-  <!-- TRACES PANEL -->
-  <div id="traces-panel" class="traces-panel">
-    <button id="traces-close-btn" title="Close">✕</button>
-    <div id="traces-content"></div>
+      <form id="chat-form" class="chat-form">
+        <input
+          id="user-input"
+          type="text"
+          placeholder="Type your message..."
+          autocomplete="off"
+          required
+        />
+        <button type="submit">Send</button>
+      </form>
+    </main>
   </div>
 
   <script src="chat.js"></script>

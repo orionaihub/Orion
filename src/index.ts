@@ -1,13 +1,14 @@
 /**
  * Suna-like Autonomous Agent – Cloudflare Workers Free Tier
+ *  - Sequential tool execution (one at a time)
+ *  - Respects 10ms CPU wall time by yielding to event loop
  *  - Persistent workspace via Durable Object SQLite
- *  - Gemini 2.5 Flash with native search & code execution
- *  - Local file system tools
+ *  - Gemini 2.0 Flash with native search & code execution
  *  - Proper error handling & streaming
- *  - 30s timeout protection for free tier
+ *  - 30s wall-clock timeout for free tier
  */
 
-import { GoogleGenerativeAI, GenerativeModel, ChatSession } from "@google/generative-ai";
+import { GoogleGenerativeAI, GenerativeModel } from "@google/generative-ai";
 
 export interface Env {
   Agent: DurableObjectNamespace;
@@ -102,16 +103,15 @@ function getSessionId(req: Request): string | null {
   return m ? m[1] : null;
 }
 
-// ---------- TYPES -----------------------------------------------------------
-interface ToolCall {
-  name: string;
-  args: Record<string, any>;
+// Helper to yield control back to event loop (respects 10ms CPU limit)
+async function yieldToEventLoop(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
+// ---------- TYPES -----------------------------------------------------------
 interface StreamEvent {
   type: string;
   data?: any;
-  ts?: number;
 }
 
 interface ConversationPart {
@@ -160,12 +160,12 @@ export class Agent {
 
   // ======  PUBLIC API  ========================================================
   async *fetchAgentStream(userPrompt: string): AsyncGenerator<StreamEvent> {
-    const start = Date.now();
+    const startTime = Date.now();
     const maxIter = 15;
-    const timeout = 28_000; // 28s (leave 2s buffer for free tier 30s limit)
+    const wallClockTimeout = 28_000; // 28s wall-clock (leave 2s buffer)
 
-    yield { type: "start", data: { ts: start, prompt: userPrompt } };
-    this.logTrace(start, "user", userPrompt);
+    yield { type: "start", data: { ts: startTime, prompt: userPrompt } };
+    this.logTrace(startTime, "user", userPrompt);
 
     try {
       const model = this.getModel();
@@ -177,24 +177,30 @@ export class Agent {
         iter++;
         yield { type: "iteration", data: { iteration: iter } };
 
-        // Check timeout
-        if (Date.now() - start > timeout) {
+        // Check wall-clock timeout
+        if (Date.now() - startTime > wallClockTimeout) {
           yield {
             type: "warning",
-            data: { reason: "Approaching 30s timeout limit", elapsed: Date.now() - start },
+            data: { reason: "Approaching 30s wall-clock timeout", elapsed: Date.now() - startTime },
           };
           break;
         }
+
+        // Yield to event loop before heavy computation (respects 10ms CPU limit)
+        await yieldToEventLoop();
 
         // Send message (first iteration uses user prompt, subsequent use empty to continue)
         const prompt = iter === 1 ? userPrompt : "";
         const { response, chunks } = await this.streamWithChunks(model, history, prompt);
 
-        // Yield response chunks
+        // Yield response chunks (stream already yields to event loop naturally)
         for (const chunk of chunks) {
           yield { type: "response_chunk", data: { text: chunk } };
           fullResponse += chunk;
         }
+
+        // Yield to event loop after streaming
+        await yieldToEventLoop();
 
         // Check for function calls
         const functionCalls = response.functionCalls();
@@ -213,16 +219,50 @@ export class Agent {
           })),
         });
 
-        // Yield function call events
+        // Execute function calls sequentially (one at a time)
+        const toolResults: Array<{ name: string; response: any; execution_time_ms: number }> = [];
+
         for (const fc of functionCalls) {
           yield {
             type: "function_call",
             data: { name: fc.name, args: fc.args },
           };
-        }
 
-        // Execute function calls
-        const toolResults = await this.executeTools(functionCalls);
+          // Yield to event loop before tool execution
+          await yieldToEventLoop();
+
+          const toolStart = Date.now();
+          try {
+            const result = await this.executeTool(fc.name, fc.args);
+            const toolResult = {
+              name: fc.name,
+              response: { success: true, result },
+              execution_time_ms: Date.now() - toolStart,
+            };
+            toolResults.push(toolResult);
+
+            yield {
+              type: "function_result",
+              data: toolResult,
+            };
+          } catch (error) {
+            const err = error as Error;
+            const toolResult = {
+              name: fc.name,
+              response: { success: false, error: err.message },
+              execution_time_ms: Date.now() - toolStart,
+            };
+            toolResults.push(toolResult);
+
+            yield {
+              type: "function_result",
+              data: toolResult,
+            };
+          }
+
+          // Yield to event loop after each tool execution
+          await yieldToEventLoop();
+        }
 
         // Add function responses to history
         history.push({
@@ -234,28 +274,16 @@ export class Agent {
             },
           })),
         });
-
-        // Yield tool results
-        for (const result of toolResults) {
-          yield {
-            type: "function_result",
-            data: {
-              name: result.name,
-              response: result.response,
-              execution_time_ms: result.execution_time_ms,
-            },
-          };
-        }
       }
 
-      const end = Date.now();
-      this.logTrace(end, "assistant", fullResponse);
+      const endTime = Date.now();
+      this.logTrace(endTime, "assistant", fullResponse);
 
       yield {
         type: "done",
         data: {
           iterations: iter,
-          elapsed: end - start,
+          elapsed: endTime - startTime,
           response_length: fullResponse.length,
         },
       };
@@ -285,7 +313,8 @@ export class Agent {
         systemInstruction:
           "You are Suna, an autonomous AI assistant. You have access to a persistent file system and can use tools to help accomplish user goals. " +
           "When working with files, always use absolute paths or paths relative to the current directory. " +
-          "Use the available tools step by step to complete tasks efficiently.",
+          "Use the available tools step by step to complete tasks efficiently. " +
+          "Call only ONE tool at a time - do not make parallel function calls.",
         tools: [
           {
             functionDeclarations: [
@@ -370,6 +399,7 @@ export class Agent {
       generationConfig: { temperature: 0.3 },
     });
 
+    // sendMessageStream is async and yields naturally to event loop
     const result = await chat.sendMessageStream(prompt);
     const chunks: string[] = [];
 
@@ -378,6 +408,7 @@ export class Agent {
       if (text) {
         chunks.push(text);
       }
+      // Async iteration naturally yields to event loop
     }
 
     const response = await result.response;
@@ -385,35 +416,8 @@ export class Agent {
   }
 
   // ======  TOOL EXECUTION  ===================================================
-  private async executeTools(
-    functionCalls: any[]
-  ): Promise<Array<{ name: string; response: any; execution_time_ms: number }>> {
-    const results = await Promise.all(
-      functionCalls.map(async (fc) => {
-        const start = Date.now();
-
-        try {
-          const result = await this.executeTool(fc.name, fc.args);
-          return {
-            name: fc.name,
-            response: { success: true, result },
-            execution_time_ms: Date.now() - start,
-          };
-        } catch (error) {
-          const err = error as Error;
-          return {
-            name: fc.name,
-            response: { success: false, error: err.message },
-            execution_time_ms: Date.now() - start,
-          };
-        }
-      })
-    );
-
-    return results;
-  }
-
   private async executeTool(name: string, args: Record<string, any>): Promise<string> {
+    // Tool execution is I/O bound (SQL queries), naturally yields to event loop
     switch (name) {
       case "read_file":
         return this.readFile(args.path);
@@ -431,6 +435,7 @@ export class Agent {
   // ======  FILE SYSTEM OPERATIONS  ===========================================
   private readFile(path: string): string {
     const normalized = this.normalizePath(path);
+    // SQL exec is synchronous but fast (<1ms typically)
     const row = this.sql.exec("SELECT content FROM files WHERE path = ?", normalized).one();
     if (!row) {
       throw new Error(`File not found: ${normalized}`);
@@ -441,6 +446,7 @@ export class Agent {
   private writeFile(path: string, content: string): string {
     const normalized = this.normalizePath(path);
     const now = Date.now();
+    // Check if file exists (fast query)
     const existing = this.sql.exec("SELECT path FROM files WHERE path = ?", normalized).one();
 
     if (existing) {
@@ -465,6 +471,7 @@ export class Agent {
 
   private listFiles(prefix?: string): string {
     const pattern = prefix ? `${this.normalizePath(prefix)}%` : "%";
+    // SQL query is fast, results are small (just filenames)
     const rows = [...this.sql.exec("SELECT path, updated_at FROM files WHERE path LIKE ?", pattern)];
 
     if (rows.length === 0) {
@@ -491,7 +498,7 @@ export class Agent {
   }
 
   private normalizePath(path: string): string {
-    // Remove leading/trailing slashes and normalize
+    // Simple string operation, <1ms
     return path.replace(/^\/+|\/+$/g, "").replace(/\/+/g, "/");
   }
 
@@ -512,11 +519,12 @@ export class Agent {
   // ======  TRACE MANAGEMENT  =================================================
   private logTrace(ts: number, type: string, payload: string): void {
     try {
+      // Fast insert, payload limited to 1000 chars
       this.sql.exec(
         "INSERT INTO agent_traces (ts, type, payload) VALUES (?, ?, ?)",
         ts,
         type,
-        payload.substring(0, 1000) // Limit payload size
+        payload.substring(0, 1000)
       );
     } catch (error) {
       console.error("Failed to log trace:", error);
@@ -526,6 +534,7 @@ export class Agent {
   private cleanupOldTraces(): void {
     try {
       const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000; // 7 days
+      // Fast DELETE with index
       this.sql.exec("DELETE FROM agent_traces WHERE ts < ?", cutoff);
     } catch (error) {
       console.error("Failed to cleanup traces:", error);

@@ -18,8 +18,3 @@ new_sqlite_classes = ["Agent"]
 GOOGLE_API_KEY = "AIzaSyDxD7WiixJUVw6h0HWqW6lS8pHpVihnNTM"
 CLOUDFLARE_ACCOUNT_ID = "4b4ec8bb6f23f3dcf72d173347ada9e2"
 CLOUDFLARE_AI_GATEWAY_NAME = "xgateway"
-
-# Optional: 1 cron to prune old traces (keeps you forever-free)
-[[triggers.crons]]
-schedule = "0 4 * * *"
-# In Worker add: if (req.cf?.cron) { await DO.clearOldTraces(); return new Response("OK"); }

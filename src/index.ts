@@ -92,10 +92,16 @@ export class AgentDurableObject implements DurableObject<Env> {
 
     // Check for API errors
     if (!response.ok) {
-        // Log the error body if possible for better debugging
+        // Log the error body for Cloudflare Worker logs
         const errorBody = await response.text();
         console.error('Gemini API detailed error:', errorBody);
-        return new Response(`Gemini API Error: ${response.statusText}. Check console for details.`, { status: response.status });
+        
+        // --- FIX: Returning the detailed error body to the client ---
+        return new Response(`Gemini API Error: ${response.statusText}.\nDetailed Body: ${errorBody}`, { 
+            status: response.status,
+            headers: { 'Content-Type': 'text/plain' }
+        });
+        // --- END FIX ---
     }
 
     const result = await response.json();
@@ -258,4 +264,3 @@ export default {
   // Export the Durable Object class (required by wrangler)
   AgentDurableObject,
 };
-

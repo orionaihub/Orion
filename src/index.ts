@@ -21,6 +21,10 @@ type Part = {
 };
 
 // 3. DURABLE OBJECT (STATE & LOGIC)
+/**
+ * AgentDurableObject maintains conversation history and coordinates calls
+ * to the Gemini API, including tool use.
+ */
 export class AgentDurableObject implements DurableObject<Env> {
   private history: Message[] = [];
   private env: Env;
@@ -66,13 +70,15 @@ export class AgentDurableObject implements DurableObject<Env> {
       Keep responses concise and helpful.
     `;
 
+    // Correct API payload structure
     const payload = {
         contents: messages,
+        // systemInstruction is a top-level field for the REST API
+        systemInstruction: systemInstructionText, 
         config: {
-            systemInstruction: systemInstructionText,
-            // Enable built-in Google Search grounding
             tools: [
-                { googleSearch: {} }, 
+                // Correct key for Google Search grounding is snake_case: google_search
+                { google_search: {} }, 
                 ...tools
             ]
         },
@@ -86,7 +92,10 @@ export class AgentDurableObject implements DurableObject<Env> {
 
     // Check for API errors
     if (!response.ok) {
-        return new Response(`Gemini API Error: ${response.statusText}`, { status: response.status });
+        // Log the error body if possible for better debugging
+        const errorBody = await response.text();
+        console.error('Gemini API detailed error:', errorBody);
+        return new Response(`Gemini API Error: ${response.statusText}. Check console for details.`, { status: response.status });
     }
 
     const result = await response.json();
@@ -128,10 +137,10 @@ export class AgentDurableObject implements DurableObject<Env> {
 
         const secondTurnPayload = {
             contents: this.history, // Send full history including tool result
+            systemInstruction: systemInstructionText, // Top level
             config: {
-                systemInstruction: systemInstructionText,
                 tools: [
-                    { googleSearch: {} }, 
+                    { google_search: {} }, // Corrected key
                     ...tools
                 ]
             },
@@ -234,8 +243,10 @@ export class AgentDurableObject implements DurableObject<Env> {
 }
 
 // 5. MAIN WORKER HANDLER
+/**
+ * Main Worker fetch handler - Routes request to a single Durable Object instance (AgentSession).
+ */
 export default {
-  // Main Worker fetch handler - Routes request to a single Durable Object instance
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     // Generate a unique ID for a single persistent DO instance (e.g., using a fixed name)
     const durableObjectId = env.AGENT_DO.idFromName('AgentSession');

@@ -1,32 +1,28 @@
+// --------------------------------------------------------------------------------------
+// WARNING: SDK DEPENDENCY
+// This file uses 'ai' and '@ai-sdk/google' imports. These dependencies REQUIRE a build 
+// process (e.g., using `wrangler` with a full build) and will FAIL in a basic, single-file 
+// Cloudflare Worker environment without one. This implementation is provided ONLY to 
+// demonstrate the requested SDK usage pattern.
+// --------------------------------------------------------------------------------------
+
+import { generateContent, tool, type CoreMessage } from 'ai';
+import { google } from '@ai-sdk/google';
 import { DurableObject, Request, ExecutionContext } from '@cloudflare/workers-types';
 
 // 1. ENVIRONMENT SETUP
-// Define the expected environment variables and bindings
 interface Env {
   AGENT_DO: DurableObjectNamespace;
   GEMINI_API_KEY: string;
 }
 
-// 2. TYPES
-// Standard structure for a message in the Gemini API
-type Message = {
-  role: 'user' | 'model' | 'tool';
-  parts: Part[];
-};
+// Map CoreMessage to the type used for Durable Object storage (for simplicity)
+type StoredMessage = CoreMessage;
 
-type Part = {
-  text?: string;
-  functionCall?: { name: string, args: Record<string, any> };
-  functionResponse?: { name: string, response: Record<string, any> };
-};
-
-// 3. DURABLE OBJECT (STATE & LOGIC)
-/**
- * AgentDurableObject maintains conversation history and coordinates calls
- * to the Gemini API, including tool use.
- */
+// 2. DURABLE OBJECT (STATE & LOGIC)
 export class AgentDurableObject implements DurableObject<Env> {
-  private history: Message[] = [];
+  // Use CoreMessage[] from ai-sdk for history compatibility
+  private history: StoredMessage[] = []; 
   private env: Env;
   private state: DurableObjectState;
   
@@ -39,149 +35,81 @@ export class AgentDurableObject implements DurableObject<Env> {
     });
   }
 
-  // Mock function for the agent to call (e.g., fetching product inventory)
-  private async inventorySearch(query: { product_name: string }): Promise<Record<string, any>> {
-    console.log(`Executing Tool: inventorySearch for product ${query.product_name}`);
-    
-    // In a real app, this would query a database or external API.
-    if (query.product_name.toLowerCase().includes('laptop')) {
+  // Define the tool implementation
+  private inventoryTool = tool({
+    description: 'Searches the internal product inventory for availability and pricing.',
+    parameters: {
+      type: 'object',
+      properties: {
+        product_name: { type: 'string', description: 'The name of the product to search for, e.g., "Gaming Laptop"' },
+      },
+      required: ['product_name'],
+    },
+    execute: async ({ product_name }) => {
+      console.log(`Executing Tool: inventorySearch for product ${product_name}`);
+      
+      // Mocked inventory logic
+      if (product_name.toLowerCase().includes('laptop')) {
+        return { 
+          status: 'success', 
+          result: { product_name: product_name, in_stock: true, price: 1200, location: 'Warehouse A' } 
+        };
+      }
       return { 
-        status: 'success', 
-        result: { product_name: query.product_name, in_stock: true, price: 1200, location: 'Warehouse A' } 
+        status: 'error', 
+        result: { product_name: product_name, in_stock: false, reason: 'Discontinued product line.' } 
       };
-    }
-    return { 
-      status: 'error', 
-      result: { product_name: query.product_name, in_stock: false, reason: 'Discontinued product line.' } 
-    };
-  }
+    },
+  });
 
-  // Core logic to interact with the Gemini API
-  private async generateContent(messages: Message[], tools: any[]): Promise<Response> {
+  // Core logic to interact with the Gemini API using the SDK
+  private async generateContentWithSDK(userMessage: string): Promise<Response> {
     
     if (!this.env.GEMINI_API_KEY || this.env.GEMINI_API_KEY.trim() === '') {
-      return new Response('Configuration Error: GEMINI_API_KEY is missing or empty in the Worker environment.', { 
+      return new Response('Configuration Error: GEMINI_API_KEY is missing or empty.', { 
         status: 500,
         headers: { 'Content-Type': 'text/plain' }
       });
     }
-    
-    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${this.env.GEMINI_API_KEY}`;
-    
-    // System Instruction for "Thinking" and Role definition (Flattened to avoid whitespace issues)
-    const systemInstructionText = 'You are a specialized Cloudflare Agent for e-commerce support. Always think step-by-step before answering using the \'thought\' field. Use the provided tools only if necessary. For current information (e.g., "today\'s date," "current events"), use the \'google_search\' tool. For product availability, use the \'inventorySearch\' tool. Keep responses concise and helpful.';
 
-    // Corrected API payload structure: tools moved to be a top-level field.
-    const payload = {
-        contents: messages,
-        systemInstruction: systemInstructionText, 
-        tools: [ // <-- FIX: tools is a top-level field, not nested in generationConfig
-            { google_search: {} }, 
-            ...tools
-        ],
-    };
+    // Add user message to history
+    this.history.push({ role: 'user', content: userMessage });
 
-    const response = await fetch(apiUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    });
+    const systemInstruction = 'You are a specialized Cloudflare Agent for e-commerce support. Always be concise and helpful. Use the inventorySearch tool for product availability and the google_search tool for current events or dates.';
 
-    // Check for API errors
-    if (!response.ok) {
-        // Log the error body for Cloudflare Worker logs
-        const errorBody = await response.text();
-        console.error('Gemini API detailed error:', errorBody);
-        
-        // Returning the detailed error body to the client
-        return new Response(`Gemini API Error: ${response.statusText}.\nDetailed Body: ${errorBody}`, { 
-            status: response.status,
-            headers: { 'Content-Type': 'text/plain' }
-        });
-    }
+    try {
+      // The SDK handles sending the full history, tool definitions, tool execution,
+      // and the multi-turn API call internally, drastically simplifying the code.
+      const result = await generateContent({
+        model: google('gemini-2.5-flash-preview-09-2025', { 
+            apiKey: this.env.GEMINI_API_KEY 
+        }),
+        messages: this.history, // Pass the full history
+        system: systemInstruction,
+        tools: {
+          inventorySearch: this.inventoryTool, // Pass the local tool implementation
+          google_search: tool({
+            // The SDK knows how to enable the built-in google_search tool when declared
+            description: 'Performs a Google search for up-to-date information.', 
+            parameters: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] },
+          }),
+        },
+      });
 
-    const result = await response.json();
-    const candidate = result.candidates?.[0];
+      const finalResponse = result.text;
+      
+      // Update history with the final response from the model
+      this.history.push({ role: 'assistant', content: finalResponse });
+      await this.state.storage.put('history', this.history);
 
-    if (!candidate || !candidate.content) {
-        return new Response('Error: Invalid response structure from Gemini API.', { status: 500 });
-    }
+      return new Response(finalResponse, { 
+        headers: { 'Content-Type': 'text/plain' },
+      });
 
-    // Extract the AI's response content
-    const responseMessage: Message = candidate.content;
-    const parts = responseMessage.parts;
-
-    // Check for Function Call (Tool Use)
-    if (parts.length > 0 && parts[0].functionCall) {
-        const functionCall = parts[0].functionCall;
-        
-        // Add the model's function call to history
-        this.history.push(responseMessage);
-        
-        // Execute the function
-        const toolName = functionCall.name;
-        const args = functionCall.args;
-        let toolResult: Record<string, any>;
-
-        if (toolName === 'inventorySearch') {
-            toolResult = await this.inventorySearch(args as { product_name: string });
-        } else {
-            // Handle calls to unknown tools
-            toolResult = { error: 'Unknown tool called', name: toolName };
-        }
-
-        // 2nd turn: Send the tool result back to the model
-        const toolMessage: Message = {
-            role: 'tool',
-            parts: [{ functionResponse: { name: toolName, response: toolResult } }],
-        };
-        this.history.push(toolMessage);
-
-        // Corrected API payload structure for the second turn
-        const secondTurnPayload = {
-            contents: this.history, // Send full history including tool result
-            systemInstruction: systemInstructionText, // Top level
-            tools: [ // <-- FIX: tools is a top-level field
-                { google_search: {} }, 
-                ...tools
-            ],
-        };
-        
-        const secondTurnResponse = await fetch(apiUrl, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(secondTurnPayload),
-        });
-        
-        const secondTurnResult = await secondTurnResponse.json();
-        const secondTurnCandidate = secondTurnResult.candidates?.[0];
-        
-        if (!secondTurnCandidate || !secondTurnCandidate.content) {
-            return new Response('Error: Invalid second-turn response structure from Gemini API.', { status: 500 });
-        }
-        
-        // Return the final text response
-        const finalResponse = secondTurnCandidate.content.parts[0].text;
-        
-        // Update history with the final text response
-        this.history.push(secondTurnCandidate.content);
-        await this.state.storage.put('history', this.history);
-
-        return new Response(finalResponse, { 
-            headers: { 'Content-Type': 'text/plain' },
-        });
-
-    } else {
-        // Standard text response (Thinking is handled in the system prompt)
-        const text = parts[0].text;
-        
-        // Update history with the standard text response
-        this.history.push(responseMessage);
-        await this.state.storage.put('history', this.history);
-
-        return new Response(text, { 
-            headers: { 'Content-Type': 'text/plain' },
-        });
+    } catch (error) {
+      console.error('SDK Agent error:', error);
+      // If the SDK throws an error (e.g., API key issue), log it and return a 500.
+      return new Response(`An internal error occurred while processing the request: ${error.message}`, { status: 500 });
     }
   }
 
@@ -194,42 +122,16 @@ export class AgentDurableObject implements DurableObject<Env> {
         return new Response('Method Not Allowed', { status: 405 });
       }
 
-      const { message } = await request.json() as { message: string };
+      const requestBody = await request.json() as { message: string };
+      const message = requestBody.message;
+      
       if (!message) {
         return new Response('Missing message in request body', { status: 400 });
       }
 
-      // Add user message to history
-      const userMessage: Message = { role: 'user', parts: [{ text: message }] };
-      this.history.push(userMessage);
+      // Call the streamlined SDK generation logic
+      return this.generateContentWithSDK(message);
 
-      // 4. TOOL DEFINITIONS
-      const availableTools = [
-        {
-          functionDeclarations: [
-            {
-              name: 'inventorySearch',
-              description: 'Searches the internal product inventory for availability and pricing.',
-              parameters: {
-                type: 'OBJECT',
-                properties: {
-                  product_name: { type: 'STRING', description: 'The name of the product to search for, e.g., "Gaming Laptop"' },
-                },
-                required: ['product_name'],
-              },
-            },
-          ],
-        },
-      ];
-
-      // Call the core generation logic
-      try {
-        const response = await this.generateContent(this.history, availableTools);
-        return response;
-      } catch (error) {
-        console.error('Agent error:', error);
-        return new Response('An internal error occurred while processing the request.', { status: 500 });
-      }
     }
 
     // Optional: Add a history endpoint for debugging
@@ -243,7 +145,7 @@ export class AgentDurableObject implements DurableObject<Env> {
   }
 }
 
-// 5. MAIN WORKER HANDLER
+// 3. MAIN WORKER HANDLER
 /**
  * Main Worker fetch handler - Routes request to a single Durable Object instance (AgentSession).
  */

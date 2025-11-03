@@ -1,4 +1,4 @@
-name = "ubix-agent"
+name = "AutonomousAgent"
 main = "src/index.ts"
 compatibility_date = "2024-11-01"
 compatibility_flags = ["nodejs_compat"]
@@ -7,12 +7,12 @@ compatibility_flags = ["nodejs_compat"]
 directory = "public"          # your front-end
 
 [[durable_objects.bindings]]
-name = "AGENT_DO"
-class_name = "AgentDurableObject"
+name = "AutonomousAgent"
+class_name = "AutonomousAgent"
 
 [[migrations]]
 tag = "v1"
-new_sqlite_classes = ["AgentDurableObject" ]
+new_sqlite_classes = ["AutonomousAgent" ]
 
 [vars]
 GEMINI_API_KEY = "AIzaSyDxD7WiixJUVw6h0HWqW6lS8pHpVihnNTM"

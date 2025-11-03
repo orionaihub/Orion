@@ -15,4 +15,4 @@ tag = "v1"
 new_sqlite_classes = ["AgentDurableObject" ]
 
 [vars]
-GOOGLE_API_KEY = "AIzaSyDxD7WiixJUVw6h0HWqW6lS8pHpVihnNTM"
+GEMINI_API_KEY = "AIzaSyDxD7WiixJUVw6h0HWqW6lS8pHpVihnNTM"

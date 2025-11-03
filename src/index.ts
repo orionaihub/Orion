@@ -68,26 +68,17 @@ export class AgentDurableObject implements DurableObject<Env> {
     
     const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${this.env.GEMINI_API_KEY}`;
     
-    // System Instruction for "Thinking" and Role definition
-    const systemInstructionText = `
-      You are a specialized Cloudflare Agent for e-commerce support.
-      Always think step-by-step before answering using the 'thought' field. 
-      Use the provided tools only if necessary. 
-      For current information (e.g., "today's date," "current events"), use the 'google_search' tool.
-      For product availability, use the 'inventorySearch' tool.
-      Keep responses concise and helpful.
-    `;
+    // System Instruction for "Thinking" and Role definition (Flattened to avoid whitespace issues)
+    const systemInstructionText = 'You are a specialized Cloudflare Agent for e-commerce support. Always think step-by-step before answering using the \'thought\' field. Use the provided tools only if necessary. For current information (e.g., "today\'s date," "current events"), use the \'google_search\' tool. For product availability, use the \'inventorySearch\' tool. Keep responses concise and helpful.';
 
-    // Correct API payload structure: Use generationConfig instead of config
+    // Corrected API payload structure: tools moved to be a top-level field.
     const payload = {
         contents: messages,
         systemInstruction: systemInstructionText, 
-        generationConfig: { // <-- FIX APPLIED HERE
-            tools: [
-                { google_search: {} }, 
-                ...tools
-            ]
-        },
+        tools: [ // <-- FIX: tools is a top-level field, not nested in generationConfig
+            { google_search: {} }, 
+            ...tools
+        ],
     };
 
     const response = await fetch(apiUrl, {
@@ -146,16 +137,14 @@ export class AgentDurableObject implements DurableObject<Env> {
         };
         this.history.push(toolMessage);
 
-        // Correct API payload structure: Use generationConfig instead of config
+        // Corrected API payload structure for the second turn
         const secondTurnPayload = {
             contents: this.history, // Send full history including tool result
             systemInstruction: systemInstructionText, // Top level
-            generationConfig: { // <-- FIX APPLIED HERE
-                tools: [
-                    { google_search: {} }, 
-                    ...tools
-                ]
-            },
+            tools: [ // <-- FIX: tools is a top-level field
+                { google_search: {} }, 
+                ...tools
+            ],
         };
         
         const secondTurnResponse = await fetch(apiUrl, {

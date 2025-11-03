@@ -1,62 +1,61 @@
-import { GoogleGenerativeAI, GenerativeModel } from '@google/generative-ai';
+/**
+ * Autonomous Agent Durable Object
+ * 
+ * This Durable Object contains all the agent logic and has no CPU time limits.
+ * It handles WebSocket connections, maintains conversation state, and executes
+ * multi-step autonomous plans using Gemini 2.5 Flash.
+ */
 
-export class AutonomousAgent extends DurableObject {
+import { DurableObject } from 'cloudflare:workers';
+import { GoogleGenerativeAI } from '@google/generative-ai';
+import type { 
+  Env, 
+  AgentState, 
+  Message, 
+  ExecutionPlan, 
+  PlanStep,
+  TaskComplexity,
+  FileContext
+} from './types';
+
+export class AutonomousAgent extends DurableObject<Env> {
   private state: AgentState;
   private genAI: GoogleGenerativeAI;
-  private model: GenerativeModel;
-  private connections: Set<WebSocket>;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    this.state = { conversationHistory: [], context: { files: [], searchResults: [] } };
-    this.connections = new Set();
+    
+    this.state = { 
+      conversationHistory: [], 
+      context: { files: [], searchResults: [] } 
+    };
     
     // Initialize Gemini
     this.genAI = new GoogleGenerativeAI(env.GEMINI_API_KEY);
-    this.model = this.genAI.getGenerativeModel({
-      model: 'gemini-2.5-flash',
-      tools: [
-        { googleSearch: {} }, // Search grounding
-        { codeExecution: {} }, // Code execution
-        // Function declarations for external APIs
-        {
-          functionDeclarations: [
-            {
-              name: 'fetch_external_api',
-              description: 'Fetch data from external APIs',
-              parameters: {
-                type: 'object',
-                properties: {
-                  url: { type: 'string' },
-                  method: { type: 'string' },
-                  body: { type: 'string' }
-                }
-              }
-            }
-          ]
-        }
-      ]
-    });
 
     // Load persisted state
     this.ctx.blockConcurrencyWhile(async () => {
       const stored = await this.ctx.storage.get<AgentState>('state');
-      if (stored) this.state = stored;
+      if (stored) {
+        this.state = stored;
+      }
     });
   }
 
-  async fetch(request: Request) {
+  async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
 
     // WebSocket upgrade for real-time agent interaction
-    if (request.headers.get('Upgrade') === 'websocket') {
+    if (url.pathname === '/ws' && request.headers.get('Upgrade') === 'websocket') {
       const pair = new WebSocketPair();
       const [client, server] = Object.values(pair);
 
       this.ctx.acceptWebSocket(server);
-      this.connections.add(server);
 
-      return new Response(null, { status: 101, webSocket: client });
+      return new Response(null, {
+        status: 101,
+        webSocket: client,
+      });
     }
 
     // HTTP endpoints
@@ -65,25 +64,62 @@ export class AutonomousAgent extends DurableObject {
     }
 
     if (url.pathname === '/history' && request.method === 'GET') {
-      return Response.json({ history: this.state.conversationHistory });
+      return Response.json({ 
+        history: this.state.conversationHistory,
+        sessionId: this.state.sessionId,
+        messageCount: this.state.conversationHistory.length
+      });
+    }
+
+    if (url.pathname === '/clear' && request.method === 'POST') {
+      this.state = {
+        conversationHistory: [],
+        context: { files: [], searchResults: [] }
+      };
+      await this.persistState();
+      return Response.json({ status: 'cleared' });
+    }
+
+    if (url.pathname === '/status' && request.method === 'GET') {
+      return Response.json({
+        status: this.state.currentPlan ? 'executing_plan' : 'idle',
+        currentPlan: this.state.currentPlan,
+        messageCount: this.state.conversationHistory.length,
+        fileCount: this.state.context.files.length,
+        lastActivity: this.state.lastActivityAt
+      });
     }
 
     return new Response('Not found', { status: 404 });
   }
 
-  async webSocketMessage(ws: WebSocket, message: string) {
+  async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer) {
     try {
+      if (typeof message !== 'string') {
+        this.sendToClient(ws, { type: 'error', error: 'Binary messages not supported' });
+        return;
+      }
+
       const data = JSON.parse(message);
       
       if (data.type === 'user_message') {
         await this.processUserMessage(data.content, ws);
       }
     } catch (error) {
-      this.sendToClient(ws, { type: 'error', error: error.message });
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      this.sendToClient(ws, { type: 'error', error: errorMessage });
     }
   }
 
-  async processUserMessage(userMessage: string, ws: WebSocket) {
+  async webSocketClose(ws: WebSocket, code: number, reason: string) {
+    // Cleanup if needed
+    ws.close(code, reason);
+  }
+
+  async processUserMessage(userMessage: string, ws: WebSocket | null) {
+    // Update activity timestamp
+    this.state.lastActivityAt = Date.now();
+
     // Add user message to history
     this.state.conversationHistory.push({
       role: 'user',
@@ -91,24 +127,37 @@ export class AutonomousAgent extends DurableObject {
       timestamp: Date.now()
     });
 
-    // Analyze task complexity with thinking enabled
-    const complexity = await this.analyzeTaskComplexity(userMessage);
+    try {
+      // Analyze task complexity with thinking enabled
+      const complexity = await this.analyzeTaskComplexity(userMessage);
 
-    if (complexity.type === 'simple') {
-      // Single-turn response with tools
-      await this.handleSimpleQuery(userMessage, ws);
-    } else {
-      // Multi-step autonomous execution
-      await this.handleComplexTask(userMessage, complexity, ws);
+      if (complexity.type === 'simple') {
+        // Single-turn response with tools
+        await this.handleSimpleQuery(userMessage, ws);
+      } else {
+        // Multi-step autonomous execution
+        await this.handleComplexTask(userMessage, complexity, ws);
+      }
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      if (ws) {
+        this.sendToClient(ws, { type: 'error', error: errorMessage });
+      }
     }
 
-    // Persist state
+    // Persist state after processing
     await this.persistState();
   }
 
-  async analyzeTaskComplexity(query: string) {
-    // Use Gemini with thinking to analyze task
-    const result = await this.model.generateContent({
+  async analyzeTaskComplexity(query: string): Promise<TaskComplexity> {
+    const model = this.genAI.getGenerativeModel({
+      model: 'gemini-2.5-flash',
+      generationConfig: {
+        responseMimeType: 'application/json',
+      }
+    });
+
+    const result = await model.generateContent({
       contents: [
         {
           role: 'user',
@@ -129,26 +178,33 @@ Respond in JSON format:
 }`
           }]
         }
-      ],
-      generationConfig: {
-        responseMimeType: 'application/json',
-        // Enable thinking for analysis
-        thinkingConfig: {
-          thinkingBudget: 2048,
-          includeThoughts: true
-        }
-      }
+      ]
     });
 
-    return JSON.parse(result.response.text());
+    const response = await result.response;
+    return JSON.parse(response.text()) as TaskComplexity;
   }
 
-  async handleSimpleQuery(query: string, ws: WebSocket) {
-    this.sendToClient(ws, { type: 'status', message: 'Processing query...' });
+  async handleSimpleQuery(query: string, ws: WebSocket | null) {
+    if (ws) {
+      this.sendToClient(ws, { type: 'status', message: 'Processing query...' });
+    }
 
-    // Create chat session with full context
-    const chat = this.model.startChat({
-      history: this.state.conversationHistory,
+    // Create model with tools
+    const model = this.genAI.getGenerativeModel({
+      model: 'gemini-2.5-flash',
+      tools: [
+        { googleSearch: {} },
+        { codeExecution: {} }
+      ]
+    });
+
+    // Create chat with history
+    const chat = model.startChat({
+      history: this.state.conversationHistory.slice(0, -1).map(msg => ({
+        role: msg.role,
+        parts: msg.parts
+      }))
     });
 
     // Stream response
@@ -156,84 +212,106 @@ Respond in JSON format:
 
     for await (const chunk of result.stream) {
       const text = chunk.text();
-      if (text) {
+      if (text && ws) {
         this.sendToClient(ws, { type: 'chunk', content: text });
       }
     }
 
-    // Final response with sources if available
+    // Get final response
     const response = await result.response;
     
     // Store response in history
     this.state.conversationHistory.push({
       role: 'model',
-      parts: response.candidates[0].content.parts,
+      parts: response.candidates?.[0]?.content?.parts || [],
       timestamp: Date.now()
     });
 
-    // Check for grounding metadata (sources)
-    const groundingMetadata = response.candidates[0].groundingMetadata;
-    if (groundingMetadata) {
-      this.sendToClient(ws, { 
-        type: 'sources', 
-        sources: groundingMetadata.webSearchQueries 
-      });
+    if (ws) {
+      this.sendToClient(ws, { type: 'done' });
     }
-
-    this.sendToClient(ws, { type: 'done' });
   }
 
-  async handleComplexTask(query: string, complexity: any, ws: WebSocket) {
-    this.sendToClient(ws, { type: 'status', message: 'Creating execution plan...' });
+  async handleComplexTask(query: string, complexity: TaskComplexity, ws: WebSocket | null) {
+    if (ws) {
+      this.sendToClient(ws, { type: 'status', message: 'Creating execution plan...' });
+    }
 
     // Generate execution plan
     const plan = await this.generateExecutionPlan(query, complexity);
     this.state.currentPlan = plan;
 
-    this.sendToClient(ws, { type: 'plan', plan });
+    if (ws) {
+      this.sendToClient(ws, { type: 'plan', plan });
+    }
 
     // Enter autonomous execution mode
     for (let i = 0; i < plan.steps.length; i++) {
       const step = plan.steps[i];
       plan.currentStepIndex = i;
       
-      this.sendToClient(ws, { 
-        type: 'step_start', 
-        step: i + 1, 
-        total: plan.steps.length,
-        description: step.description 
-      });
+      if (ws) {
+        this.sendToClient(ws, { 
+          type: 'step_start', 
+          step: i + 1, 
+          total: plan.steps.length,
+          description: step.description 
+        });
+      }
 
       try {
+        step.status = 'executing';
+        step.startedAt = Date.now();
+
         // Execute step with full context
         const result = await this.executeStep(step);
+        
         step.result = result;
         step.status = 'completed';
+        step.completedAt = Date.now();
+        step.durationMs = step.completedAt - (step.startedAt || 0);
 
-        this.sendToClient(ws, { 
-          type: 'step_complete', 
-          step: i + 1,
-          result 
-        });
+        if (ws) {
+          this.sendToClient(ws, { 
+            type: 'step_complete', 
+            step: i + 1,
+            result 
+          });
+        }
 
         // Persist after each step
         await this.persistState();
       } catch (error) {
         step.status = 'failed';
-        this.sendToClient(ws, { 
-          type: 'step_error', 
-          step: i + 1,
-          error: error.message 
-        });
+        step.error = error instanceof Error ? error.message : 'Unknown error';
+        
+        if (ws) {
+          this.sendToClient(ws, { 
+            type: 'step_error', 
+            step: i + 1,
+            error: step.error
+          });
+        }
         break;
       }
     }
 
     // Synthesize final response
     await this.synthesizeFinalResponse(ws);
+    
+    // Mark plan as completed
+    plan.status = 'completed';
+    plan.completedAt = Date.now();
   }
 
-  async generateExecutionPlan(query: string, complexity: any): Promise<ExecutionPlan> {
+  async generateExecutionPlan(query: string, complexity: TaskComplexity): Promise<ExecutionPlan> {
+    const model = this.genAI.getGenerativeModel({
+      model: 'gemini-2.5-flash',
+      generationConfig: {
+        responseMimeType: 'application/json',
+      }
+    });
+
     const planningPrompt = `You are an autonomous agent planner. Given this user request, create a detailed step-by-step execution plan.
 
 User Request: ${query}
@@ -251,27 +329,25 @@ Return JSON array of steps:
     "id": "step_1",
     "description": "Search for X",
     "action": "search"
-  },
-  ...
+  }
 ]`;
 
-    const result = await this.model.generateContent({
-      contents: [{ role: 'user', parts: [{ text: planningPrompt }] }],
-      generationConfig: {
-        responseMimeType: 'application/json',
-        thinkingConfig: {
-          thinkingBudget: 4096,
-          includeThoughts: true
-        }
-      }
+    const result = await model.generateContent({
+      contents: [{ role: 'user', parts: [{ text: planningPrompt }] }]
     });
 
-    const steps = JSON.parse(result.response.text());
+    const response = await result.response;
+    const steps = JSON.parse(response.text());
 
     return {
-      steps,
+      steps: steps.map((s: any, i: number) => ({
+        ...s,
+        id: s.id || `step_${i + 1}`,
+        status: 'pending' as const
+      })),
       currentStepIndex: 0,
-      status: 'executing'
+      status: 'executing',
+      createdAt: Date.now()
     };
   }
 
@@ -279,36 +355,31 @@ Return JSON array of steps:
     // Build context-aware prompt
     const contextPrompt = this.buildContextualPrompt(step);
 
-    const chat = this.model.startChat({
-      history: this.state.conversationHistory,
+    const model = this.genAI.getGenerativeModel({
+      model: 'gemini-2.5-flash',
+      tools: [
+        { googleSearch: {} },
+        { codeExecution: {} }
+      ]
+    });
+
+    const chat = model.startChat({
+      history: this.state.conversationHistory.map(msg => ({
+        role: msg.role,
+        parts: msg.parts
+      }))
     });
 
     const result = await chat.sendMessage(contextPrompt);
-
-    // Handle function calls if any
-    const response = result.response;
-    const functionCall = response.functionCalls()?.[0];
-
-    if (functionCall) {
-      // Execute function (e.g., external API call)
-      const functionResult = await this.executeFunction(functionCall);
-      
-      // Send function result back to model
-      const followUp = await chat.sendMessage([{
-        functionResponse: {
-          name: functionCall.name,
-          response: functionResult
-        }
-      }]);
-
-      return followUp.response.text();
-    }
+    const response = await result.response;
 
     return response.text();
   }
 
   buildContextualPrompt(step: PlanStep): string {
     const plan = this.state.currentPlan;
+    if (!plan) return step.description;
+
     const completedSteps = plan.steps
       .filter(s => s.status === 'completed')
       .map(s => `${s.description}: ${s.result}`)
@@ -318,49 +389,48 @@ Return JSON array of steps:
 Plan Overview: ${plan.steps.map(s => s.description).join(' → ')}
 
 Completed Steps:
-${completedSteps}
+${completedSteps || 'None yet'}
 
 Current Step: ${step.description}
 Action Type: ${step.action}
 
-Files Context: ${JSON.stringify(this.state.context.files)}
-
 Execute this step and provide the result.`;
   }
 
-  async executeFunction(functionCall: any): Promise<any> {
-    // Handle external API calls
-    if (functionCall.name === 'fetch_external_api') {
-      const { url, method, body } = functionCall.args;
-      const response = await fetch(url, {
-        method,
-        body: body ? JSON.stringify(body) : undefined,
-        headers: { 'Content-Type': 'application/json' }
-      });
-      return await response.json();
+  async synthesizeFinalResponse(ws: WebSocket | null) {
+    if (ws) {
+      this.sendToClient(ws, { type: 'status', message: 'Synthesizing final response...' });
     }
-    
-    throw new Error(`Unknown function: ${functionCall.name}`);
-  }
-
-  async synthesizeFinalResponse(ws: WebSocket) {
-    this.sendToClient(ws, { type: 'status', message: 'Synthesizing final response...' });
 
     const plan = this.state.currentPlan;
+    if (!plan) return;
+
+    const originalRequest = this.state.conversationHistory
+      .find(m => m.role === 'user')?.parts[0];
+    
+    const originalText = originalRequest && 'text' in originalRequest 
+      ? originalRequest.text 
+      : 'Unknown request';
+
     const synthesisPrompt = `Based on the execution of this plan, provide a comprehensive final response to the user.
 
-Original User Request: ${this.state.conversationHistory[0].parts[0].text}
+Original User Request: ${originalText}
 
 Execution Results:
-${plan.steps.map((s, i) => `Step ${i+1} (${s.description}): ${s.result}`).join('\n\n')}
+${plan.steps.map((s, i) => `Step ${i+1} (${s.description}): ${s.result || 'No result'}`).join('\n\n')}
 
 Synthesize a clear, complete response that addresses the user's original request.`;
 
-    const result = await this.model.generateContent({
-      contents: [{ role: 'user', parts: [{ text: synthesisPrompt }] }],
+    const model = this.genAI.getGenerativeModel({
+      model: 'gemini-2.5-flash'
     });
 
-    const finalResponse = result.response.text();
+    const result = await model.generateContent({
+      contents: [{ role: 'user', parts: [{ text: synthesisPrompt }] }]
+    });
+
+    const response = await result.response;
+    const finalResponse = response.text();
 
     // Store in history
     this.state.conversationHistory.push({
@@ -369,10 +439,11 @@ Synthesize a clear, complete response that addresses the user's original request
       timestamp: Date.now()
     });
 
-    this.sendToClient(ws, { type: 'final_response', content: finalResponse });
-    this.sendToClient(ws, { type: 'done' });
+    if (ws) {
+      this.sendToClient(ws, { type: 'final_response', content: finalResponse });
+      this.sendToClient(ws, { type: 'done' });
+    }
 
-    plan.status = 'completed';
     await this.persistState();
   }
 
@@ -388,17 +459,12 @@ Synthesize a clear, complete response that addresses the user's original request
     await this.ctx.storage.put('state', this.state);
   }
 
-  async handleChatRequest(request: Request) {
-    const { message } = await request.json();
+  async handleChatRequest(request: Request): Promise<Response> {
+    const { message } = await request.json<{ message: string }>();
     
-    // For HTTP requests, return immediately and process async
+    // For HTTP requests, process async
     this.ctx.waitUntil(this.processUserMessage(message, null));
     
     return Response.json({ status: 'processing' });
-  }
-
-  webSocketClose(ws: WebSocket) {
-    this.connections.delete(ws);
-    ws.close();
   }
 }

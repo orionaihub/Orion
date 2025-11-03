@@ -58,6 +58,14 @@ export class AgentDurableObject implements DurableObject<Env> {
 
   // Core logic to interact with the Gemini API
   private async generateContent(messages: Message[], tools: any[]): Promise<Response> {
+    
+    if (!this.env.GEMINI_API_KEY || this.env.GEMINI_API_KEY.trim() === '') {
+      return new Response('Configuration Error: GEMINI_API_KEY is missing or empty in the Worker environment.', { 
+        status: 500,
+        headers: { 'Content-Type': 'text/plain' }
+      });
+    }
+    
     const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${this.env.GEMINI_API_KEY}`;
     
     // System Instruction for "Thinking" and Role definition
@@ -70,14 +78,12 @@ export class AgentDurableObject implements DurableObject<Env> {
       Keep responses concise and helpful.
     `;
 
-    // Correct API payload structure
+    // Correct API payload structure: Use generationConfig instead of config
     const payload = {
         contents: messages,
-        // systemInstruction is a top-level field for the REST API
         systemInstruction: systemInstructionText, 
-        config: {
+        generationConfig: { // <-- FIX APPLIED HERE
             tools: [
-                // Correct key for Google Search grounding is snake_case: google_search
                 { google_search: {} }, 
                 ...tools
             ]
@@ -96,12 +102,11 @@ export class AgentDurableObject implements DurableObject<Env> {
         const errorBody = await response.text();
         console.error('Gemini API detailed error:', errorBody);
         
-        // --- FIX: Returning the detailed error body to the client ---
+        // Returning the detailed error body to the client
         return new Response(`Gemini API Error: ${response.statusText}.\nDetailed Body: ${errorBody}`, { 
             status: response.status,
             headers: { 'Content-Type': 'text/plain' }
         });
-        // --- END FIX ---
     }
 
     const result = await response.json();
@@ -141,12 +146,13 @@ export class AgentDurableObject implements DurableObject<Env> {
         };
         this.history.push(toolMessage);
 
+        // Correct API payload structure: Use generationConfig instead of config
         const secondTurnPayload = {
             contents: this.history, // Send full history including tool result
             systemInstruction: systemInstructionText, // Top level
-            config: {
+            generationConfig: { // <-- FIX APPLIED HERE
                 tools: [
-                    { google_search: {} }, // Corrected key
+                    { google_search: {} }, 
                     ...tools
                 ]
             },

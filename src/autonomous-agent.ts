@@ -1,11 +1,4 @@
-/**
- * Autonomous Agent Durable Object – SQLite-backed, WebSocket-ready
- * 
- * Handles:
- *   • /api/ws   → WebSocket (real-time streaming)
- *   • /api/chat → POST { message } → async processing
- *   • /api/history, /api/clear, /api/status
- */
+// src/autonomous-agent.ts
 import { DurableObject } from 'cloudflare:workers';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import type {
@@ -29,7 +22,7 @@ export class AutonomousAgent extends DurableObject<Env> {
     this.sql = state.storage.sql;
     this.genAI = new GoogleGenerativeAI(env.GEMINI_API_KEY);
 
-    // Create tables once (idempotent) with error handling
+    // Create tables (idempotent) – wrapped in try/catch
     try {
       this.sql.exec(`
         CREATE TABLE IF NOT EXISTS kv (
@@ -50,7 +43,7 @@ export class AutonomousAgent extends DurableObject<Env> {
   }
 
   // -----------------------------------------------------------------
-  // JSON helpers (robust parsing)
+  // JSON helpers
   // -----------------------------------------------------------------
   private parse<T>(text: string): T {
     const trimmed = text.trim().replace(/^```json\s*/, '').replace(/```$/, '');
@@ -62,7 +55,7 @@ export class AutonomousAgent extends DurableObject<Env> {
   }
 
   // -----------------------------------------------------------------
-  // Load / save state from SQLite (kv table) – deadlock-free init
+  // Load state – **no save here** (prevents deadlock)
   // -----------------------------------------------------------------
   private async loadState(): Promise<AgentState> {
     const row = this.sql.exec(`SELECT value FROM kv WHERE key = 'state'`).one();
@@ -70,22 +63,23 @@ export class AutonomousAgent extends DurableObject<Env> {
       try {
         return this.parse<AgentState>(row.value as string);
       } catch (e) {
-        console.error('Parse state error:', e);
-        // Fall through to defaults if corrupted
+        console.error('Corrupted state, resetting:', e);
       }
     }
 
-    // First-time init: Create defaults WITHOUT blocking (no save here)
-    const defaults: AgentState = {
+    // First-time defaults
+    return {
       conversationHistory: [],
       context: { files: [], searchResults: [] },
       sessionId: this.ctx.id.toString(),
       lastActivityAt: Date.now(),
       currentPlan: undefined,
     };
-    return defaults;
   }
 
+  // -----------------------------------------------------------------
+  // Save state – serialized with blockConcurrencyWhile
+  // -----------------------------------------------------------------
   private async saveState(state: AgentState): Promise<void> {
     await this.ctx.blockConcurrencyWhile(async () => {
       this.sql.exec(
@@ -110,13 +104,13 @@ export class AutonomousAgent extends DurableObject<Env> {
       return new Response(null, { status: 101, webSocket: client });
     }
 
-    // Load state once for the request
+    // Load state (now safe)
     let state: AgentState;
     try {
       state = await this.loadState();
-      console.log('State loaded:', state.sessionId);
+      console.log('State loaded – sessionId:', state.sessionId);
     } catch (e) {
-      console.error('State load error', e);
+      console.error('State load failed:', e);
       return new Response(JSON.stringify({ error: 'Failed to load state' }), {
         status: 500,
         headers: { 'Content-Type': 'application/json' },
@@ -163,7 +157,7 @@ export class AutonomousAgent extends DurableObject<Env> {
   }
 
   // -----------------------------------------------------------------
-  // Core message processing
+  // Core processing
   // -----------------------------------------------------------------
   private async processUserMessage(userMsg: string, ws: WebSocket | null) {
     let state = await this.loadState();
@@ -187,23 +181,24 @@ export class AutonomousAgent extends DurableObject<Env> {
       const msg = e instanceof Error ? e.message : 'Unknown error';
       if (ws) this.send(ws, { type: 'error', error: msg });
     } finally {
+      // Persist state after processing
       await this.saveState(state);
     }
   }
 
   // -----------------------------------------------------------------
-  // Send JSON over WebSocket (safe)
+  // Send helper
   // -----------------------------------------------------------------
   private send(ws: WebSocket, data: unknown) {
     try {
       ws.send(this.stringify(data));
     } catch (err) {
-      console.error('WebSocket send error:', err);
+      console.error('WS send error:', err);
     }
   }
 
   // -----------------------------------------------------------------
-  // Task complexity analysis
+  // Complexity analysis
   // -----------------------------------------------------------------
   private async analyzeTaskComplexity(query: string): Promise<TaskComplexity> {
     const model = this.genAI.getGenerativeModel({
@@ -227,7 +222,7 @@ Request: ${query}` }]
   }
 
   // -----------------------------------------------------------------
-  // Simple query – streaming response
+  // Simple query – streaming
   // -----------------------------------------------------------------
   private async handleSimpleQuery(
     query: string,
@@ -252,7 +247,6 @@ Request: ${query}` }]
       if (ws) this.send(ws, { type: 'chunk', content: txt });
     }
 
-    // Save assistant response
     this.sql.exec(
       `INSERT INTO history (role, parts, timestamp) VALUES ('model', ?, ?)`,
       this.stringify([{ text: full }]),
@@ -263,7 +257,7 @@ Request: ${query}` }]
   }
 
   // -----------------------------------------------------------------
-  // Complex task – planning + execution
+  // Complex task – plan + steps
   // -----------------------------------------------------------------
   private async handleComplexTask(
     query: string,
@@ -479,7 +473,6 @@ Give a concise, user-facing answer.`;
         parts,
       });
     }
-    // Remove last user message (will be sent separately)
     if (hist.length > 0 && hist[hist.length - 1].role === 'user') hist.pop();
     return hist;
   }

@@ -1,634 +1,470 @@
 /**
- * Autonomous Agent Worker Entry Point
- *
- * This Worker acts as a thin routing layer (<10ms CPU) that immediately
- * delegates all agent logic to the AutonomousAgent Durable Object.
- *
- * Architecture:
- * - Worker: Routes requests, manages sessions, handles CORS
- * - Durable Object: Contains ALL agent logic, runs without CPU limits
- *
- * @license MIT
+ * Autonomous Agent Durable Object
+ * 
+ * This Durable Object contains all the agent logic and has no CPU time limits.
+ * It handles WebSocket connections, maintains conversation state, and executes
+ * multi-step autonomous plans using Gemini 2.5 Flash.
  */
 
-import { Env } from './types';
-import { AutonomousAgent } from './autonomous-agent';
+import { DurableObject } from 'cloudflare:workers';
+import { GoogleGenerativeAI } from '@google/generative-ai';
+import type { 
+  Env, 
+  AgentState, 
+  Message, 
+  ExecutionPlan, 
+  PlanStep,
+  TaskComplexity,
+  FileContext
+} from './types';
 
-// Export the Durable Object class
-export { AutonomousAgent };
+export class AutonomousAgent extends DurableObject<Env> {
+  private state: AgentState;
+  private genAI: GoogleGenerativeAI;
 
-export default {
-  /**
-   * Main request handler for the Worker
-   *
-   * This function must stay under 10ms CPU time on Free Tier.
-   * All complex logic is delegated to the Durable Object.
-   */
-  async fetch(
-    request: Request,
-    env: Env,
-    ctx: ExecutionContext,
-  ): Promise<Response> {
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+    
+    this.state = { 
+      conversationHistory: [], 
+      context: { files: [], searchResults: [] } 
+    };
+    
+    // Initialize Gemini
+    this.genAI = new GoogleGenerativeAI(env.GEMINI_API_KEY);
+
+    // Load persisted state
+    this.ctx.blockConcurrencyWhile(async () => {
+      const stored = await this.ctx.storage.get<AgentState>('state');
+      if (stored) {
+        this.state = stored;
+      }
+    });
+  }
+
+  async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
 
-    // Handle static assets (frontend UI)
-    if (url.pathname === '/' || url.pathname.startsWith('/public/')) {
-      if (env.ASSETS) {
-        return env.ASSETS.fetch(request);
-      }
-      // Fallback for local dev without assets binding
-      return new Response(getBasicHTML(), {
-        headers: { 'Content-Type': 'text/html' },
+    // WebSocket upgrade for real-time agent interaction
+    if (url.pathname === '/ws' && request.headers.get('Upgrade') === 'websocket') {
+      const pair = new WebSocketPair();
+      const [client, server] = Object.values(pair);
+
+      this.ctx.acceptWebSocket(server);
+
+      return new Response(null, {
+        status: 101,
+        webSocket: client,
       });
     }
 
-    // All API routes go to Durable Object
-    if (url.pathname.startsWith('/api/')) {
-      return handleApiRequest(request, env, url);
+    // HTTP endpoints
+    if (url.pathname === '/chat' && request.method === 'POST') {
+      return this.handleChatRequest(request);
     }
 
-    // Handle 404 for unmatched routes
+    if (url.pathname === '/history' && request.method === 'GET') {
+      return Response.json({ 
+        history: this.state.conversationHistory,
+        sessionId: this.state.sessionId,
+        messageCount: this.state.conversationHistory.length
+      });
+    }
+
+    if (url.pathname === '/clear' && request.method === 'POST') {
+      this.state = {
+        conversationHistory: [],
+        context: { files: [], searchResults: [] }
+      };
+      await this.persistState();
+      return Response.json({ status: 'cleared' });
+    }
+
+    if (url.pathname === '/status' && request.method === 'GET') {
+      return Response.json({
+        status: this.state.currentPlan ? 'executing_plan' : 'idle',
+        currentPlan: this.state.currentPlan,
+        messageCount: this.state.conversationHistory.length,
+        fileCount: this.state.context.files.length,
+        lastActivity: this.state.lastActivityAt
+      });
+    }
+
     return new Response('Not found', { status: 404 });
-  },
-} satisfies ExportedHandler<Env>;
-
-/**
- * Handle API requests by routing to the appropriate Durable Object
- *
- * This function creates or retrieves a Durable Object instance based on
- * the session ID, then forwards the request to it.
- */
-async function handleApiRequest(
-  request: Request,
-  env: Env,
-  url: URL,
-): Promise<Response> {
-  // Get or create session ID from cookie or generate new one
-  const sessionId = getSessionId(request) || generateSessionId();
-
-  // Get the Durable Object stub for this session
-  // Using idFromName ensures the same user always connects to the same instance
-  const id = env.AutonomousAgent.idFromName(sessionId);
-  const stub = env.AutonomousAgent.get(id);
-
-  // Set CORS headers for cross-origin requests
-  const corsHeaders = {
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS, DELETE',
-    'Access-Control-Allow-Headers': 'Content-Type, Upgrade, Connection',
-  };
-
-  // Handle CORS preflight
-  if (request.method === 'OPTIONS') {
-    return new Response(null, { headers: corsHeaders });
   }
 
-  let response: Response;
-
-  try {
-    // Route based on endpoint
-    if (url.pathname === '/api/chat' && request.method === 'POST') {
-      // Send chat message (HTTP endpoint - for non-WebSocket clients)
-      response = await stub.fetch(
-        new Request('http://internal/chat', {
-          method: 'POST',
-          body: request.body,
-          headers: request.headers,
-        })
-      );
-    } else if (url.pathname === '/api/ws') {
-      // WebSocket upgrade – fixed headers
-      const upgradeReq = new Request('http://internal/ws', {
-        headers: {
-          upgrade               : 'websocket',
-          connection            : 'upgrade',
-          'sec-websocket-key'    : request.headers.get('Sec-WebSocket-Key')!,
-          'sec-websocket-version': request.headers.get('Sec-WebSocket-Version')!,
-        },
-      });
-      response = await stub.fetch(upgradeReq);
-    } else if (url.pathname === '/api/history' && request.method === 'GET') {
-      // Get conversation history
-      response = await stub.fetch('http://internal/history');
-    } else if (url.pathname === '/api/clear' && request.method === 'POST') {
-      // Clear conversation history and reset agent state
-      response = await stub.fetch('http://internal/clear', { method: 'POST' });
-    } else if (url.pathname === '/api/upload' && request.method === 'POST') {
-      // Upload files (images, PDFs, documents)
-      response = await stub.fetch(
-        new Request('http://internal/upload', {
-          method: 'POST',
-          body: request.body,
-          headers: request.headers,
-        })
-      );
-    } else if (url.pathname === '/api/files' && request.method === 'GET') {
-      // List uploaded files
-      response = await stub.fetch('http://internal/files');
-    } else if (url.pathname === '/api/files' && request.method === 'DELETE') {
-      // Delete a file
-      response = await stub.fetch(
-        new Request('http://internal/files', {
-          method: 'DELETE',
-          body: request.body,
-          headers: request.headers,
-        })
-      );
-    } else if (url.pathname === '/api/status' && request.method === 'GET') {
-      // Get agent status and current plan
-      response = await stub.fetch('http://internal/status');
-    } else {
-      response = new Response('Not found', { status: 404 });
-    }
-  } catch (error) {
-    console.error('Error routing to Durable Object:', error);
-    response = new Response(
-      JSON.stringify({
-        error: 'Internal server error',
-        message: error instanceof Error ? error.message : 'Unknown error',
-      }),
-      {
-        status: 500,
-        headers: { 'Content-Type': 'application/json' },
+  async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer) {
+    try {
+      if (typeof message !== 'string') {
+        this.sendToClient(ws, { type: 'error', error: 'Binary messages not supported' });
+        return;
       }
-    );
-  }
 
-  // Add session cookie and CORS headers to response
-  const headers = new Headers(response.headers);
-
-  // Add session cookie if not present
-  if (!getSessionId(request)) {
-    headers.set(
-      'Set-Cookie',
-      `session_id=${sessionId}; Path=/; HttpOnly; SameSite=Strict; Max-Age=2592000` // 30 days
-    );
-  }
-
-  // Add CORS headers
-  Object.entries(corsHeaders).forEach(([key, value]) => {
-    headers.set(key, value);
-  });
-
-  return new Response(response.body, {
-    status: response.status,
-    statusText: response.statusText,
-    headers,
-  });
-}
-
-/**
- * Get session ID from cookie
- */
-function getSessionId(request: Request): string | null {
-  const cookieHeader = request.headers.get('Cookie');
-  if (!cookieHeader) return null;
-
-  const cookies = cookieHeader.split(';').map((c) => c.trim());
-  const sessionCookie = cookies.find((c) => c.startsWith('session_id='));
-
-  if (sessionCookie) {
-    return sessionCookie.split('=')[1];
-  }
-
-  return null;
-}
-
-/**
- * Generate a unique session ID
- *
- * Format: session_timestamp_random
- * This ensures uniqueness and provides temporal ordering
- */
-function generateSessionId(): string {
-  return `session_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`;
-}
-
-/**
- * Basic HTML for testing without assets binding
- *
- * This provides a minimal UI for interacting with the agent
- * during development or when ASSETS binding is not configured.
- */
-function getBasicHTML(): string {
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Autonomous Agent</title>
-  <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-      min-height: 100vh;
-      padding: 20px;
-    }
-    .container {
-      max-width: 900px;
-      margin: 0 auto;
-      background: white;
-      border-radius: 16px;
-      box-shadow: 0 20px 60px rgba(0,0,0,0.3);
-      overflow: hidden;
-      display: flex;
-      flex-direction: column;
-      height: calc(100vh - 40px);
-    }
-    .header {
-      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-      color: white;
-      padding: 24px;
-      text-align: center;
-    }
-    .header h1 { font-size: 28px; margin-bottom: 8px; }
-    .header p { opacity: 0.9; font-size: 14px; }
-    .chat-container {
-      flex: 1;
-      overflow-y: auto;
-      padding: 20px;
-      background: #f8f9fa;
-    }
-    .message {
-      margin-bottom: 16px;
-      display: flex;
-      gap: 12px;
-      animation: slideIn 0.3s ease;
-    }
-    @keyframes slideIn {
-      from { opacity: 0; transform: translateY(10px); }
-      to { opacity: 1; transform: translateY(0); }
-    }
-    .message.user { flex-direction: row-reverse; }
-    .message-content {
-      max-width: 70%;
-      padding: 12px 16px;
-      border-radius: 12px;
-      line-height: 1.5;
-    }
-    .message.user .message-content {
-      background: #667eea;
-      color: white;
-      border-bottom-right-radius: 4px;
-    }
-    .message.agent .message-content {
-      background: white;
-      color: #333;
-      border-bottom-left-radius: 4px;
-      box-shadow: 0 2px 8px rgba(0,0,0,0.1);
-    }
-    .message.status .message-content {
-      background: #fff3cd;
-      color: #856404;
-      border-left: 4px solid #ffc107;
-      max-width: 100%;
-    }
-    .plan {
-      background: #e3f2fd;
-      border-left: 4px solid #2196f3;
-      padding: 12px;
-      margin: 12px 0;
-      border-radius: 4px;
-    }
-    .plan-step {
-      padding: 8px;
-      margin: 4px 0;
-      background: white;
-      border-radius: 4px;
-      font-size: 14px;
-    }
-    .plan-step.active { border-left: 3px solid #4caf50; font-weight: 500; }
-    .plan-step.completed { opacity: 0.6; text-decoration: line-through; }
-    .input-container {
-      padding: 20px;
-      background: white;
-      border-top: 1px solid #e0e0e0;
-    }
-    .input-row {
-      display: flex;
-      gap: 12px;
-    }
-    textarea {
-      flex: 1;
-      padding: 12px;
-      border: 2px solid #e0e0e0;
-      border-radius: 8px;
-      resize: none;
-      font-family: inherit;
-      font-size: 14px;
-      transition: border-color 0.2s;
-    }
-    textarea:focus {
-      outline: none;
-      border-color: #667eea;
-    }
-    button {
-      padding: 12px 24px;
-      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-      color: white;
-      border: none;
-      border-radius: 8px;
-      cursor: pointer;
-      font-weight: 600;
-      transition: transform 0.2s, box-shadow 0.2s;
-    }
-    button:hover {
-      transform: translateY(-2px);
-      box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
-    }
-    button:disabled {
-      opacity: 0.5;
-      cursor: not-allowed;
-      transform: none;
-    }
-    .controls {
-      display: flex;
-      gap: 8px;
-      margin-top: 8px;
-    }
-    .controls button {
-      padding: 8px 16px;
-      font-size: 12px;
-      background: #6c757d;
-    }
-    .typing {
-      display: inline-block;
-      padding: 8px 16px;
-      background: white;
-      border-radius: 12px;
-      box-shadow: 0 2px 8px rgba(0,0,0,0.1);
-    }
-    .typing span {
-      display: inline-block;
-      width: 8px;
-      height: 8px;
-      border-radius: 50%;
-      background: #667eea;
-      margin: 0 2px;
-      animation: typing 1.4s infinite;
-    }
-    .typing span:nth-child(2) { animation-delay: 0.2s; }
-    .typing span:nth-child(3) { animation-delay: 0.4s; }
-    @keyframes typing {
-      0%, 60%, 100% { transform: translateY(0); }
-      30% { transform: translateY(-10px); }
-    }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <div class="header">
-      <h1>🤖 Autonomous Agent</h1>
-      <p>Powered by Gemini 2.5 Flash • Multi-step reasoning & execution</p>
-    </div>
-
-    <div class="chat-container" id="chat"></div>
-
-    <div class="input-container">
-      <div class="input-row">
-        <textarea
-          id="input"
-          placeholder="Ask me anything or give me a complex task to execute autonomously..."
-          rows="3"
-        ></textarea>
-        <button id="send" onclick="sendMessage()">Send</button>
-      </div>
-      <div class="controls">
-        <button onclick="clearHistory()">Clear History</button>
-        <button onclick="viewHistory()">View History</button>
-      </div>
-    </div>
-  </div>
-
-  <script>
-    let ws = null;
-    let isConnecting = false;
-
-    // Connect to WebSocket
-    function connect() {
-      if (ws && ws.readyState === WebSocket.OPEN) return;
-      if (isConnecting) return;
-
-      isConnecting = true;
-      const wsUrl = new URL('/api/ws', location.href);
-      wsUrl.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-      ws = new WebSocket(wsUrl);
-
-      ws.onopen = function () {
-        console.log('WebSocket connected');
-        isConnecting = false;
-        addStatusMessage('Connected to agent');
-      };
-
-      ws.onmessage = function (event) {
-        const data = JSON.parse(event.data);
-        handleMessage(data);
-      };
-
-      ws.onclose = function () {
-        console.log('WebSocket closed');
-        isConnecting = false;
-        addStatusMessage('Disconnected. Reconnecting...');
-        setTimeout(connect, 2000);
-      };
-
-      ws.onerror = function (error) {
-        console.error('WebSocket error:', error);
-        isConnecting = false;
-      };
-    }
-
-    let currentMessageEl = null;
-    let currentPlanEl = null;
-
-    function handleMessage(data) {
-      switch (data.type) {
-        case 'status':
-          addStatusMessage(data.message);
-          break;
-        case 'chunk':
-          if (!currentMessageEl) {
-            currentMessageEl = addMessage('agent', '');
-          }
-          currentMessageEl.textContent += data.content;
-          scrollToBottom();
-          break;
-        case 'plan':
-          currentPlanEl = addPlan(data.plan);
-          break;
-        case 'step_start':
-          updatePlanStep(data.step - 1, 'active');
-          addStatusMessage('Executing: ' + data.description);
-          break;
-        case 'step_complete':
-          updatePlanStep(data.step - 1, 'completed');
-          break;
-        case 'step_error':
-          addStatusMessage('Error in step ' + data.step + ': ' + data.error, true);
-          break;
-        case 'final_response':
-          currentMessageEl = addMessage('agent', data.content);
-          break;
-        case 'sources':
-          addSources(data.sources);
-          break;
-        case 'done':
-          currentMessageEl = null;
-          removeTyping();
-          break;
-        case 'error':
-          addStatusMessage('Error: ' + data.error, true);
-          removeTyping();
-          break;
+      const data = JSON.parse(message);
+      
+      if (data.type === 'user_message') {
+        await this.processUserMessage(data.content, ws);
       }
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      this.sendToClient(ws, { type: 'error', error: errorMessage });
     }
+  }
 
-    function sendMessage() {
-      const input = document.getElementById('input');
-      const message = input.value.trim();
-      if (!message) return;
+  async webSocketClose(ws: WebSocket, code: number, reason: string) {
+    // Cleanup if needed
+    ws.close(code, reason);
+  }
 
-      addMessage('user', message);
-      input.value = '';
+  async processUserMessage(userMessage: string, ws: WebSocket | null) {
+    // Update activity timestamp
+    this.state.lastActivityAt = Date.now();
 
-      addTyping();
+    // Add user message to history
+    this.state.conversationHistory.push({
+      role: 'user',
+      parts: [{ text: userMessage }],
+      timestamp: Date.now()
+    });
 
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: 'user_message', content: message }));
+    try {
+      // Analyze task complexity with thinking enabled
+      const complexity = await this.analyzeTaskComplexity(userMessage);
+
+      if (complexity.type === 'simple') {
+        // Single-turn response with tools
+        await this.handleSimpleQuery(userMessage, ws);
       } else {
-        addStatusMessage('Connecting...', true);
-        connect();
-        setTimeout(function () {
-          if (ws && ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ type: 'user_message', content: message }));
-          }
-        }, 1000);
+        // Multi-step autonomous execution
+        await this.handleComplexTask(userMessage, complexity, ws);
+      }
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      if (ws) {
+        this.sendToClient(ws, { type: 'error', error: errorMessage });
       }
     }
 
-    function addMessage(role, content) {
-      const chat = document.getElementById('chat');
-      const msgDiv = document.createElement('div');
-      msgDiv.className = 'message ' + role;
-      const contentDiv = document.createElement('div');
-      contentDiv.className = 'message-content';
-      contentDiv.textContent = content;
-      msgDiv.appendChild(contentDiv);
-      chat.appendChild(msgDiv);
-      scrollToBottom();
-      return contentDiv;
-    }
+    // Persist state after processing
+    await this.persistState();
+  }
 
-    function addStatusMessage(message, isError) {
-      const chat = document.getElementById('chat');
-      const msgDiv = document.createElement('div');
-      msgDiv.className = 'message status';
-      const contentDiv = document.createElement('div');
-      contentDiv.className = 'message-content';
-      contentDiv.textContent = (isError ? '⚠️ ' : 'ℹ️ ') + message;
-      msgDiv.appendChild(contentDiv);
-      chat.appendChild(msgDiv);
-      scrollToBottom();
-    }
-
-    function addPlan(plan) {
-      const chat = document.getElementById('chat');
-      const planDiv = document.createElement('div');
-      planDiv.className = 'plan';
-      planDiv.innerHTML = '<strong>📋 Execution Plan:</strong>';
-
-      plan.steps.forEach(function (step, i) {
-        const stepDiv = document.createElement('div');
-        stepDiv.className = 'plan-step';
-        stepDiv.dataset.index = i;
-        stepDiv.textContent = (i + 1) + '. ' + step.description;
-        planDiv.appendChild(stepDiv);
-      });
-
-      chat.appendChild(planDiv);
-      scrollToBottom();
-      return planDiv;
-    }
-
-    function updatePlanStep(index, status) {
-      if (!currentPlanEl) return;
-      const step = currentPlanEl.querySelector('[data-index="' + index + '"]');
-      if (step) {
-        step.className = 'plan-step ' + status;
-      }
-    }
-
-    function addTyping() {
-      const chat = document.getElementById('chat');
-      const typingDiv = document.createElement('div');
-      typingDiv.className = 'message agent';
-      typingDiv.id = 'typing';
-      typingDiv.innerHTML = '' +
-        '<div class="typing">' +
-          '<span></span><span></span><span></span>' +
-        '</div>';
-      chat.appendChild(typingDiv);
-      scrollToBottom();
-    }
-
-    function removeTyping() {
-      const typing = document.getElementById('typing');
-      if (typing) typing.remove();
-    }
-
-    function addSources(sources) {
-      if (!sources || sources.length === 0) return;
-      const chat = document.getElementById('chat');
-      const sourcesDiv = document.createElement('div');
-      sourcesDiv.className = 'message status';
-      sourcesDiv.innerHTML = '' +
-        '<div class="message-content">' +
-          '<strong>📚 Sources:</strong><br>' +
-          sources.map(function (s) { return '• ' + s; }).join('<br>') +
-        '</div>';
-      chat.appendChild(sourcesDiv);
-      scrollToBottom();
-    }
-
-    function scrollToBottom() {
-      const chat = document.getElementById('chat');
-      chat.scrollTop = chat.scrollHeight;
-    }
-
-    async function clearHistory() {
-      if (!confirm('Clear conversation history?')) return;
-      try {
-        await fetch('/api/clear', { method: 'POST' });
-        document.getElementById('chat').innerHTML = '';
-        addStatusMessage('History cleared', false);
-      } catch (error) {
-        addStatusMessage('Error clearing history', true);
-      }
-    }
-
-    async function viewHistory() {
-      try {
-        const res = await fetch('/api/history');
-        const data = await res.json();
-        console.log('Conversation History:', data.history);
-        addStatusMessage('History has ' + data.history.length + ' messages (see console)', false);
-      } catch (error) {
-        addStatusMessage('Error fetching history', true);
-      }
-    }
-
-    // Handle Enter key
-    document.getElementById('input').addEventListener('keydown', function (e) {
-      if (e.key === 'Enter' && !e.shiftKey) {
-        e.preventDefault();
-        sendMessage();
+  async analyzeTaskComplexity(query: string): Promise<TaskComplexity> {
+    const model = this.genAI.getGenerativeModel({
+      model: 'gemini-2.5-flash',
+      generationConfig: {
+        responseMimeType: 'application/json',
       }
     });
 
-    // Connect on load
-    connect();
-  </script>
-</body>
-</html>`;
+    const result = await model.generateContent({
+      contents: [
+        {
+          role: 'user',
+          parts: [{
+            text: `Analyze this user request and determine:
+1. Is it a simple question (single turn) or complex task (multi-step)?
+2. What tools/capabilities are needed?
+3. Estimated number of steps if complex
+
+Request: ${query}
+
+Respond in JSON format:
+{
+  "type": "simple" | "complex",
+  "requiredTools": ["search", "code_execution", "api_call"],
+  "estimatedSteps": number,
+  "reasoning": "brief explanation"
+}`
+          }]
+        }
+      ]
+    });
+
+    const response = await result.response;
+    return JSON.parse(response.text()) as TaskComplexity;
+  }
+
+  async handleSimpleQuery(query: string, ws: WebSocket | null) {
+    if (ws) {
+      this.sendToClient(ws, { type: 'status', message: 'Processing query...' });
+    }
+
+    // Create model with tools
+    const model = this.genAI.getGenerativeModel({
+      model: 'gemini-2.5-flash',
+      tools: [
+        { googleSearch: {} },
+        { codeExecution: {} }
+      ]
+    });
+
+    // Create chat with history
+    const chat = model.startChat({
+      history: this.state.conversationHistory.slice(0, -1).map(msg => ({
+        role: msg.role,
+        parts: msg.parts
+      }))
+    });
+
+    // Stream response
+    const result = await chat.sendMessageStream(query);
+
+    for await (const chunk of result.stream) {
+      const text = chunk.text();
+      if (text && ws) {
+        this.sendToClient(ws, { type: 'chunk', content: text });
+      }
+    }
+
+    // Get final response
+    const response = await result.response;
+    
+    // Store response in history
+    this.state.conversationHistory.push({
+      role: 'model',
+      parts: response.candidates?.[0]?.content?.parts || [],
+      timestamp: Date.now()
+    });
+
+    if (ws) {
+      this.sendToClient(ws, { type: 'done' });
+    }
+  }
+
+  async handleComplexTask(query: string, complexity: TaskComplexity, ws: WebSocket | null) {
+    if (ws) {
+      this.sendToClient(ws, { type: 'status', message: 'Creating execution plan...' });
+    }
+
+    // Generate execution plan
+    const plan = await this.generateExecutionPlan(query, complexity);
+    this.state.currentPlan = plan;
+
+    if (ws) {
+      this.sendToClient(ws, { type: 'plan', plan });
+    }
+
+    // Enter autonomous execution mode
+    for (let i = 0; i < plan.steps.length; i++) {
+      const step = plan.steps[i];
+      plan.currentStepIndex = i;
+      
+      if (ws) {
+        this.sendToClient(ws, { 
+          type: 'step_start', 
+          step: i + 1, 
+          total: plan.steps.length,
+          description: step.description 
+        });
+      }
+
+      try {
+        step.status = 'executing';
+        step.startedAt = Date.now();
+
+        // Execute step with full context
+        const result = await this.executeStep(step);
+        
+        step.result = result;
+        step.status = 'completed';
+        step.completedAt = Date.now();
+        step.durationMs = step.completedAt - (step.startedAt || 0);
+
+        if (ws) {
+          this.sendToClient(ws, { 
+            type: 'step_complete', 
+            step: i + 1,
+            result 
+          });
+        }
+
+        // Persist after each step
+        await this.persistState();
+      } catch (error) {
+        step.status = 'failed';
+        step.error = error instanceof Error ? error.message : 'Unknown error';
+        
+        if (ws) {
+          this.sendToClient(ws, { 
+            type: 'step_error', 
+            step: i + 1,
+            error: step.error
+          });
+        }
+        break;
+      }
+    }
+
+    // Synthesize final response
+    await this.synthesizeFinalResponse(ws);
+    
+    // Mark plan as completed
+    plan.status = 'completed';
+    plan.completedAt = Date.now();
+  }
+
+  async generateExecutionPlan(query: string, complexity: TaskComplexity): Promise<ExecutionPlan> {
+    const model = this.genAI.getGenerativeModel({
+      model: 'gemini-2.5-flash',
+      generationConfig: {
+        responseMimeType: 'application/json',
+      }
+    });
+
+    const planningPrompt = `You are an autonomous agent planner. Given this user request, create a detailed step-by-step execution plan.
+
+User Request: ${query}
+
+Task Complexity Analysis: ${JSON.stringify(complexity)}
+
+Create a plan with specific, actionable steps. Each step should specify:
+- Action type: search, analyze, code_execute, api_call, or synthesize
+- Clear description of what to do
+- Expected output
+
+Return JSON array of steps:
+[
+  {
+    "id": "step_1",
+    "description": "Search for X",
+    "action": "search"
+  }
+]`;
+
+    const result = await model.generateContent({
+      contents: [{ role: 'user', parts: [{ text: planningPrompt }] }]
+    });
+
+    const response = await result.response;
+    const steps = JSON.parse(response.text());
+
+    return {
+      steps: steps.map((s: any, i: number) => ({
+        ...s,
+        id: s.id || `step_${i + 1}`,
+        status: 'pending' as const
+      })),
+      currentStepIndex: 0,
+      status: 'executing',
+      createdAt: Date.now()
+    };
+  }
+
+  async executeStep(step: PlanStep): Promise<any> {
+    // Build context-aware prompt
+    const contextPrompt = this.buildContextualPrompt(step);
+
+    const model = this.genAI.getGenerativeModel({
+      model: 'gemini-2.5-flash',
+      tools: [
+        { googleSearch: {} },
+        { codeExecution: {} }
+      ]
+    });
+
+    const chat = model.startChat({
+      history: this.state.conversationHistory.map(msg => ({
+        role: msg.role,
+        parts: msg.parts
+      }))
+    });
+
+    const result = await chat.sendMessage(contextPrompt);
+    const response = await result.response;
+
+    return response.text();
+  }
+
+  buildContextualPrompt(step: PlanStep): string {
+    const plan = this.state.currentPlan;
+    if (!plan) return step.description;
+
+    const completedSteps = plan.steps
+      .filter(s => s.status === 'completed')
+      .map(s => `${s.description}: ${s.result}`)
+      .join('\n');
+
+    return `EXECUTION CONTEXT:
+Plan Overview: ${plan.steps.map(s => s.description).join(' → ')}
+
+Completed Steps:
+${completedSteps || 'None yet'}
+
+Current Step: ${step.description}
+Action Type: ${step.action}
+
+Execute this step and provide the result.`;
+  }
+
+  async synthesizeFinalResponse(ws: WebSocket | null) {
+    if (ws) {
+      this.sendToClient(ws, { type: 'status', message: 'Synthesizing final response...' });
+    }
+
+    const plan = this.state.currentPlan;
+    if (!plan) return;
+
+    const originalRequest = this.state.conversationHistory
+      .find(m => m.role === 'user')?.parts[0];
+    
+    const originalText = originalRequest && 'text' in originalRequest 
+      ? originalRequest.text 
+      : 'Unknown request';
+
+    const synthesisPrompt = `Based on the execution of this plan, provide a comprehensive final response to the user.
+
+Original User Request: ${originalText}
+
+Execution Results:
+${plan.steps.map((s, i) => `Step ${i+1} (${s.description}): ${s.result || 'No result'}`).join('\n\n')}
+
+Synthesize a clear, complete response that addresses the user's original request.`;
+
+    const model = this.genAI.getGenerativeModel({
+      model: 'gemini-2.5-flash'
+    });
+
+    const result = await model.generateContent({
+      contents: [{ role: 'user', parts: [{ text: synthesisPrompt }] }]
+    });
+
+    const response = await result.response;
+    const finalResponse = response.text();
+
+    // Store in history
+    this.state.conversationHistory.push({
+      role: 'model',
+      parts: [{ text: finalResponse }],
+      timestamp: Date.now()
+    });
+
+    if (ws) {
+      this.sendToClient(ws, { type: 'final_response', content: finalResponse });
+      this.sendToClient(ws, { type: 'done' });
+    }
+
+    await this.persistState();
+  }
+
+  sendToClient(ws: WebSocket, data: any) {
+    try {
+      ws.send(JSON.stringify(data));
+    } catch (e) {
+      console.error('Failed to send to client:', e);
+    }
+  }
+
+  async persistState() {
+    await this.ctx.storage.put('state', this.state);
+  }
+
+  async handleChatRequest(request: Request): Promise<Response> {
+    const { message } = await request.json<{ message: string }>();
+    
+    // For HTTP requests, process async
+    this.ctx.waitUntil(this.processUserMessage(message, null));
+    
+    return Response.json({ status: 'processing' });
+  }
 }

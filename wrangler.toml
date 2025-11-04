@@ -3,6 +3,8 @@ main = "src/index.ts"
 compatibility_date = "2025-08-31"
 type = "module"
 
+[assets]
+directory = "public"
 # -------------------------------------------------
 # Durable Object binding (required!)
 # -------------------------------------------------

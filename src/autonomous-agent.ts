@@ -34,6 +34,7 @@ export class AutonomousAgent extends DurableObject<Env> {
     `);
   }
 
+  // JSON helpers
   private parse<T>(text: string): T | null {
     try {
       const trimmed = text.trim().replace(/^```json\s*/, '').replace(/```$/, '');
@@ -48,6 +49,7 @@ export class AutonomousAgent extends DurableObject<Env> {
     return JSON.stringify(obj);
   }
 
+  // Load state – ALWAYS RETURNS
   private async loadState(): Promise<AgentState> {
     let state: AgentState | null = null;
     try {
@@ -71,6 +73,7 @@ export class AutonomousAgent extends DurableObject<Env> {
     return state;
   }
 
+  // Save state – safe
   private async saveState(state: AgentState): Promise<void> {
     try {
       await this.ctx.blockConcurrencyWhile(async () => {
@@ -85,6 +88,7 @@ export class AutonomousAgent extends DurableObject<Env> {
     }
   }
 
+  // fetch
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
 
@@ -103,6 +107,7 @@ export class AutonomousAgent extends DurableObject<Env> {
     return new Response('Not found', { status: 404 });
   }
 
+  // WebSocket – FULLY VALIDATED
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer) {
     if (typeof message !== 'string') return;
 
@@ -126,6 +131,7 @@ export class AutonomousAgent extends DurableObject<Env> {
     }
   }
 
+  // Safe send
   private send(ws: WebSocket, data: unknown) {
     try {
       ws.send(this.stringify(data));
@@ -134,13 +140,16 @@ export class AutonomousAgent extends DurableObject<Env> {
     }
   }
 
+  // Core processing
   private async process(userMsg: string, ws: WebSocket | null) {
     let state = await this.loadState();
     state.lastActivityAt = Date.now();
 
+    // FIXED: Correct parameter order
     try {
       this.sql.exec(
-        `INSERT INTO messages (role, parts, timestamp) VALUES ('user', ?, ?)`,
+        `INSERT INTO messages (role, parts, timestamp) VALUES (?, ?, ?)`,
+        'user',
         this.stringify([{ text: userMsg }]),
         Date.now()
       );
@@ -165,6 +174,7 @@ export class AutonomousAgent extends DurableObject<Env> {
     }
   }
 
+  // Complexity
   private async analyzeComplexity(query: string): Promise<TaskComplexity> {
     const model = this.genAI.getGenerativeModel({
       model: 'gemini-2.5-flash',
@@ -192,6 +202,7 @@ Request: ${query}` }]
     }
   }
 
+  // Simple query
   private async handleSimple(query: string, ws: WebSocket | null, state: AgentState) {
     if (ws) this.send(ws, { type: 'status', message: 'Thinking…' });
 
@@ -214,9 +225,11 @@ Request: ${query}` }]
       if (ws) this.send(ws, { type: 'error', error: 'Streaming failed' });
     }
 
+    // FIXED: Correct parameter order
     try {
       this.sql.exec(
-        `INSERT INTO messages (role, parts, timestamp) VALUES ('model', ?, ?)`,
+        `INSERT INTO messages (role, parts, timestamp) VALUES (?, ?, ?)`,
+        'model',
         this.stringify([{ text: full }]),
         Date.now()
       );
@@ -227,6 +240,7 @@ Request: ${query}` }]
     if (ws) this.send(ws, { type: 'done' });
   }
 
+  // Complex task
   private async handleComplex(query: string, complexity: TaskComplexity, ws: WebSocket | null, state: AgentState) {
     if (ws) this.send(ws, { type: 'status', message: 'Planning…' });
     const plan = await this.generatePlan(query, complexity);
@@ -277,7 +291,7 @@ Request: ${query}` }]
 Request: ${query}
 Complexity: ${this.stringify(complexity)}` }] }],
       });
-      const text = (await result.response).text?.() ?? '[]';
+      const text = ( (await result.response).text?.() ?? '[]';
       const steps = this.parse<any[]>(text) || [];
       return {
         steps: steps.map((s, i) => ({
@@ -322,7 +336,7 @@ Complexity: ${this.stringify(complexity)}` }] }],
       .filter(s => s.status === 'completed')
       .map(s => `${s.description}: ${s.result ?? ''}`)
       .join('\n');
-    return `PLAN: ${plan.steps.map(s => s.description).join(' → ')}
+    return `PLAN: ${plan.steps.map(s => s.description).join(' to ')}
 
 DONE:
 ${done || 'None'}
@@ -353,7 +367,8 @@ Concise answer:`;
       const answer = (await result.response).text?.() ?? '[No answer]';
 
       this.sql.exec(
-        `INSERT INTO messages (role, parts, timestamp) VALUES ('model', ?, ?)`,
+        `INSERT INTO messages (role, parts, timestamp) VALUES (?, ?, ?)`,
+        'model',
         this.stringify([{ text: answer }]),
         Date.now()
       );
@@ -384,6 +399,7 @@ Concise answer:`;
     return hist;
   }
 
+  // HTTP
   private async handleChat(req: Request): Promise<Response> {
     let message: string;
     try {
@@ -423,7 +439,7 @@ Concise answer:`;
 
   private async clearHistory(): Promise<Response> {
     try {
-      this.sql.exec('DELETE FROM messages');
+      this.sql.exec('DELETE FROM messages  messages');
       this.sql.exec('DELETE FROM kv');
       this.sql.exec('DELETE FROM sqlite_sequence WHERE name IN ("messages")');
     } catch (e) {

@@ -107,13 +107,36 @@ export class AutonomousAgent extends DurableObject<Env> {
     return new Response('Not found', { status: 404 });
   }
 
-  // WebSocket
+  // WebSocket – FULLY VALIDATED
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer) {
     if (typeof message !== 'string') return;
-    let payload;
-    try { payload = JSON.parse(message); } catch { return; }
-    if (payload.type === 'user_message') {
-      this.ctx.waitUntil(this.process(payload.content, ws).catch(() => {}));
+
+    let payload: any;
+    try {
+      payload = JSON.parse(message);
+    } catch {
+      this.send(ws, { type: 'error', error: 'Invalid JSON' });
+      return;
+    }
+
+    if (payload.type === 'user_message' && typeof payload.content === 'string') {
+      this.ctx.waitUntil(
+        this.process(payload.content, ws).catch(err => {
+          console.error('WebSocket process failed:', err);
+          this.send(ws, { type: 'error', error: 'Processing failed' });
+        })
+      );
+    } else {
+      this.send(ws, { type: 'error', error: 'Invalid payload' });
+    }
+  }
+
+  // Safe send
+  private send(ws: WebSocket, data: unknown) {
+    try {
+      ws.send(this.stringify(data));
+    } catch (e) {
+      console.error('WebSocket send failed:', e);
     }
   }
 
@@ -122,11 +145,17 @@ export class AutonomousAgent extends DurableObject<Env> {
     let state = await this.loadState();
     state.lastActivityAt = Date.now();
 
-    this.sql.exec(
-      `INSERT INTO messages (role, parts, timestamp) VALUES ('user', ?, ?)`,
-      this.stringify([{ text: userMsg }]),
-      Date.now()
-    );
+    try {
+      this.sql.exec(
+        `INSERT INTO messages (role, parts, timestamp) VALUES ('user', ?, ?)`,
+        this.stringify([{ text: userMsg }]),
+        Date.now()
+      );
+    } catch (e) {
+      console.error('Failed to save user message:', e);
+      if (ws) this.send(ws, { type: 'error', error: 'Save failed' });
+      return;
+    }
 
     try {
       const complexity = await this.analyzeComplexity(userMsg);
@@ -141,10 +170,6 @@ export class AutonomousAgent extends DurableObject<Env> {
     } finally {
       await this.saveState(state);
     }
-  }
-
-  private send(ws: WebSocket, data: unknown) {
-    try { ws.send(this.stringify(data)); } catch {}
   }
 
   // Complexity
@@ -198,11 +223,16 @@ Request: ${query}` }]
       if (ws) this.send(ws, { type: 'error', error: 'Streaming failed' });
     }
 
-    this.sql.exec(
-      `INSERT INTO messages (role, parts, timestamp) VALUES ('model', ?, ?)`,
-      this.stringify([{ text: full }]),
-      Date.now()
-    );
+    try {
+      this.sql.exec(
+        `INSERT INTO messages (role, parts, timestamp) VALUES ('model', ?, ?)`,
+        this.stringify([{ text: full }]),
+        Date.now()
+      );
+    } catch (e) {
+      console.error('Failed to save model response:', e);
+    }
+
     if (ws) this.send(ws, { type: 'done' });
   }
 
@@ -318,7 +348,7 @@ Result only:`;
 
     const plan = state.currentPlan!;
     const lastUser = this.sql.exec(`SELECT parts FROM messages WHERE role='user' ORDER BY timestamp DESC LIMIT 1`).one()?.parts as string;
-    const original = lastUser ? this.parse<any[]>(lastUser)[0].text : '';
+    const original = lastUser ? this.parse<any[]>(lastUser)?.[0]?.text || '' : '';
 
     const prompt = `Request: ${original}
 
@@ -386,6 +416,7 @@ Concise answer:`;
 
   private getHistory(): Response {
     const rows = this.sql.exec(`SELECT role, parts, timestamp FROM messages ORDER BY timestamp ASC`);
+(vertex
     const msgs: Message[] = [];
     for (const r of rows) {
       const parts = this.parse<any[]>(r.parts as string);
@@ -403,9 +434,13 @@ Concise answer:`;
   }
 
   private async clearHistory(): Promise<Response> {
-    this.sql.exec('DELETE FROM messages');
-    this.sql.exec('DELETE FROM kv');
-    this.sql.exec('DELETE FROM sqlite_sequence WHERE name IN ("messages")');
+    try {
+      this.sql.exec('DELETE FROM messages');
+      this.sql.exec('DELETE FROM kv');
+      this.sql.exec('DELETE FROM sqlite_sequence WHERE name IN ("messages")');
+    } catch (e) {
+      console.error('Clear failed:', e);
+    }
     return new Response(this.stringify({ ok: true }));
   }
 

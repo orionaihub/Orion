@@ -34,6 +34,7 @@ export class AutonomousAgent extends DurableObject<Env> {
     `);
   }
 
+  // JSON helpers
   private parse<T>(text: string): T | null {
     try {
       const trimmed = text.trim().replace(/^```json\s*/, '').replace(/```$/, '');
@@ -49,6 +50,7 @@ export class AutonomousAgent extends DurableObject<Env> {
     return JSON.stringify(obj);
   }
 
+  // Load state – ALWAYS RETURNS
   private async loadState(): Promise<AgentState> {
     let state: AgentState | null = null;
     try {
@@ -72,6 +74,7 @@ export class AutonomousAgent extends DurableObject<Env> {
     return state;
   }
 
+  // Save state – safe
   private async saveState(state: AgentState): Promise<void> {
     try {
       await this.ctx.blockConcurrencyWhile(async () => {
@@ -86,6 +89,7 @@ export class AutonomousAgent extends DurableObject<Env> {
     }
   }
 
+  // fetch
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
 
@@ -104,6 +108,7 @@ export class AutonomousAgent extends DurableObject<Env> {
     return new Response('Not found', { status: 404 });
   }
 
+  // WebSocket
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer) {
     if (typeof message !== 'string') return;
 
@@ -325,7 +330,7 @@ Complexity: ${this.stringify(complexity)}` }] }],
       .filter(s => s.status === 'completed')
       .map(s => `${s.description}: ${s.result ?? ''}`)
       .join('\n');
-    return `PLAN: ${plan.steps.map(s => s.description).join(' to ')}
+    return `PLAN: ${plan.steps.map(s => s.description).join(' → ')}
 
 DONE:
 ${done || 'None'}
@@ -438,4 +443,10 @@ Concise answer:`;
 
   private getStatus(): Response {
     const row = this.sql.exec(`SELECT value FROM kv WHERE key='state'`).one();
-    const state = row ? this.parse<AgentState>(row.value as string<|eos|>
+    const state = row ? this.parse<AgentState>(row.value as string) : null;
+    return new Response(this.stringify({
+      plan: state?.currentPlan,
+      lastActivity: state?.lastActivityAt,
+    }), { headers: { 'Content-Type': 'application/json' } });
+  }
+}

@@ -29,20 +29,24 @@ export class AutonomousAgent extends DurableObject<Env> {
     this.sql = state.storage.sql;
     this.genAI = new GoogleGenerativeAI(env.GEMINI_API_KEY);
 
-    // Create tables once (idempotent)
-    this.sql.exec(`
-      CREATE TABLE IF NOT EXISTS kv (
-        key TEXT PRIMARY KEY,
-        value TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS history (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        role TEXT NOT NULL,
-        parts TEXT NOT NULL,
-        timestamp INTEGER NOT NULL
-      );
-      CREATE INDEX IF NOT EXISTS idx_history_ts ON history(timestamp);
-    `);
+    // Create tables once (idempotent) with error handling
+    try {
+      this.sql.exec(`
+        CREATE TABLE IF NOT EXISTS kv (
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS history (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          role TEXT NOT NULL,
+          parts TEXT NOT NULL,
+          timestamp INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_history_ts ON history(timestamp);
+      `);
+    } catch (e) {
+      console.error('Table init error:', e);
+    }
   }
 
   // -----------------------------------------------------------------
@@ -58,22 +62,28 @@ export class AutonomousAgent extends DurableObject<Env> {
   }
 
   // -----------------------------------------------------------------
-  // Load / save state from SQLite (kv table)
+  // Load / save state from SQLite (kv table) – deadlock-free init
   // -----------------------------------------------------------------
   private async loadState(): Promise<AgentState> {
     const row = this.sql.exec(`SELECT value FROM kv WHERE key = 'state'`).one();
-    if (!row) {
-      const defaults: AgentState = {
-        conversationHistory: [],
-        context: { files: [], searchResults: [] },
-        sessionId: this.ctx.id.toString(),
-        lastActivityAt: Date.now(),
-        currentPlan: undefined,
-      };
-      await this.saveState(defaults);
-      return defaults;
+    if (row) {
+      try {
+        return this.parse<AgentState>(row.value as string);
+      } catch (e) {
+        console.error('Parse state error:', e);
+        // Fall through to defaults if corrupted
+      }
     }
-    return this.parse<AgentState>(row.value as string);
+
+    // First-time init: Create defaults WITHOUT blocking (no save here)
+    const defaults: AgentState = {
+      conversationHistory: [],
+      context: { files: [], searchResults: [] },
+      sessionId: this.ctx.id.toString(),
+      lastActivityAt: Date.now(),
+      currentPlan: undefined,
+    };
+    return defaults;
   }
 
   private async saveState(state: AgentState): Promise<void> {
@@ -104,6 +114,7 @@ export class AutonomousAgent extends DurableObject<Env> {
     let state: AgentState;
     try {
       state = await this.loadState();
+      console.log('State loaded:', state.sessionId);
     } catch (e) {
       console.error('State load error', e);
       return new Response(JSON.stringify({ error: 'Failed to load state' }), {

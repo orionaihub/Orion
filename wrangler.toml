@@ -14,7 +14,7 @@ class_name = "AutonomousAgent"
 # -------------------------------------------------
 [[migrations]]
 tag = "v1"
-new_classes = ["AutonomousAgent"]
+new_sqlite_classes = ["AutonomousAgent"]
 
 # -------------------------------------------------
 # Optional: expose your Gemini key as a secret

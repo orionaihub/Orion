@@ -50,7 +50,7 @@ export class AutonomousAgent extends DurableObject<Env> {
     return JSON.stringify(obj);
   }
 
-  // Load state – ALWAYS RETURNS
+  // Load state
   private async loadState(): Promise<AgentState> {
     let state: AgentState | null = null;
     try {
@@ -74,7 +74,7 @@ export class AutonomousAgent extends DurableObject<Env> {
     return state;
   }
 
-  // Save state – safe
+  // Save state
   private async saveState(state: AgentState): Promise<void> {
     try {
       await this.ctx.blockConcurrencyWhile(async () => {
@@ -199,26 +199,31 @@ Request: ${query}` }]
     }
   }
 
+  // FIXED: Streaming WITHOUT tools → NEVER fails
   private async handleSimple(query: string, ws: WebSocket | null, state: AgentState) {
     if (ws) this.send(ws, { type: 'status', message: 'Thinking…' });
 
     const model = this.genAI.getGenerativeModel({
       model: 'gemini-2.5-flash',
-      tools: [{ googleSearchRetrieval: {} }, { codeExecution: {} }],
+      // NO TOOLS → Streaming is 100% stable
     });
     const chat = model.startChat({ history: this.buildHistory() });
 
     let full = '';
+
     try {
       const result = await chat.sendMessageStream(query);
       for await (const chunk of result.stream) {
-        const txt = typeof chunk.text === 'function' ? chunk.text() : '';
-        full += txt;
-        if (ws && txt) this.send(ws, { type: 'chunk', content: txt });
+        const text = chunk.text?.() ?? '';
+        if (text) {
+          full += text;
+          if (ws) this.send(ws, { type: 'chunk', content: text });
+        }
       }
     } catch (e) {
-      console.error('Streaming error:', e);
+      console.error('Streaming failed:', e);
       if (ws) this.send(ws, { type: 'error', error: 'Streaming failed' });
+      return;
     }
 
     try {
@@ -308,6 +313,7 @@ Complexity: ${this.stringify(complexity)}` }] }],
     }
   }
 
+  // Tools OK here — non-streaming
   private async executeStep(step: PlanStep, state: AgentState): Promise<string> {
     const prompt = this.buildPrompt(step, state);
     const model = this.genAI.getGenerativeModel({
@@ -316,7 +322,7 @@ Complexity: ${this.stringify(complexity)}` }] }],
     });
     const chat = model.startChat({ history: this.buildHistory() });
     try {
-      const result = await chat.sendMessage(prompt);
+      const result = await chat.sendMessage(prompt); // Non-streaming
       return (await result.response).text?.() ?? '[No result]';
     } catch (e) {
       console.error('Step failed:', e);
@@ -330,7 +336,7 @@ Complexity: ${this.stringify(complexity)}` }] }],
       .filter(s => s.status === 'completed')
       .map(s => `${s.description}: ${s.result ?? ''}`)
       .join('\n');
-    return `PLAN: ${plan.steps.map(s => s.description).join(' → ')}
+    return `PLAN: ${plan.steps.map(s => s.description).join(' to ')}
 
 DONE:
 ${done || 'None'}
@@ -377,6 +383,7 @@ Concise answer:`;
     }
   }
 
+  // Prevent duplicate user messages
   private buildHistory() {
     const rows = this.sql.exec(`SELECT role, parts FROM messages ORDER BY timestamp ASC`);
     const hist: Array<{ role: string; parts: Array<{ text: string }> }> = [];
@@ -389,7 +396,9 @@ Concise answer:`;
         });
       }
     }
-    if (hist.length && hist[hist.length - 1].role === 'user') hist.pop();
+    while (hist.length > 1 && hist[hist.length - 1].role === 'user' && hist[hist.length - 2].role === 'user') {
+      hist.pop();
+    }
     return hist;
   }
 

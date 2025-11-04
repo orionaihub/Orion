@@ -27,18 +27,28 @@ export class AutonomousAgent extends DurableObject<Env> {
     
     this.state = { 
       conversationHistory: [], 
-      context: { files: [], searchResults: [] } 
+      context: { files: [], searchResults: [] },
+      sessionId: '',
+      lastActivityAt: Date.now(),
+      currentPlan: undefined
     };
     
     // Initialize Gemini
     this.genAI = new GoogleGenerativeAI(env.GEMINI_API_KEY);
 
-    // Load persisted state
+    // Load persisted state and set defaults if missing
     this.ctx.blockConcurrencyWhile(async () => {
       const stored = await this.ctx.storage.get<AgentState>('state');
       if (stored) {
-        this.state = stored;
+        this.state = { ...this.state, ...stored };
       }
+      // Ensure sessionId is set (unique per DO instance)
+      if (!this.state.sessionId) {
+        this.state.sessionId = this.ctx.id.toString();
+      }
+      // Defaults for other fields if not persisted
+      this.state.lastActivityAt = this.state.lastActivityAt || Date.now();
+      this.state.currentPlan = this.state.currentPlan || undefined;
     });
   }
 
@@ -74,7 +84,10 @@ export class AutonomousAgent extends DurableObject<Env> {
     if (url.pathname === '/clear' && request.method === 'POST') {
       this.state = {
         conversationHistory: [],
-        context: { files: [], searchResults: [] }
+        context: { files: [], searchResults: [] },
+        sessionId: this.state.sessionId, // Preserve sessionId
+        lastActivityAt: Date.now(),
+        currentPlan: undefined
       };
       await this.persistState();
       return Response.json({ status: 'cleared' });
@@ -194,7 +207,7 @@ Respond in JSON format:
     const model = this.genAI.getGenerativeModel({
       model: 'gemini-2.5-flash',
       tools: [
-        { googleSearch: {} },
+        { googleSearchRetrieval: {} },
         { codeExecution: {} }
       ]
     });
@@ -358,7 +371,7 @@ Return JSON array of steps:
     const model = this.genAI.getGenerativeModel({
       model: 'gemini-2.5-flash',
       tools: [
-        { googleSearch: {} },
+        { googleSearchRetrieval: {} },
         { codeExecution: {} }
       ]
     });

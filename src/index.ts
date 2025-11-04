@@ -1,15 +1,16 @@
-// src/index.ts
-export { AutonomousAgent } from './autonomous-agent';
-
+import { AutonomousAgent } from './autonomous-agent';
 import type { Env } from './types';
+
+export { AutonomousAgent };
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     if (url.pathname.startsWith('/api/')) {
-      const id = env.AGENT.idFromName('agent');
-      return env.AGENT.get(id).fetch(request);
+      const id = env.AGENT.idFromName('singleton');
+      const obj = env.AGENT.get(id);
+      return obj.fetch(request);
     }
-    return new Response('Use /api/chat, /api/ws, /api/history, /api/clear', { status: 200 });
+    return new Response('Use /api/ws, /api/chat, /api/history', { status: 200 });
   },
 } satisfies ExportedHandler<Env>;

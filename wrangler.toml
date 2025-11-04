@@ -1,19 +1,29 @@
 name = "autonomousagent"
 main = "src/index.ts"
-compatibility_date = "2024-11-01"
-compatibility_flags = ["nodejs_compat"]
-type = "module"
-  
-[assets]
-directory = "public"          # your front-end
+compatibility_date = "2025-08-31"
 
+# -------------------------------------------------
+# Durable Object binding (required!)
+# -------------------------------------------------
 [[durable_objects.bindings]]
-name = "AutonomousAgent"
+name = "AGENT"               # <-- this name appears as env.AGENT in the worker
 class_name = "AutonomousAgent"
 
+# -------------------------------------------------
+# Tell Cloudflare that the class exists in the bundle
+# -------------------------------------------------
 [[migrations]]
 tag = "v1"
-new_sqlite_classes = ["AutonomousAgent" ]
+new_classes = ["AutonomousAgent"]
 
+# -------------------------------------------------
+# Optional: expose your Gemini key as a secret
+# -------------------------------------------------
 [vars]
 GEMINI_API_KEY = "AIzaSyDxD7WiixJUVw6h0HWqW6lS8pHpVihnNTM"
+
+# -------------------------------------------------
+# Routes (replace with your domain / subdomain)
+# -------------------------------------------------
+# [[routes]]
+# pattern = "autonomousagent.rachidhakim265-b4e.workers.dev/api/*"

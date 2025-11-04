@@ -19,7 +19,6 @@ export class AutonomousAgent extends DurableObject<Env> {
     this.sql = state.storage.sql;
     this.genAI = new GoogleGenerativeAI(env.GEMINI_API_KEY);
 
-    // Tables: history + state
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS messages (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -35,20 +34,20 @@ export class AutonomousAgent extends DurableObject<Env> {
     `);
   }
 
-  // -----------------------------------------------------------------
   // JSON helpers
-  // -----------------------------------------------------------------
   private parse<T>(text: string): T {
     const trimmed = text.trim().replace(/^```json\s*/, '').replace(/```$/, '');
-    return JSON.parse(trimmed) as T;
+    try {
+      return JSON.parse(trimmed) as T;
+    } catch {
+      return {} as T;
+    }
   }
   private stringify(obj: unknown): string {
     return JSON.stringify(obj);
   }
 
-  // -----------------------------------------------------------------
-  // Load state – returns defaults if missing (NO save here!)
-  // -----------------------------------------------------------------
+  // Load state – safe, no save inside
   private async loadState(): Promise<AgentState> {
     const row = this.sql.exec(`SELECT value FROM kv WHERE key = 'state'`).one();
     if (row) {
@@ -67,22 +66,22 @@ export class AutonomousAgent extends DurableObject<Env> {
     };
   }
 
-  // -----------------------------------------------------------------
-  // Save state – called only at the end
-  // -----------------------------------------------------------------
+  // Save state – only at the end
   private async saveState(state: AgentState): Promise<void> {
-    await this.ctx.blockConcurrencyWhile(async () => {
-      this.sql.exec(
-        `INSERT INTO kv (key, value) VALUES ('state', ?) 
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
-        this.stringify(state)
-      );
-    });
+    try {
+      await this.ctx.blockConcurrencyWhile(async () => {
+        this.sql.exec(
+          `INSERT INTO kv (key, value) VALUES ('state', ?) 
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+          this.stringify(state)
+        );
+      });
+    } catch (e) {
+      console.error('saveState failed:', e);
+    }
   }
 
-  // -----------------------------------------------------------------
   // fetch
-  // -----------------------------------------------------------------
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
 
@@ -101,24 +100,28 @@ export class AutonomousAgent extends DurableObject<Env> {
     return new Response('Not found', { status: 404 });
   }
 
-  // -----------------------------------------------------------------
   // WebSocket
-  // -----------------------------------------------------------------
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer) {
     if (typeof message !== 'string') return;
     let payload;
     try { payload = JSON.parse(message); } catch { return; }
-    if (payload.type === 'user_message') await this.process(payload.content, ws);
+    if (payload.type === 'user_message') {
+      this.ctx.waitUntil(this.process(payload.content, ws).catch(() => {}));
+    }
   }
 
-  // -----------------------------------------------------------------
   // Core processing
-  // -----------------------------------------------------------------
   private async process(userMsg: string, ws: WebSocket | null) {
-    let state = await this.loadState();
+    let state: AgentState;
+    try {
+      state = await this.loadState();
+    } catch (e) {
+      if (ws) this.send(ws, { type: 'error', error: 'Failed to load state' });
+      return;
+    }
+
     state.lastActivityAt = Date.now();
 
-    // Save user message
     this.sql.exec(
       `INSERT INTO messages (role, parts, timestamp) VALUES ('user', ?, ?)`,
       this.stringify([{ text: userMsg }]),
@@ -133,8 +136,8 @@ export class AutonomousAgent extends DurableObject<Env> {
         await this.handleComplex(userMsg, complexity, ws, state);
       }
     } catch (e) {
-      const msg = e instanceof Error ? e.message : 'Error';
-      if (ws) this.send(ws, { type: 'error', error: msg });
+      console.error('Process error:', e);
+      if (ws) this.send(ws, { type: 'error', error: 'Processing failed' });
     } finally {
       await this.saveState(state);
     }
@@ -144,18 +147,17 @@ export class AutonomousAgent extends DurableObject<Env> {
     try { ws.send(this.stringify(data)); } catch {}
   }
 
-  // -----------------------------------------------------------------
   // Complexity
-  // -----------------------------------------------------------------
   private async analyzeComplexity(query: string): Promise<TaskComplexity> {
     const model = this.genAI.getGenerativeModel({
       model: 'gemini-2.5-flash',
       generationConfig: { responseMimeType: 'application/json' },
     });
-    const result = await model.generateContent({
-      contents: [{
-        role: 'user',
-        parts: [{ text: `Analyze: return JSON only:
+    try {
+      const result = await model.generateContent({
+        contents: [{
+          role: 'user',
+          parts: [{ text: `Analyze: return JSON only:
 {
   "type": "simple" | "complex",
   "requiredTools": string[],
@@ -163,14 +165,16 @@ export class AutonomousAgent extends DurableObject<Env> {
   "reasoning": "short"
 }
 Request: ${query}` }]
-      }],
-    });
-    return this.parse<TaskComplexity>((await result.response).text());
+        }],
+      });
+      const text = (await result.response).text?.() ?? '{}';
+      return this.parse<TaskComplexity>(text);
+    } catch {
+      return { type: 'simple', requiredTools: [], estimatedSteps: 1, reasoning: 'fallback' };
+    }
   }
 
-  // -----------------------------------------------------------------
   // Simple query
-  // -----------------------------------------------------------------
   private async handleSimple(query: string, ws: WebSocket | null, state: AgentState) {
     if (ws) this.send(ws, { type: 'status', message: 'Thinking…' });
 
@@ -179,13 +183,18 @@ Request: ${query}` }]
       tools: [{ googleSearchRetrieval: {} }, { codeExecution: {} }],
     });
     const chat = model.startChat({ history: this.buildHistory() });
-    const result = await chat.sendMessageStream(query);
 
     let full = '';
-    for await (const chunk of result.stream) {
-      const txt = chunk.text();
-      full += txt;
-      if (ws) this.send(ws, { type: 'chunk', content: txt });
+    try {
+      const result = await chat.sendMessageStream(query);
+      for await (const chunk of result.stream) {
+        const txt = typeof chunk.text === 'function' ? chunk.text() : '';
+        full += txt;
+        if (ws && txt) this.send(ws, { type: 'chunk', content: txt });
+      }
+    } catch (e) {
+      console.error('Streaming error:', e);
+      if (ws) this.send(ws, { type: 'error', error: 'Streaming failed' });
     }
 
     this.sql.exec(
@@ -196,9 +205,7 @@ Request: ${query}` }]
     if (ws) this.send(ws, { type: 'done' });
   }
 
-  // -----------------------------------------------------------------
   // Complex task
-  // -----------------------------------------------------------------
   private async handleComplex(query: string, complexity: TaskComplexity, ws: WebSocket | null, state: AgentState) {
     if (ws) this.send(ws, { type: 'status', message: 'Planning…' });
     const plan = await this.generatePlan(query, complexity);
@@ -240,25 +247,35 @@ Request: ${query}` }]
       model: 'gemini-2.5-flash',
       generationConfig: { responseMimeType: 'application/json' },
     });
-    const result = await model.generateContent({
-      contents: [{ role: 'user', parts: [{ text: `Plan as JSON array:
+    try {
+      const result = await model.generateContent({
+        contents: [{ role: 'user', parts: [{ text: `Plan as JSON array:
 [
   { "id": "s1", "description": "...", "action": "search|analyze|code_execute|api_call|synthesize" }
 ]
 Request: ${query}
 Complexity: ${this.stringify(complexity)}` }] }],
-    });
-    const steps = this.parse<any[]>((await result.response).text());
-    return {
-      steps: steps.map((s, i) => ({
-        ...s,
-        id: s.id ?? `step_${i + 1}`,
-        status: 'pending' as const,
-      })),
-      currentStepIndex: 0,
-      status: 'executing',
-      createdAt: Date.now(),
-    };
+      });
+      const text = (await result.response).text?.() ?? '[]';
+      const steps = this.parse<any[]>(text);
+      return {
+        steps: steps.map((s, i) => ({
+          ...s,
+          id: s.id ?? `step_${i + 1}`,
+          status: 'pending' as const,
+        })),
+        currentStepIndex: 0,
+        status: 'executing',
+        createdAt: Date.now(),
+      };
+    } catch {
+      return {
+        steps: [{ id: 's1', description: 'Answer directly', action: 'synthesize', status: 'pending' }],
+        currentStepIndex: 0,
+        status: 'executing',
+        createdAt: Date.now(),
+      };
+    }
   }
 
   private async executeStep(step: PlanStep, state: AgentState): Promise<string> {
@@ -268,8 +285,12 @@ Complexity: ${this.stringify(complexity)}` }] }],
       tools: [{ googleSearchRetrieval: {} }, { codeExecution: {} }],
     });
     const chat = model.startChat({ history: this.buildHistory() });
-    const result = await chat.sendMessage(prompt);
-    return (await result.response).text();
+    try {
+      const result = await chat.sendMessage(prompt);
+      return (await result.response).text?.() ?? '[No result]';
+    } catch {
+      return '[Step failed]';
+    }
   }
 
   private buildPrompt(step: PlanStep, state: AgentState): string {
@@ -304,18 +325,23 @@ ${plan.steps.map((s, i) => `Step ${i + 1}: ${s.result ?? ''}`).join('\n\n')}
 Concise answer:`;
 
     const model = this.genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
-    const result = await model.generateContent({ contents: [{ role: 'user', parts: [{ text: prompt }] }] });
-    const answer = (await result.response).text();
+    try {
+      const result = await model.generateContent({ contents: [{ role: 'user', parts: [{ text: prompt }] }] });
+      const answer = (await result.response).text?.() ?? '[No answer]';
 
-    this.sql.exec(
-      `INSERT INTO messages (role, parts, timestamp) VALUES ('model', ?, ?)`,
-      this.stringify([{ text: answer }]),
-      Date.now()
-    );
+      this.sql.exec(
+        `INSERT INTO messages (role, parts, timestamp) VALUES ('model', ?, ?)`,
+        this.stringify([{ text: answer }]),
+        Date.now()
+      );
 
-    if (ws) {
-      this.send(ws, { type: 'final_response', content: answer });
-      this.send(ws, { type: 'done' });
+      if (ws) {
+        this.send(ws, { type: 'final_response', content: answer });
+        this.send(ws, { type: 'done' });
+      }
+    } catch (e) {
+      console.error('Synthesis failed:', e);
+      if (ws) this.send(ws, { type: 'error', error: 'Synthesis failed' });
     }
   }
 
@@ -323,22 +349,34 @@ Concise answer:`;
     const rows = this.sql.exec(`SELECT role, parts FROM messages ORDER BY timestamp ASC`);
     const hist: Array<{ role: string; parts: Array<{ text: string }> }> = [];
     for (const r of rows) {
-      hist.push({
-        role: r.role === 'model' ? 'model' : 'user',
-        parts: this.parse(r.parts as string),
-      });
+      try {
+        hist.push({
+          role: r.role === 'model' ? 'model' : 'user',
+          parts: this.parse(r.parts as string),
+        });
+      } catch {}
     }
     if (hist.length && hist[hist.length - 1].role === 'user') hist.pop();
     return hist;
   }
 
-  // -----------------------------------------------------------------
   // HTTP
-  // -----------------------------------------------------------------
   private async handleChat(req: Request): Promise<Response> {
-    const { message } = await req.json<{ message: string }>();
-    if (!message) return new Response(JSON.stringify({ error: 'no message' }), { status: 400 });
-    this.ctx.waitUntil(this.process(message, null));
+    let message: string;
+    try {
+      const body = await req.json<{ message: string }>();
+      message = body.message;
+      if (!message) throw new Error();
+    } catch {
+      return new Response(JSON.stringify({ error: 'Invalid JSON' }), { status: 400 });
+    }
+
+    this.ctx.waitUntil(
+      this.process(message, null).catch(err => {
+        console.error('Background process failed:', err);
+      })
+    );
+
     return new Response(JSON.stringify({ status: 'queued' }));
   }
 
@@ -346,11 +384,13 @@ Concise answer:`;
     const rows = this.sql.exec(`SELECT role, parts, timestamp FROM messages ORDER BY timestamp ASC`);
     const msgs: Message[] = [];
     for (const r of rows) {
-      msgs.push({
-        role: r.role as any,
-        parts: this.parse(r.parts as string),
-        timestamp: r.timestamp as number,
-      });
+      try {
+        msgs.push({
+          role: r.role as any,
+          parts: this.parse(r.parts as string),
+          timestamp: r.timestamp as number,
+        });
+      } catch {}
     }
     return new Response(JSON.stringify({ messages: msgs }), {
       headers: { 'Content-Type': 'application/json' },
@@ -358,17 +398,22 @@ Concise answer:`;
   }
 
   private async clearHistory(): Promise<Response> {
-    this.sql.exec('DELETE FROM messages');
-    this.sql.exec('DELETE FROM kv');
-    this.sql.exec('DELETE FROM sqlite_sequence WHERE name IN ("messages")');
+    try {
+      this.sql.exec('DELETE FROM messages');
+      this.sql.exec('DELETE FROM kv');
+      this.sql.exec('DELETE FROM sqlite_sequence WHERE name IN ("messages")');
+    } catch (e) {
+      console.error('Clear failed:', e);
+    }
     return new Response(JSON.stringify({ ok: true }));
   }
 
   private getStatus(): Response {
-    const stateRow = this.sql.exec(`SELECT value FROM kv WHERE key='state'`).one();
-    const state = stateRow ? this.parse<AgentState>(stateRow.value as string) : null;
-    return new Response(JSON.stringify({ plan: state?.currentPlan, lastActivity: state?.lastActivityAt }), {
-      headers: { 'Content-Type': 'application/json' },
-    });
+    const row = this.sql.exec(`SELECT value FROM kv WHERE key='state'`).one();
+    const state = row ? this.parse<AgentState>(row.value as string) : null;
+    return new Response(JSON.stringify({
+      plan: state?.currentPlan,
+      lastActivity: state?.lastActivityAt,
+    }), { headers: { 'Content-Type': 'application/json' } });
   }
 }

@@ -34,7 +34,6 @@ export class AutonomousAgent extends DurableObject<Env> {
     `);
   }
 
-  // JSON helpers
   private parse<T>(text: string): T | null {
     try {
       const trimmed = text.trim().replace(/^```json\s*/, '').replace(/```$/, '');
@@ -49,7 +48,6 @@ export class AutonomousAgent extends DurableObject<Env> {
     return JSON.stringify(obj);
   }
 
-  // Load state – ALWAYS RETURNS
   private async loadState(): Promise<AgentState> {
     let state: AgentState | null = null;
     try {
@@ -73,7 +71,6 @@ export class AutonomousAgent extends DurableObject<Env> {
     return state;
   }
 
-  // Save state – safe
   private async saveState(state: AgentState): Promise<void> {
     try {
       await this.ctx.blockConcurrencyWhile(async () => {
@@ -88,7 +85,6 @@ export class AutonomousAgent extends DurableObject<Env> {
     }
   }
 
-  // fetch
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
 
@@ -107,7 +103,6 @@ export class AutonomousAgent extends DurableObject<Env> {
     return new Response('Not found', { status: 404 });
   }
 
-  // WebSocket – FULLY VALIDATED
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer) {
     if (typeof message !== 'string') return;
 
@@ -131,7 +126,6 @@ export class AutonomousAgent extends DurableObject<Env> {
     }
   }
 
-  // Safe send
   private send(ws: WebSocket, data: unknown) {
     try {
       ws.send(this.stringify(data));
@@ -140,7 +134,6 @@ export class AutonomousAgent extends DurableObject<Env> {
     }
   }
 
-  // Core processing
   private async process(userMsg: string, ws: WebSocket | null) {
     let state = await this.loadState();
     state.lastActivityAt = Date.now();
@@ -172,7 +165,6 @@ export class AutonomousAgent extends DurableObject<Env> {
     }
   }
 
-  // Complexity
   private async analyzeComplexity(query: string): Promise<TaskComplexity> {
     const model = this.genAI.getGenerativeModel({
       model: 'gemini-2.5-flash',
@@ -200,7 +192,6 @@ Request: ${query}` }]
     }
   }
 
-  // Simple query
   private async handleSimple(query: string, ws: WebSocket | null, state: AgentState) {
     if (ws) this.send(ws, { type: 'status', message: 'Thinking…' });
 
@@ -236,7 +227,6 @@ Request: ${query}` }]
     if (ws) this.send(ws, { type: 'done' });
   }
 
-  // Complex task
   private async handleComplex(query: string, complexity: TaskComplexity, ws: WebSocket | null, state: AgentState) {
     if (ws) this.send(ws, { type: 'status', message: 'Planning…' });
     const plan = await this.generatePlan(query, complexity);
@@ -394,7 +384,6 @@ Concise answer:`;
     return hist;
   }
 
-  // HTTP
   private async handleChat(req: Request): Promise<Response> {
     let message: string;
     try {
@@ -416,7 +405,6 @@ Concise answer:`;
 
   private getHistory(): Response {
     const rows = this.sql.exec(`SELECT role, parts, timestamp FROM messages ORDER BY timestamp ASC`);
-(vertex
     const msgs: Message[] = [];
     for (const r of rows) {
       const parts = this.parse<any[]>(r.parts as string);

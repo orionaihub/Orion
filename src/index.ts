@@ -10,6 +10,6 @@ export default {
       const id = env.AGENT.idFromName('agent');
       return env.AGENT.get(id).fetch(request);
     }
-    return new Response('Use /api/*', { status: 200 });
+    return new Response('Use /api/chat, /api/ws, /api/history, /api/clear', { status: 200 });
   },
 } satisfies ExportedHandler<Env>;

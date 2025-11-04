@@ -1,483 +1,468 @@
 /**
- * Autonomous Agent Durable Object
- * 
- * This Durable Object contains all the agent logic and has no CPU time limits.
- * It handles WebSocket connections, maintains conversation state, and executes
- * multi-step autonomous plans using Gemini 2.5 Flash.
+ * Autonomous Agent Durable Object – SQLite-backed, safe async init,
+ * WebSocket on /api/ws, HTTP on /api/*.
  */
-
 import { DurableObject } from 'cloudflare:workers';
 import { GoogleGenerativeAI } from '@google/generative-ai';
-import type { 
-  Env, 
-  AgentState, 
-  Message, 
-  ExecutionPlan, 
+import type {
+  Env,
+  AgentState,
+  Message,
+  ExecutionPlan,
   PlanStep,
   TaskComplexity,
-  FileContext
 } from './types';
 
 export class AutonomousAgent extends DurableObject<Env> {
-  private state: AgentState;
+  private sql: SqlStorage;
   private genAI: GoogleGenerativeAI;
 
-  constructor(ctx: DurableObjectState, env: Env) {
-    super(ctx, env);
-    
-    this.state = { 
-      conversationHistory: [], 
-      context: { files: [], searchResults: [] },
-      sessionId: '',
-      lastActivityAt: Date.now(),
-      currentPlan: undefined
-    };
-    
-    // Initialize Gemini
+  // -----------------------------------------------------------------
+  // Constructor – **only synchronous** work
+  // -----------------------------------------------------------------
+  constructor(state: DurableObjectState, env: Env) {
+    super(state, env);
+    this.sql = state.storage.sql;
     this.genAI = new GoogleGenerativeAI(env.GEMINI_API_KEY);
 
-    // Load persisted state and set defaults if missing
-    this.ctx.blockConcurrencyWhile(async () => {
-      const stored = await this.ctx.storage.get<AgentState>('state');
-      if (stored) {
-        this.state = { ...this.state, ...stored };
-      }
-      // Ensure sessionId is set (unique per DO instance)
-      if (!this.state.sessionId) {
-        this.state.sessionId = this.ctx.id.toString();
-      }
-      // Defaults for other fields if not persisted
-      this.state.lastActivityAt = this.state.lastActivityAt || Date.now();
-      this.state.currentPlan = this.state.currentPlan || undefined;
+    // Create tables once (idempotent)
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS kv (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        role TEXT NOT NULL,
+        parts TEXT NOT NULL,
+        timestamp INTEGER NOT NULL
+      );
+    `);
+  }
+
+  // -----------------------------------------------------------------
+  // Helper: safe JSON parse / stringify
+  // -----------------------------------------------------------------
+  private parse<T>(text: string): T {
+    const trimmed = text.trim().replace(/^```json/, '').replace(/```$/, '');
+    return JSON.parse(trimmed) as T;
+  }
+
+  private stringify(obj: unknown): string {
+    return JSON.stringify(obj);
+  }
+
+  // -----------------------------------------------------------------
+  // Load / save the whole AgentState in one KV row
+  // -----------------------------------------------------------------
+  private async loadState(): Promise<AgentState> {
+    const row = this.sql.exec(`SELECT value FROM kv WHERE key = 'state'`).one();
+    if (!row) {
+      // first-time defaults
+      const defaults: AgentState = {
+        conversationHistory: [],
+        context: { files: [], searchResults: [] },
+        sessionId: this.ctx.id.toString(),
+        lastActivityAt: Date.now(),
+        currentPlan: undefined,
+      };
+      await this.saveState(defaults);
+      return defaults;
+    }
+    return this.parse<AgentState>(row.value as string);
+  }
+
+  private async saveState(state: AgentState): Promise<void> {
+    await this.ctx.blockConcurrencyWhile(async () => {
+      this.sql.exec(
+        `INSERT INTO kv (key, value) VALUES ('state', ?) 
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+        this.stringify(state)
+      );
     });
   }
 
+  // -----------------------------------------------------------------
+  // fetch – **all async work starts here**
+  // -----------------------------------------------------------------
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
 
-    // WebSocket upgrade for real-time agent interaction
-    if (url.pathname === '/ws' && request.headers.get('Upgrade') === 'websocket') {
+    // ---------- WebSocket ----------
+    if (url.pathname === '/api/ws' && request.headers.get('Upgrade')?.toLowerCase() === 'websocket') {
       const pair = new WebSocketPair();
       const [client, server] = Object.values(pair);
-
       this.ctx.acceptWebSocket(server);
+      return new Response(null, { status: 101, webSocket: client });
+    }
 
-      return new Response(null, {
-        status: 101,
-        webSocket: client,
+    // Load state **once** for the whole request
+    let state: AgentState;
+    try {
+      state = await this.loadState();
+    } catch (e) {
+      console.error('State load error', e);
+      return new Response(JSON.stringify({ error: 'Failed to load state' }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json' },
       });
     }
 
-    // HTTP endpoints
-    if (url.pathname === '/chat' && request.method === 'POST') {
-      return this.handleChatRequest(request);
+    // ---------- HTTP API ----------
+    if (url.pathname === '/api/chat' && request.method === 'POST') {
+      return this.handleChatRequest(request, state);
     }
-
-    if (url.pathname === '/history' && request.method === 'GET') {
-      return Response.json({ 
-        history: this.state.conversationHistory,
-        sessionId: this.state.sessionId,
-        messageCount: this.state.conversationHistory.length
-      });
+    if (url.pathname === '/api/history' && request.method === 'GET') {
+      return this.getHistory(state);
     }
-
-    if (url.pathname === '/clear' && request.method === 'POST') {
-      this.state = {
-        conversationHistory: [],
-        context: { files: [], searchResults: [] },
-        sessionId: this.state.sessionId, // Preserve sessionId
-        lastActivityAt: Date.now(),
-        currentPlan: undefined
-      };
-      await this.persistState();
-      return Response.json({ status: 'cleared' });
+    if (url.pathname === '/api/clear' && request.method === 'POST') {
+      return this.clearHistory(state);
     }
-
-    if (url.pathname === '/status' && request.method === 'GET') {
-      return Response.json({
-        status: this.state.currentPlan ? 'executing_plan' : 'idle',
-        currentPlan: this.state.currentPlan,
-        messageCount: this.state.conversationHistory.length,
-        fileCount: this.state.context.files.length,
-        lastActivity: this.state.lastActivityAt
-      });
+    if (url.pathname === '/api/status' && request.method === 'GET') {
+      return this.getStatus(state);
     }
 
     return new Response('Not found', { status: 404 });
   }
 
+  // -----------------------------------------------------------------
+  // WebSocket message handling (state already loaded in fetch)
+  // -----------------------------------------------------------------
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer) {
-    try {
-      if (typeof message !== 'string') {
-        this.sendToClient(ws, { type: 'error', error: 'Binary messages not supported' });
-        return;
-      }
+    if (typeof message !== 'string') {
+      this.send(ws, { type: 'error', error: 'Binary not supported' });
+      return;
+    }
 
-      const data = JSON.parse(message);
-      
-      if (data.type === 'user_message') {
-        await this.processUserMessage(data.content, ws);
-      }
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-      this.sendToClient(ws, { type: 'error', error: errorMessage });
+    let payload;
+    try { payload = JSON.parse(message); } catch { return; }
+
+    if (payload.type === 'user_message') {
+      await this.processUserMessage(payload.content, ws);
     }
   }
 
-  async webSocketClose(ws: WebSocket, code: number, reason: string) {
-    // Cleanup if needed
-    ws.close(code, reason);
-  }
+  // -----------------------------------------------------------------
+  // Core processing – all DB ops are inside try/catch
+  // -----------------------------------------------------------------
+  private async processUserMessage(userMsg: string, ws: WebSocket | null) {
+    let state = await this.loadState();
+    state.lastActivityAt = Date.now();
 
-  async processUserMessage(userMessage: string, ws: WebSocket | null) {
-    // Update activity timestamp
-    this.state.lastActivityAt = Date.now();
-
-    // Add user message to history
-    this.state.conversationHistory.push({
-      role: 'user',
-      parts: [{ text: userMessage }],
-      timestamp: Date.now()
-    });
+    // ---- store user message ----
+    const userPart = JSON.stringify([{ text: userMsg }]);
+    this.sql.exec(
+      `INSERT INTO history (role, parts, timestamp) VALUES ('user', ?, ?)`,
+      userPart,
+      Date.now()
+    );
 
     try {
-      // Analyze task complexity with thinking enabled
-      const complexity = await this.analyzeTaskComplexity(userMessage);
-
+      const complexity = await this.analyzeTaskComplexity(userMsg);
       if (complexity.type === 'simple') {
-        // Single-turn response with tools
-        await this.handleSimpleQuery(userMessage, ws);
+        await this.handleSimpleQuery(userMsg, ws, state);
       } else {
-        // Multi-step autonomous execution
-        await this.handleComplexTask(userMessage, complexity, ws);
+        await this.handleComplexTask(userMsg, complexity, ws, state);
       }
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-      if (ws) {
-        this.sendToClient(ws, { type: 'error', error: errorMessage });
-      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : 'Unknown error';
+      if (ws) this.send(ws, { type: 'error', error: msg });
+    } finally {
+      await this.saveState(state);
     }
-
-    // Persist state after processing
-    await this.persistState();
   }
 
-  async analyzeTaskComplexity(query: string): Promise<TaskComplexity> {
+  // -----------------------------------------------------------------
+  // Helper: send JSON over WS (safe)
+  // -----------------------------------------------------------------
+  private send(ws: WebSocket, data: unknown) {
+    try { ws.send(JSON.stringify(data)); } catch {}
+  }
+
+  // -----------------------------------------------------------------
+  // Complexity analysis (robust JSON extraction)
+  // -----------------------------------------------------------------
+  private async analyzeTaskComplexity(query: string): Promise<TaskComplexity> {
     const model = this.genAI.getGenerativeModel({
       model: 'gemini-2.5-flash',
-      generationConfig: {
-        responseMimeType: 'application/json',
-      }
+      generationConfig: { responseMimeType: 'application/json' },
     });
-
     const result = await model.generateContent({
-      contents: [
-        {
-          role: 'user',
-          parts: [{
-            text: `Analyze this user request and determine:
-1. Is it a simple question (single turn) or complex task (multi-step)?
-2. What tools/capabilities are needed?
-3. Estimated number of steps if complex
+      contents: [{ role: 'user', parts: [{ text: this.complexityPrompt(query) }] }],
+    });
+    return this.parse<TaskComplexity>((await result.response).text());
+  }
 
-Request: ${query}
-
-Respond in JSON format:
+  private complexityPrompt(q: string) {
+    return `Analyze this request and answer in JSON only:
 {
   "type": "simple" | "complex",
-  "requiredTools": ["search", "code_execution", "api_call"],
+  "requiredTools": string[],
   "estimatedSteps": number,
-  "reasoning": "brief explanation"
-}`
-          }]
-        }
-      ]
-    });
-
-    const response = await result.response;
-    return JSON.parse(response.text()) as TaskComplexity;
+  "reasoning": "short"
+}
+Request: ${q}`;
   }
 
-  async handleSimpleQuery(query: string, ws: WebSocket | null) {
-    if (ws) {
-      this.sendToClient(ws, { type: 'status', message: 'Processing query...' });
-    }
+  // -----------------------------------------------------------------
+  // Simple query – streaming like the Chat example
+  // -----------------------------------------------------------------
+  private async handleSimpleQuery(
+    query: string,
+    ws: WebSocket | null,
+    state: AgentState
+  ) {
+    if (ws) this.send(ws, { type: 'status', message: 'Thinking…' });
 
-    // Create model with tools
     const model = this.genAI.getGenerativeModel({
       model: 'gemini-2.5-flash',
-      tools: [
-        { googleSearchRetrieval: {} },
-        { codeExecution: {} }
-      ]
+      tools: [{ googleSearchRetrieval: {} }, { codeExecution: {} }],
     });
 
-    // Create chat with history
-    const chat = model.startChat({
-      history: this.state.conversationHistory.slice(0, -1).map(msg => ({
-        role: msg.role,
-        parts: msg.parts
-      }))
-    });
+    const history = this.buildGeminiHistory(state);
+    const chat = model.startChat({ history });
 
-    // Stream response
     const result = await chat.sendMessageStream(query);
-
+    let full = '';
     for await (const chunk of result.stream) {
-      const text = chunk.text();
-      if (text && ws) {
-        this.sendToClient(ws, { type: 'chunk', content: text });
-      }
+      const txt = chunk.text();
+      full += txt;
+      if (ws) this.send(ws, { type: 'chunk', content: txt });
     }
 
-    // Get final response
-    const response = await result.response;
-    
-    // Store response in history
-    this.state.conversationHistory.push({
-      role: 'model',
-      parts: response.candidates?.[0]?.content?.parts || [],
-      timestamp: Date.now()
-    });
+    // store assistant reply
+    const parts = JSON.stringify([{ text: full }]);
+    this.sql.exec(
+      `INSERT INTO history (role, parts, timestamp) VALUES ('model', ?, ?)`,
+      parts,
+      Date.now()
+    );
 
-    if (ws) {
-      this.sendToClient(ws, { type: 'done' });
-    }
+    if (ws) this.send(ws, { type: 'done' });
   }
 
-  async handleComplexTask(query: string, complexity: TaskComplexity, ws: WebSocket | null) {
-    if (ws) {
-      this.sendToClient(ws, { type: 'status', message: 'Creating execution plan...' });
-    }
+  // -----------------------------------------------------------------
+  // Complex task – plan → step → synthesize (all SQLite backed)
+  // -----------------------------------------------------------------
+  private async handleComplexTask(
+    query: string,
+    complexity: TaskComplexity,
+    ws: WebSocket | null,
+    state: AgentState
+  ) {
+    if (ws) this.send(ws, { type: 'status', message: 'Planning…' });
+    const plan = await this.generatePlan(query, complexity);
+    state.currentPlan = plan;
+    await this.saveState(state);
+    if (ws) this.send(ws, { type: 'plan', plan });
 
-    // Generate execution plan
-    const plan = await this.generateExecutionPlan(query, complexity);
-    this.state.currentPlan = plan;
-
-    if (ws) {
-      this.sendToClient(ws, { type: 'plan', plan });
-    }
-
-    // Enter autonomous execution mode
     for (let i = 0; i < plan.steps.length; i++) {
       const step = plan.steps[i];
       plan.currentStepIndex = i;
-      
-      if (ws) {
-        this.sendToClient(ws, { 
-          type: 'step_start', 
-          step: i + 1, 
-          total: plan.steps.length,
-          description: step.description 
-        });
-      }
+      if (ws) this.send(ws, { type: 'step_start', step: i + 1, description: step.description });
 
       try {
         step.status = 'executing';
         step.startedAt = Date.now();
-
-        // Execute step with full context
-        const result = await this.executeStep(step);
-        
+        const result = await this.executeStep(step, state);
         step.result = result;
         step.status = 'completed';
         step.completedAt = Date.now();
-        step.durationMs = step.completedAt - (step.startedAt || 0);
-
-        if (ws) {
-          this.sendToClient(ws, { 
-            type: 'step_complete', 
-            step: i + 1,
-            result 
-          });
-        }
-
-        // Persist after each step
-        await this.persistState();
-      } catch (error) {
+        step.durationMs = step.completedAt - step.startedAt;
+        if (ws) this.send(ws, { type: 'step_complete', step: i + 1, result });
+        await this.saveState(state);
+      } catch (e) {
         step.status = 'failed';
-        step.error = error instanceof Error ? error.message : 'Unknown error';
-        
-        if (ws) {
-          this.sendToClient(ws, { 
-            type: 'step_error', 
-            step: i + 1,
-            error: step.error
-          });
-        }
+        step.error = e instanceof Error ? e.message : 'unknown';
+        if (ws) this.send(ws, { type: 'step_error', step: i + 1, error: step.error });
         break;
       }
     }
 
-    // Synthesize final response
-    await this.synthesizeFinalResponse(ws);
-    
-    // Mark plan as completed
+    await this.synthesizeFinalResponse(ws, state);
     plan.status = 'completed';
     plan.completedAt = Date.now();
+    await this.saveState(state);
   }
 
-  async generateExecutionPlan(query: string, complexity: TaskComplexity): Promise<ExecutionPlan> {
+  // -----------------------------------------------------------------
+  // Plan generation (robust JSON)
+  // -----------------------------------------------------------------
+  private async generatePlan(query: string, complexity: TaskComplexity): Promise<ExecutionPlan> {
     const model = this.genAI.getGenerativeModel({
       model: 'gemini-2.5-flash',
-      generationConfig: {
-        responseMimeType: 'application/json',
-      }
+      generationConfig: { responseMimeType: 'application/json' },
     });
-
-    const planningPrompt = `You are an autonomous agent planner. Given this user request, create a detailed step-by-step execution plan.
-
-User Request: ${query}
-
-Task Complexity Analysis: ${JSON.stringify(complexity)}
-
-Create a plan with specific, actionable steps. Each step should specify:
-- Action type: search, analyze, code_execute, api_call, or synthesize
-- Clear description of what to do
-- Expected output
-
-Return JSON array of steps:
+    const prompt = `Return **only** a JSON array of steps:
 [
-  {
-    "id": "step_1",
-    "description": "Search for X",
-    "action": "search"
-  }
-]`;
+  { "id": "s1", "description": "...", "action": "search|analyze|code_execute|api_call|synthesize" }
+]
+User request: ${query}
+Complexity: ${JSON.stringify(complexity)}`;
 
     const result = await model.generateContent({
-      contents: [{ role: 'user', parts: [{ text: planningPrompt }] }]
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
     });
-
-    const response = await result.response;
-    const steps = JSON.parse(response.text());
+    const steps = this.parse<any[]>((await result.response).text());
 
     return {
-      steps: steps.map((s: any, i: number) => ({
+      steps: steps.map((s, i) => ({
         ...s,
-        id: s.id || `step_${i + 1}`,
-        status: 'pending' as const
+        id: s.id ?? `step_${i + 1}`,
+        status: 'pending' as const,
       })),
       currentStepIndex: 0,
       status: 'executing',
-      createdAt: Date.now()
+      createdAt: Date.now(),
     };
   }
 
-  async executeStep(step: PlanStep): Promise<any> {
-    // Build context-aware prompt
-    const contextPrompt = this.buildContextualPrompt(step);
-
+  // -----------------------------------------------------------------
+  // Step execution (tools enabled)
+  // -----------------------------------------------------------------
+  private async executeStep(step: PlanStep, state: AgentState): Promise<string> {
+    const prompt = this.buildStepPrompt(step, state);
     const model = this.genAI.getGenerativeModel({
       model: 'gemini-2.5-flash',
-      tools: [
-        { googleSearchRetrieval: {} },
-        { codeExecution: {} }
-      ]
+      tools: [{ googleSearchRetrieval: {} }, { codeExecution: {} }],
     });
-
-    const chat = model.startChat({
-      history: this.state.conversationHistory.map(msg => ({
-        role: msg.role,
-        parts: msg.parts
-      }))
-    });
-
-    const result = await chat.sendMessage(contextPrompt);
-    const response = await result.response;
-
-    return response.text();
+    const chat = model.startChat({ history: this.buildGeminiHistory(state) });
+    const result = await chat.sendMessage(prompt);
+    return (await result.response).text();
   }
 
-  buildContextualPrompt(step: PlanStep): string {
-    const plan = this.state.currentPlan;
-    if (!plan) return step.description;
-
-    const completedSteps = plan.steps
+  private buildStepPrompt(step: PlanStep, state: AgentState): string {
+    const plan = state.currentPlan!;
+    const completed = plan.steps
       .filter(s => s.status === 'completed')
-      .map(s => `${s.description}: ${s.result}`)
+      .map(s => `${s.description}: ${s.result ?? ''}`)
       .join('\n');
+    return `PLAN OVERVIEW: ${plan.steps.map(s => s.description).join(' → ')}
 
-    return `EXECUTION CONTEXT:
-Plan Overview: ${plan.steps.map(s => s.description).join(' → ')}
+COMPLETED:
+${completed || 'None'}
 
-Completed Steps:
-${completedSteps || 'None yet'}
+CURRENT STEP: ${step.description}
+ACTION: ${step.action}
 
-Current Step: ${step.description}
-Action Type: ${step.action}
-
-Execute this step and provide the result.`;
+Provide the result for this step only.`;
   }
 
-  async synthesizeFinalResponse(ws: WebSocket | null) {
-    if (ws) {
-      this.sendToClient(ws, { type: 'status', message: 'Synthesizing final response...' });
-    }
+  // -----------------------------------------------------------------
+  // Final synthesis
+  // -----------------------------------------------------------------
+  private async synthesizeFinalResponse(ws: WebSocket | null, state: AgentState) {
+    if (ws) this.send(ws, { type: 'status', message: 'Summarising…' });
 
-    const plan = this.state.currentPlan;
-    if (!plan) return;
+    const plan = state.currentPlan!;
+    const lastUser = this.sql
+      .exec(`SELECT parts FROM history WHERE role='user' ORDER BY timestamp DESC LIMIT 1`)
+      .one()?.parts as string | undefined;
+    const original = lastUser ? JSON.parse(lastUser)[0].text : '…';
 
-    const originalRequest = this.state.conversationHistory
-      .find(m => m.role === 'user')?.parts[0];
-    
-    const originalText = originalRequest && 'text' in originalRequest 
-      ? originalRequest.text 
-      : 'Unknown request';
+    const prompt = `Original request: ${original}
 
-    const synthesisPrompt = `Based on the execution of this plan, provide a comprehensive final response to the user.
+Execution results:
+${plan.steps
+  .map((s, i) => `Step ${i + 1} (${s.description}): ${s.result ?? ''}`)
+  .join('\n\n')}
 
-Original User Request: ${originalText}
+Give a concise, user-facing answer.`;
 
-Execution Results:
-${plan.steps.map((s, i) => `Step ${i+1} (${s.description}): ${s.result || 'No result'}`).join('\n\n')}
-
-Synthesize a clear, complete response that addresses the user's original request.`;
-
-    const model = this.genAI.getGenerativeModel({
-      model: 'gemini-2.5-flash'
-    });
-
+    const model = this.genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
     const result = await model.generateContent({
-      contents: [{ role: 'user', parts: [{ text: synthesisPrompt }] }]
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
     });
+    const answer = (await result.response).text();
 
-    const response = await result.response;
-    const finalResponse = response.text();
-
-    // Store in history
-    this.state.conversationHistory.push({
-      role: 'model',
-      parts: [{ text: finalResponse }],
-      timestamp: Date.now()
-    });
+    const parts = JSON.stringify([{ text: answer }]);
+    this.sql.exec(
+      `INSERT INTO history (role, parts, timestamp) VALUES ('model', ?, ?)`,
+      parts,
+      Date.now()
+    );
 
     if (ws) {
-      this.sendToClient(ws, { type: 'final_response', content: finalResponse });
-      this.sendToClient(ws, { type: 'done' });
-    }
-
-    await this.persistState();
-  }
-
-  sendToClient(ws: WebSocket, data: any) {
-    try {
-      ws.send(JSON.stringify(data));
-    } catch (e) {
-      console.error('Failed to send to client:', e);
+      this.send(ws, { type: 'final_response', content: answer });
+      this.send(ws, { type: 'done' });
     }
   }
 
-  async persistState() {
-    await this.ctx.storage.put('state', this.state);
-  }
-
-  async handleChatRequest(request: Request): Promise<Response> {
-    const { message } = await request.json<{ message: string }>();
-    
-    // For HTTP requests, process async
+  // -----------------------------------------------------------------
+  // HTTP helpers
+  // -----------------------------------------------------------------
+  private async handleChatRequest(req: Request, state: AgentState): Promise<Response> {
+    const { message } = await req.json<{ message: string }>();
     this.ctx.waitUntil(this.processUserMessage(message, null));
-    
-    return Response.json({ status: 'processing' });
+    return new Response(JSON.stringify({ status: 'queued' }), {
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+
+  private getHistory(state: AgentState): Response {
+    const rows = this.sql.exec(
+      `SELECT role, parts, timestamp FROM history ORDER BY timestamp ASC`
+    );
+    const messages: Message[] = [];
+    for (const r of rows) {
+      messages.push({
+        role: r.role as 'user' | 'model',
+        parts: JSON.parse(r.parts as string),
+        timestamp: r.timestamp as number,
+      });
+    }
+    return new Response(
+      JSON.stringify({
+        history: messages,
+        sessionId: state.sessionId,
+        messageCount: messages.length,
+      }),
+      { headers: { 'Content-Type': 'application/json' } }
+    );
+  }
+
+  private async clearHistory(state: AgentState): Promise<Response> {
+    this.sql.exec(`DELETE FROM history`);
+    this.sql.exec(`DELETE FROM kv WHERE key='state'`);
+    state.conversationHistory = [];
+    state.currentPlan = undefined;
+    state.lastActivityAt = Date.now();
+    await this.saveState(state);
+    return new Response(JSON.stringify({ status: 'cleared' }), {
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+
+  private getStatus(state: AgentState): Response {
+    return new Response(
+      JSON.stringify({
+        status: state.currentPlan ? 'executing_plan' : 'idle',
+        currentPlan: state.currentPlan,
+        messageCount: state.conversationHistory.length,
+        fileCount: state.context.files.length,
+        lastActivity: state.lastActivityAt,
+      }),
+      { headers: { 'Content-Type': 'application/json' } }
+    );
+  }
+
+  // -----------------------------------------------------------------
+  // Build Gemini history from SQLite rows
+  // -----------------------------------------------------------------
+  private buildGeminiHistory(state: AgentState) {
+    const rows = this.sql.exec(
+      `SELECT role, parts FROM history ORDER BY timestamp ASC`
+    );
+    const hist: Array<{ role: string; parts: Array<{ text: string }> }> = [];
+    for (const r of rows) {
+      const parts = JSON.parse(r.parts as string);
+      hist.push({
+        role: r.role === 'model' ? 'model' : 'user',
+        parts,
+      });
+    }
+    // Remove the very last user message because it will be sent separately
+    if (hist.length > 0 && hist[hist.length - 1].role === 'user') hist.pop();
+    return hist;
   }
 }

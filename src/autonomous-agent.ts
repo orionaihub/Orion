@@ -35,38 +35,45 @@ export class AutonomousAgent extends DurableObject<Env> {
   }
 
   // JSON helpers
-  private parse<T>(text: string): T {
-    const trimmed = text.trim().replace(/^```json\s*/, '').replace(/```$/, '');
+  private parse<T>(text: string): T | null {
     try {
+      const trimmed = text.trim().replace(/^```json\s*/, '').replace(/```$/, '');
+      if (!trimmed) return null;
       return JSON.parse(trimmed) as T;
-    } catch {
-      return {} as T;
+    } catch (e) {
+      console.error('JSON parse failed:', e, 'Raw:', text);
+      return null;
     }
   }
   private stringify(obj: unknown): string {
     return JSON.stringify(obj);
   }
 
-  // Load state – safe, no save inside
+  // Load state – ALWAYS RETURNS
   private async loadState(): Promise<AgentState> {
-    const row = this.sql.exec(`SELECT value FROM kv WHERE key = 'state'`).one();
-    if (row) {
-      try {
-        return this.parse<AgentState>(row.value as string);
-      } catch (e) {
-        console.error('Corrupted state:', e);
+    let state: AgentState | null = null;
+    try {
+      const row = this.sql.exec(`SELECT value FROM kv WHERE key = 'state'`).one();
+      if (row && typeof row.value === 'string') {
+        state = this.parse<AgentState>(row.value);
       }
+    } catch (e) {
+      console.error('SQLite read failed:', e);
     }
-    return {
-      conversationHistory: [],
-      context: { files: [], searchResults: [] },
-      sessionId: this.ctx.id.toString(),
-      lastActivityAt: Date.now(),
-      currentPlan: undefined,
-    };
+
+    if (!state || !state.sessionId) {
+      state = {
+        conversationHistory: [],
+        context: { files: [], searchResults: [] },
+        sessionId: this.ctx.id.toString(),
+        lastActivityAt: Date.now(),
+        currentPlan: undefined,
+      };
+    }
+    return state;
   }
 
-  // Save state – only at the end
+  // Save state – safe
   private async saveState(state: AgentState): Promise<void> {
     try {
       await this.ctx.blockConcurrencyWhile(async () => {
@@ -112,14 +119,7 @@ export class AutonomousAgent extends DurableObject<Env> {
 
   // Core processing
   private async process(userMsg: string, ws: WebSocket | null) {
-    let state: AgentState;
-    try {
-      state = await this.loadState();
-    } catch (e) {
-      if (ws) this.send(ws, { type: 'error', error: 'Failed to load state' });
-      return;
-    }
-
+    let state = await this.loadState();
     state.lastActivityAt = Date.now();
 
     this.sql.exec(
@@ -168,9 +168,10 @@ Request: ${query}` }]
         }],
       });
       const text = (await result.response).text?.() ?? '{}';
-      return this.parse<TaskComplexity>(text);
-    } catch {
-      return { type: 'simple', requiredTools: [], estimatedSteps: 1, reasoning: 'fallback' };
+      return this.parse<TaskComplexity>(text) || { type: 'simple', requiredTools: [], estimatedSteps: 1, reasoning: 'fallback' };
+    } catch (e) {
+      console.error('Complexity failed:', e);
+      return { type: 'simple', requiredTools: [], estimatedSteps: 1, reasoning: 'error' };
     }
   }
 
@@ -257,7 +258,7 @@ Request: ${query}
 Complexity: ${this.stringify(complexity)}` }] }],
       });
       const text = (await result.response).text?.() ?? '[]';
-      const steps = this.parse<any[]>(text);
+      const steps = this.parse<any[]>(text) || [];
       return {
         steps: steps.map((s, i) => ({
           ...s,
@@ -268,7 +269,8 @@ Complexity: ${this.stringify(complexity)}` }] }],
         status: 'executing',
         createdAt: Date.now(),
       };
-    } catch {
+    } catch (e) {
+      console.error('Plan failed:', e);
       return {
         steps: [{ id: 's1', description: 'Answer directly', action: 'synthesize', status: 'pending' }],
         currentStepIndex: 0,
@@ -288,7 +290,8 @@ Complexity: ${this.stringify(complexity)}` }] }],
     try {
       const result = await chat.sendMessage(prompt);
       return (await result.response).text?.() ?? '[No result]';
-    } catch {
+    } catch (e) {
+      console.error('Step failed:', e);
       return '[Step failed]';
     }
   }
@@ -349,12 +352,13 @@ Concise answer:`;
     const rows = this.sql.exec(`SELECT role, parts FROM messages ORDER BY timestamp ASC`);
     const hist: Array<{ role: string; parts: Array<{ text: string }> }> = [];
     for (const r of rows) {
-      try {
+      const parts = this.parse<any[]>(r.parts as string);
+      if (parts) {
         hist.push({
           role: r.role === 'model' ? 'model' : 'user',
-          parts: this.parse(r.parts as string),
+          parts,
         });
-      } catch {}
+      }
     }
     if (hist.length && hist[hist.length - 1].role === 'user') hist.pop();
     return hist;
@@ -384,34 +388,31 @@ Concise answer:`;
     const rows = this.sql.exec(`SELECT role, parts, timestamp FROM messages ORDER BY timestamp ASC`);
     const msgs: Message[] = [];
     for (const r of rows) {
-      try {
+      const parts = this.parse<any[]>(r.parts as string);
+      if (parts) {
         msgs.push({
           role: r.role as any,
-          parts: this.parse(r.parts as string),
+          parts,
           timestamp: r.timestamp as number,
         });
-      } catch {}
+      }
     }
-    return new Response(JSON.stringify({ messages: msgs }), {
+    return new Response(this.stringify({ messages: msgs }), {
       headers: { 'Content-Type': 'application/json' },
     });
   }
 
   private async clearHistory(): Promise<Response> {
-    try {
-      this.sql.exec('DELETE FROM messages');
-      this.sql.exec('DELETE FROM kv');
-      this.sql.exec('DELETE FROM sqlite_sequence WHERE name IN ("messages")');
-    } catch (e) {
-      console.error('Clear failed:', e);
-    }
-    return new Response(JSON.stringify({ ok: true }));
+    this.sql.exec('DELETE FROM messages');
+    this.sql.exec('DELETE FROM kv');
+    this.sql.exec('DELETE FROM sqlite_sequence WHERE name IN ("messages")');
+    return new Response(this.stringify({ ok: true }));
   }
 
   private getStatus(): Response {
     const row = this.sql.exec(`SELECT value FROM kv WHERE key='state'`).one();
     const state = row ? this.parse<AgentState>(row.value as string) : null;
-    return new Response(JSON.stringify({
+    return new Response(this.stringify({
       plan: state?.currentPlan,
       lastActivity: state?.lastActivityAt,
     }), { headers: { 'Content-Type': 'application/json' } });

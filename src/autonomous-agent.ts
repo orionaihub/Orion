@@ -1,6 +1,10 @@
 /**
- * Autonomous Agent Durable Object – SQLite-backed, safe async init,
- * WebSocket on /api/ws, HTTP on /api/*.
+ * Autonomous Agent Durable Object – SQLite-backed, WebSocket-ready
+ * 
+ * Handles:
+ *   • /api/ws   → WebSocket (real-time streaming)
+ *   • /api/chat → POST { message } → async processing
+ *   • /api/history, /api/clear, /api/status
  */
 import { DurableObject } from 'cloudflare:workers';
 import { GoogleGenerativeAI } from '@google/generative-ai';
@@ -18,7 +22,7 @@ export class AutonomousAgent extends DurableObject<Env> {
   private genAI: GoogleGenerativeAI;
 
   // -----------------------------------------------------------------
-  // Constructor – **only synchronous** work
+  // Constructor – ONLY synchronous work
   // -----------------------------------------------------------------
   constructor(state: DurableObjectState, env: Env) {
     super(state, env);
@@ -37,14 +41,15 @@ export class AutonomousAgent extends DurableObject<Env> {
         parts TEXT NOT NULL,
         timestamp INTEGER NOT NULL
       );
+      CREATE INDEX IF NOT EXISTS idx_history_ts ON history(timestamp);
     `);
   }
 
   // -----------------------------------------------------------------
-  // Helper: safe JSON parse / stringify
+  // JSON helpers (robust parsing)
   // -----------------------------------------------------------------
   private parse<T>(text: string): T {
-    const trimmed = text.trim().replace(/^```json/, '').replace(/```$/, '');
+    const trimmed = text.trim().replace(/^```json\s*/, '').replace(/```$/, '');
     return JSON.parse(trimmed) as T;
   }
 
@@ -53,12 +58,11 @@ export class AutonomousAgent extends DurableObject<Env> {
   }
 
   // -----------------------------------------------------------------
-  // Load / save the whole AgentState in one KV row
+  // Load / save state from SQLite (kv table)
   // -----------------------------------------------------------------
   private async loadState(): Promise<AgentState> {
     const row = this.sql.exec(`SELECT value FROM kv WHERE key = 'state'`).one();
     if (!row) {
-      // first-time defaults
       const defaults: AgentState = {
         conversationHistory: [],
         context: { files: [], searchResults: [] },
@@ -83,7 +87,7 @@ export class AutonomousAgent extends DurableObject<Env> {
   }
 
   // -----------------------------------------------------------------
-  // fetch – **all async work starts here**
+  // fetch – all async work starts here
   // -----------------------------------------------------------------
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
@@ -96,7 +100,7 @@ export class AutonomousAgent extends DurableObject<Env> {
       return new Response(null, { status: 101, webSocket: client });
     }
 
-    // Load state **once** for the whole request
+    // Load state once for the request
     let state: AgentState;
     try {
       state = await this.loadState();
@@ -113,7 +117,7 @@ export class AutonomousAgent extends DurableObject<Env> {
       return this.handleChatRequest(request, state);
     }
     if (url.pathname === '/api/history' && request.method === 'GET') {
-      return this.getHistory(state);
+      return this.getHistory();
     }
     if (url.pathname === '/api/clear' && request.method === 'POST') {
       return this.clearHistory(state);
@@ -126,7 +130,7 @@ export class AutonomousAgent extends DurableObject<Env> {
   }
 
   // -----------------------------------------------------------------
-  // WebSocket message handling (state already loaded in fetch)
+  // WebSocket message handler
   // -----------------------------------------------------------------
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer) {
     if (typeof message !== 'string') {
@@ -135,7 +139,12 @@ export class AutonomousAgent extends DurableObject<Env> {
     }
 
     let payload;
-    try { payload = JSON.parse(message); } catch { return; }
+    try {
+      payload = JSON.parse(message);
+    } catch {
+      this.send(ws, { type: 'error', error: 'Invalid JSON' });
+      return;
+    }
 
     if (payload.type === 'user_message') {
       await this.processUserMessage(payload.content, ws);
@@ -143,17 +152,16 @@ export class AutonomousAgent extends DurableObject<Env> {
   }
 
   // -----------------------------------------------------------------
-  // Core processing – all DB ops are inside try/catch
+  // Core message processing
   // -----------------------------------------------------------------
   private async processUserMessage(userMsg: string, ws: WebSocket | null) {
     let state = await this.loadState();
     state.lastActivityAt = Date.now();
 
-    // ---- store user message ----
-    const userPart = JSON.stringify([{ text: userMsg }]);
+    // Store user message
     this.sql.exec(
       `INSERT INTO history (role, parts, timestamp) VALUES ('user', ?, ?)`,
-      userPart,
+      this.stringify([{ text: userMsg }]),
       Date.now()
     );
 
@@ -173,14 +181,18 @@ export class AutonomousAgent extends DurableObject<Env> {
   }
 
   // -----------------------------------------------------------------
-  // Helper: send JSON over WS (safe)
+  // Send JSON over WebSocket (safe)
   // -----------------------------------------------------------------
   private send(ws: WebSocket, data: unknown) {
-    try { ws.send(JSON.stringify(data)); } catch {}
+    try {
+      ws.send(this.stringify(data));
+    } catch (err) {
+      console.error('WebSocket send error:', err);
+    }
   }
 
   // -----------------------------------------------------------------
-  // Complexity analysis (robust JSON extraction)
+  // Task complexity analysis
   // -----------------------------------------------------------------
   private async analyzeTaskComplexity(query: string): Promise<TaskComplexity> {
     const model = this.genAI.getGenerativeModel({
@@ -188,24 +200,23 @@ export class AutonomousAgent extends DurableObject<Env> {
       generationConfig: { responseMimeType: 'application/json' },
     });
     const result = await model.generateContent({
-      contents: [{ role: 'user', parts: [{ text: this.complexityPrompt(query) }] }],
-    });
-    return this.parse<TaskComplexity>((await result.response).text());
-  }
-
-  private complexityPrompt(q: string) {
-    return `Analyze this request and answer in JSON only:
+      contents: [{
+        role: 'user',
+        parts: [{ text: `Analyze this request and respond in JSON only:
 {
   "type": "simple" | "complex",
   "requiredTools": string[],
   "estimatedSteps": number,
   "reasoning": "short"
 }
-Request: ${q}`;
+Request: ${query}` }]
+      }],
+    });
+    return this.parse<TaskComplexity>((await result.response).text());
   }
 
   // -----------------------------------------------------------------
-  // Simple query – streaming like the Chat example
+  // Simple query – streaming response
   // -----------------------------------------------------------------
   private async handleSimpleQuery(
     query: string,
@@ -219,7 +230,7 @@ Request: ${q}`;
       tools: [{ googleSearchRetrieval: {} }, { codeExecution: {} }],
     });
 
-    const history = this.buildGeminiHistory(state);
+    const history = this.buildGeminiHistory();
     const chat = model.startChat({ history });
 
     const result = await chat.sendMessageStream(query);
@@ -230,11 +241,10 @@ Request: ${q}`;
       if (ws) this.send(ws, { type: 'chunk', content: txt });
     }
 
-    // store assistant reply
-    const parts = JSON.stringify([{ text: full }]);
+    // Save assistant response
     this.sql.exec(
       `INSERT INTO history (role, parts, timestamp) VALUES ('model', ?, ?)`,
-      parts,
+      this.stringify([{ text: full }]),
       Date.now()
     );
 
@@ -242,7 +252,7 @@ Request: ${q}`;
   }
 
   // -----------------------------------------------------------------
-  // Complex task – plan → step → synthesize (all SQLite backed)
+  // Complex task – planning + execution
   // -----------------------------------------------------------------
   private async handleComplexTask(
     query: string,
@@ -286,19 +296,19 @@ Request: ${q}`;
   }
 
   // -----------------------------------------------------------------
-  // Plan generation (robust JSON)
+  // Plan generation
   // -----------------------------------------------------------------
   private async generatePlan(query: string, complexity: TaskComplexity): Promise<ExecutionPlan> {
     const model = this.genAI.getGenerativeModel({
       model: 'gemini-2.5-flash',
       generationConfig: { responseMimeType: 'application/json' },
     });
-    const prompt = `Return **only** a JSON array of steps:
+    const prompt = `Return ONLY a JSON array of steps:
 [
   { "id": "s1", "description": "...", "action": "search|analyze|code_execute|api_call|synthesize" }
 ]
 User request: ${query}
-Complexity: ${JSON.stringify(complexity)}`;
+Complexity: ${this.stringify(complexity)}`;
 
     const result = await model.generateContent({
       contents: [{ role: 'user', parts: [{ text: prompt }] }],
@@ -318,7 +328,7 @@ Complexity: ${JSON.stringify(complexity)}`;
   }
 
   // -----------------------------------------------------------------
-  // Step execution (tools enabled)
+  // Step execution
   // -----------------------------------------------------------------
   private async executeStep(step: PlanStep, state: AgentState): Promise<string> {
     const prompt = this.buildStepPrompt(step, state);
@@ -326,7 +336,7 @@ Complexity: ${JSON.stringify(complexity)}`;
       model: 'gemini-2.5-flash',
       tools: [{ googleSearchRetrieval: {} }, { codeExecution: {} }],
     });
-    const chat = model.startChat({ history: this.buildGeminiHistory(state) });
+    const chat = model.startChat({ history: this.buildGeminiHistory() });
     const result = await chat.sendMessage(prompt);
     return (await result.response).text();
   }
@@ -352,13 +362,13 @@ Provide the result for this step only.`;
   // Final synthesis
   // -----------------------------------------------------------------
   private async synthesizeFinalResponse(ws: WebSocket | null, state: AgentState) {
-    if (ws) this.send(ws, { type: 'status', message: 'Summarising…' });
+    if (ws) this.send(ws, { type: 'status', message: 'Summarizing…' });
 
     const plan = state.currentPlan!;
     const lastUser = this.sql
       .exec(`SELECT parts FROM history WHERE role='user' ORDER BY timestamp DESC LIMIT 1`)
       .one()?.parts as string | undefined;
-    const original = lastUser ? JSON.parse(lastUser)[0].text : '…';
+    const original = lastUser ? this.parse<any[]>(lastUser)[0].text : '…';
 
     const prompt = `Original request: ${original}
 
@@ -375,10 +385,9 @@ Give a concise, user-facing answer.`;
     });
     const answer = (await result.response).text();
 
-    const parts = JSON.stringify([{ text: answer }]);
     this.sql.exec(
       `INSERT INTO history (role, parts, timestamp) VALUES ('model', ?, ?)`,
-      parts,
+      this.stringify([{ text: answer }]),
       Date.now()
     );
 
@@ -389,7 +398,7 @@ Give a concise, user-facing answer.`;
   }
 
   // -----------------------------------------------------------------
-  // HTTP helpers
+  // HTTP handlers
   // -----------------------------------------------------------------
   private async handleChatRequest(req: Request, state: AgentState): Promise<Response> {
     const { message } = await req.json<{ message: string }>();
@@ -399,22 +408,22 @@ Give a concise, user-facing answer.`;
     });
   }
 
-  private getHistory(state: AgentState): Response {
-    const rows = this.sql.exec(
-      `SELECT role, parts, timestamp FROM history ORDER BY timestamp ASC`
-    );
+  private getHistory(): Response {
+    const rows = this.sql.exec(`SELECT role, parts, timestamp FROM history ORDER BY timestamp ASC`);
     const messages: Message[] = [];
     for (const r of rows) {
       messages.push({
         role: r.role as 'user' | 'model',
-        parts: JSON.parse(r.parts as string),
+        parts: this.parse(r.parts as string),
         timestamp: r.timestamp as number,
       });
     }
+    const stateRow = this.sql.exec(`SELECT value FROM kv WHERE key='state'`).one();
+    const sessionId = stateRow ? this.parse<AgentState>(stateRow.value as string).sessionId : 'unknown';
     return new Response(
-      JSON.stringify({
+      this.stringify({
         history: messages,
-        sessionId: state.sessionId,
+        sessionId,
         messageCount: messages.length,
       }),
       { headers: { 'Content-Type': 'application/json' } }
@@ -435,7 +444,7 @@ Give a concise, user-facing answer.`;
 
   private getStatus(state: AgentState): Response {
     return new Response(
-      JSON.stringify({
+      this.stringify({
         status: state.currentPlan ? 'executing_plan' : 'idle',
         currentPlan: state.currentPlan,
         messageCount: state.conversationHistory.length,
@@ -447,21 +456,19 @@ Give a concise, user-facing answer.`;
   }
 
   // -----------------------------------------------------------------
-  // Build Gemini history from SQLite rows
+  // Build Gemini history from SQLite
   // -----------------------------------------------------------------
-  private buildGeminiHistory(state: AgentState) {
-    const rows = this.sql.exec(
-      `SELECT role, parts FROM history ORDER BY timestamp ASC`
-    );
+  private buildGeminiHistory() {
+    const rows = this.sql.exec(`SELECT role, parts FROM history ORDER BY timestamp ASC`);
     const hist: Array<{ role: string; parts: Array<{ text: string }> }> = [];
     for (const r of rows) {
-      const parts = JSON.parse(r.parts as string);
+      const parts = this.parse<any[]>(r.parts as string);
       hist.push({
         role: r.role === 'model' ? 'model' : 'user',
         parts,
       });
     }
-    // Remove the very last user message because it will be sent separately
+    // Remove last user message (will be sent separately)
     if (hist.length > 0 && hist[hist.length - 1].role === 'user') hist.pop();
     return hist;
   }

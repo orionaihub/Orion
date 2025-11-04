@@ -1,13 +1,13 @@
 /**
  * Autonomous Agent Worker Entry Point
- *
+ * 
  * This Worker acts as a thin routing layer (<10ms CPU) that immediately
  * delegates all agent logic to the AutonomousAgent Durable Object.
- *
+ * 
  * Architecture:
  * - Worker: Routes requests, manages sessions, handles CORS
  * - Durable Object: Contains ALL agent logic, runs without CPU limits
- *
+ * 
  * @license MIT
  */
 
@@ -20,7 +20,7 @@ export { AutonomousAgent };
 export default {
   /**
    * Main request handler for the Worker
-   *
+   * 
    * This function must stay under 10ms CPU time on Free Tier.
    * All complex logic is delegated to the Durable Object.
    */
@@ -54,7 +54,7 @@ export default {
 
 /**
  * Handle API requests by routing to the appropriate Durable Object
- *
+ * 
  * This function creates or retrieves a Durable Object instance based on
  * the session ID, then forwards the request to it.
  */
@@ -97,16 +97,13 @@ async function handleApiRequest(
         })
       );
     } else if (url.pathname === '/api/ws') {
-      // WebSocket upgrade – fixed headers
-      const upgradeReq = new Request('http://internal/ws', {
-        headers: {
-          upgrade               : 'websocket',
-          connection            : 'upgrade',
-          'sec-websocket-key'    : request.headers.get('Sec-WebSocket-Key')!,
-          'sec-websocket-version': request.headers.get('Sec-WebSocket-Version')!,
-        },
-      });
-      response = await stub.fetch(upgradeReq);
+      // WebSocket upgrade - for real-time agent communication
+      // The Durable Object will handle the WebSocket lifecycle
+      response = await stub.fetch(
+        new Request('http://internal/ws', {
+          headers: request.headers,
+        })
+      );
     } else if (url.pathname === '/api/history' && request.method === 'GET') {
       // Get conversation history
       response = await stub.fetch('http://internal/history');
@@ -196,7 +193,7 @@ function getSessionId(request: Request): string | null {
 
 /**
  * Generate a unique session ID
- *
+ * 
  * Format: session_timestamp_random
  * This ensures uniqueness and provides temporal ordering
  */
@@ -206,7 +203,7 @@ function generateSessionId(): string {
 
 /**
  * Basic HTML for testing without assets binding
- *
+ * 
  * This provides a minimal UI for interacting with the agent
  * during development or when ASSETS binding is not configured.
  */
@@ -382,13 +379,13 @@ function getBasicHTML(): string {
       <h1>🤖 Autonomous Agent</h1>
       <p>Powered by Gemini 2.5 Flash • Multi-step reasoning & execution</p>
     </div>
-
+    
     <div class="chat-container" id="chat"></div>
-
+    
     <div class="input-container">
       <div class="input-row">
-        <textarea
-          id="input"
+        <textarea 
+          id="input" 
           placeholder="Ask me anything or give me a complex task to execute autonomously..."
           rows="3"
         ></textarea>
@@ -409,11 +406,10 @@ function getBasicHTML(): string {
     function connect() {
       if (ws && ws.readyState === WebSocket.OPEN) return;
       if (isConnecting) return;
-
+      
       isConnecting = true;
-      const wsUrl = new URL('/api/ws', location.href);
-      wsUrl.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-      ws = new WebSocket(wsUrl);
+      const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      ws = new WebSocket(protocol + '//' + location.host + '/api/ws');
 
       ws.onopen = () => {
         console.log('WebSocket connected');
@@ -443,7 +439,7 @@ function getBasicHTML(): string {
     let currentPlanEl = null;
 
     function handleMessage(data) {
-      switch (data.type) {
+      switch(data.type) {
         case 'status':
           addStatusMessage(data.message);
           break;
@@ -459,13 +455,13 @@ function getBasicHTML(): string {
           break;
         case 'step_start':
           updatePlanStep(data.step - 1, 'active');
-          addStatusMessage(`Executing: ${data.description}`);
+          addStatusMessage(\`Executing: \${data.description}\`);
           break;
         case 'step_complete':
           updatePlanStep(data.step - 1, 'completed');
           break;
         case 'step_error':
-          addStatusMessage(`Error in step ${data.step}: ${data.error}`, true);
+          addStatusMessage(\`Error in step \${data.step}: \${data.error}\`, true);
           break;
         case 'final_response':
           currentMessageEl = addMessage('agent', data.content);
@@ -491,7 +487,7 @@ function getBasicHTML(): string {
 
       addMessage('user', message);
       input.value = '';
-
+      
       addTyping();
 
       if (ws && ws.readyState === WebSocket.OPEN) {
@@ -510,7 +506,7 @@ function getBasicHTML(): string {
     function addMessage(role, content) {
       const chat = document.getElementById('chat');
       const msgDiv = document.createElement('div');
-      msgDiv.className = `message ${role}`;
+      msgDiv.className = \`message \${role}\`;
       const contentDiv = document.createElement('div');
       contentDiv.className = 'message-content';
       contentDiv.textContent = content;
@@ -537,15 +533,15 @@ function getBasicHTML(): string {
       const planDiv = document.createElement('div');
       planDiv.className = 'plan';
       planDiv.innerHTML = '<strong>📋 Execution Plan:</strong>';
-
+      
       plan.steps.forEach((step, i) => {
         const stepDiv = document.createElement('div');
         stepDiv.className = 'plan-step';
         stepDiv.dataset.index = i;
-        stepDiv.textContent = `${i + 1}. ${step.description}`;
+        stepDiv.textContent = \`\${i+1}. \${step.description}\`;
         planDiv.appendChild(stepDiv);
       });
-
+      
       chat.appendChild(planDiv);
       scrollToBottom();
       return planDiv;
@@ -553,9 +549,9 @@ function getBasicHTML(): string {
 
     function updatePlanStep(index, status) {
       if (!currentPlanEl) return;
-      const step = currentPlanEl.querySelector(`[data-index="${index}"]`);
+      const step = currentPlanEl.querySelector(\`[data-index="\${index}"]\`);
       if (step) {
-        step.className = `plan-step ${status}`;
+        step.className = \`plan-step \${status}\`;
       }
     }
 
@@ -564,11 +560,11 @@ function getBasicHTML(): string {
       const typingDiv = document.createElement('div');
       typingDiv.className = 'message agent';
       typingDiv.id = 'typing';
-      typingDiv.innerHTML = `
+      typingDiv.innerHTML = \`
         <div class="typing">
           <span></span><span></span><span></span>
         </div>
-      `;
+      \`;
       chat.appendChild(typingDiv);
       scrollToBottom();
     }
@@ -583,12 +579,12 @@ function getBasicHTML(): string {
       const chat = document.getElementById('chat');
       const sourcesDiv = document.createElement('div');
       sourcesDiv.className = 'message status';
-      sourcesDiv.innerHTML = `
+      sourcesDiv.innerHTML = \`
         <div class="message-content">
           <strong>📚 Sources:</strong><br>
-          ${sources.map(s => `• ${s}`).join('<br>')}
+          \${sources.map(s => \`• \${s}\`).join('<br>')}
         </div>
-      `;
+      \`;
       chat.appendChild(sourcesDiv);
       scrollToBottom();
     }
@@ -614,7 +610,7 @@ function getBasicHTML(): string {
         const res = await fetch('/api/history');
         const data = await res.json();
         console.log('Conversation History:', data.history);
-        addStatusMessage(`History has ${data.history.length} messages (see console)`);
+        addStatusMessage(\`History has \${data.history.length} messages (see console)\`);
       } catch (error) {
         addStatusMessage('Error fetching history', true);
       }

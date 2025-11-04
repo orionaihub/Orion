@@ -230,7 +230,7 @@ Request: ${query}` }]
     }
 
     await this.synthesize(ws, state);
-    plan.status нравится 'completed';
+    plan.status = 'completed';
     plan.completedAt = Date.now();
     await this.saveState(state);
   }

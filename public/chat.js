@@ -1,8 +1,7 @@
 /**
- * Autonomous Agent Frontend with WebSocket Support
+ * Suna-Lite Frontend with File Upload Support
  *
- * Handles the chat UI interactions and WebSocket communication with the backend.
- * Supports real-time streaming, execution plans, and multi-step autonomous tasks.
+ * Handles chat UI, WebSocket communication, and file uploads
  */
 
 // DOM elements
@@ -10,6 +9,9 @@ const chatMessages = document.getElementById("chat-messages");
 const userInput = document.getElementById("user-input");
 const sendButton = document.getElementById("send-button");
 const typingIndicator = document.getElementById("typing-indicator");
+const fileInput = document.getElementById("file-input");
+const uploadedFilesArea = document.getElementById("uploaded-files-area");
+const capabilitiesEl = document.getElementById("capabilities");
 
 // WebSocket connection
 let ws = null;
@@ -21,12 +23,98 @@ const MAX_RECONNECT_DELAY = 30000; // 30 seconds
 let isProcessing = false;
 let currentMessageElement = null;
 let currentPlanElement = null;
+let uploadedFiles = [];
+let pendingFiles = [];
 
 // Load chat history on page load
 window.addEventListener('DOMContentLoaded', () => {
   loadChatHistory();
   connectWebSocket();
+  setupFileUpload();
 });
+
+/**
+ * Setup file upload handler
+ */
+function setupFileUpload() {
+  fileInput.addEventListener('change', async (e) => {
+    const files = Array.from(e.target.files);
+    
+    for (const file of files) {
+      if (file.size > 10 * 1024 * 1024) { // 10MB limit
+        addStatusMessage(`File ${file.name} is too large (max 10MB)`, 'error');
+        continue;
+      }
+
+      try {
+        const base64 = await fileToBase64(file);
+        pendingFiles.push({
+          data: base64.split(',')[1], // Remove data:xxx;base64, prefix
+          mimeType: file.type,
+          name: file.name,
+          size: file.size
+        });
+
+        addFileChip(file.name, file.size);
+      } catch (error) {
+        console.error('File reading failed:', error);
+        addStatusMessage(`Failed to read ${file.name}`, 'error');
+      }
+    }
+
+    // Clear file input
+    fileInput.value = '';
+  });
+}
+
+/**
+ * Convert file to base64
+ */
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+/**
+ * Add file chip to UI
+ */
+function addFileChip(name, size) {
+  uploadedFilesArea.classList.remove('empty');
+  
+  const chip = document.createElement('div');
+  chip.className = 'file-chip';
+  chip.innerHTML = `
+    <span>📄 ${name} (${formatFileSize(size)})</span>
+    <span class="remove" onclick="removeFileChip(this, '${name}')">✕</span>
+  `;
+  
+  uploadedFilesArea.appendChild(chip);
+}
+
+/**
+ * Remove file chip
+ */
+function removeFileChip(element, fileName) {
+  pendingFiles = pendingFiles.filter(f => f.name !== fileName);
+  element.parentElement.remove();
+  
+  if (pendingFiles.length === 0) {
+    uploadedFilesArea.classList.add('empty');
+  }
+}
+
+/**
+ * Format file size
+ */
+function formatFileSize(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+  return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+}
 
 /**
  * Connect to WebSocket
@@ -64,7 +152,6 @@ function connectWebSocket() {
     isConnecting = false;
     updateConnectionStatus('disconnected');
     
-    // Attempt to reconnect with exponential backoff
     reconnectAttempts++;
     const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), MAX_RECONNECT_DELAY);
     console.log(`Reconnecting in ${delay}ms...`);
@@ -86,6 +173,9 @@ function handleServerMessage(data) {
   switch (data.type) {
     case 'connected':
       console.log('Session ID:', data.sessionId);
+      if (data.capabilities) {
+        displayCapabilities(data.capabilities);
+      }
       break;
 
     case 'status':
@@ -125,6 +215,24 @@ function handleServerMessage(data) {
       addStatusMessage(`Error in step ${data.step}: ${data.error}`, 'error');
       break;
 
+    case 'file_uploaded':
+      addStatusMessage(`✓ Uploaded: ${data.file.name} (${formatFileSize(data.file.size)})`, 'success');
+      break;
+
+    case 'file_analyzed':
+      addStatusMessage(`✓ Analyzed file: ${data.fileName}`, 'success');
+      break;
+
+    case 'code_executing':
+      addStatusMessage('⚙️ Executing code...', 'info');
+      break;
+
+    case 'code_result':
+      if (data.result) {
+        addCodeResultElement(data.result);
+      }
+      break;
+
     case 'final_response':
       currentMessageElement = createMessageElement('assistant');
       appendToMessage(currentMessageElement, data.content);
@@ -147,6 +255,11 @@ function handleServerMessage(data) {
       currentPlanElement = null;
       isProcessing = false;
       enableInput();
+      
+      // Clear pending files after successful send
+      pendingFiles = [];
+      uploadedFilesArea.innerHTML = '';
+      uploadedFilesArea.classList.add('empty');
       break;
 
     case 'error':
@@ -163,19 +276,39 @@ function handleServerMessage(data) {
 }
 
 /**
+ * Display capabilities
+ */
+function displayCapabilities(capabilities) {
+  capabilitiesEl.innerHTML = '';
+  
+  const capabilityIcons = {
+    'search': '🔍 Search',
+    'code_execution': '💻 Code',
+    'file_analysis': '📄 Files',
+    'vision': '👁️ Vision',
+    'data_analysis': '📊 Data',
+    'image_generation': '🎨 Images'
+  };
+
+  capabilities.forEach(cap => {
+    const badge = document.createElement('span');
+    badge.className = 'capability-badge';
+    badge.textContent = capabilityIcons[cap] || cap;
+    capabilitiesEl.appendChild(badge);
+  });
+}
+
+/**
  * Send message to the agent
  */
 async function sendMessage() {
   const message = userInput.value.trim();
 
-  // Don't send empty messages
   if (message === "" || isProcessing) return;
 
-  // Check WebSocket connection
   if (!ws || ws.readyState !== WebSocket.OPEN) {
     addStatusMessage('Connecting to server...', 'info');
     connectWebSocket();
-    // Retry after connection attempt
     setTimeout(() => {
       if (ws && ws.readyState === WebSocket.OPEN) {
         sendMessage();
@@ -184,7 +317,6 @@ async function sendMessage() {
     return;
   }
 
-  // Disable input while processing
   isProcessing = true;
   disableInput();
 
@@ -198,12 +330,18 @@ async function sendMessage() {
   // Show typing indicator
   showTypingIndicator('Processing your request...');
 
-  // Send via WebSocket
+  // Send via WebSocket with files
   try {
-    ws.send(JSON.stringify({
+    const payload = {
       type: 'user_message',
       content: message
-    }));
+    };
+
+    if (pendingFiles.length > 0) {
+      payload.files = pendingFiles;
+    }
+
+    ws.send(JSON.stringify(payload));
   } catch (error) {
     console.error('Error sending message:', error);
     addStatusMessage('Failed to send message. Please try again.', 'error');
@@ -222,26 +360,28 @@ async function loadChatHistory() {
     if (response.ok) {
       const data = await response.json();
       
-      // Clear initial message
       chatMessages.innerHTML = '';
       
-      // Load messages
       if (data.history && data.history.length > 0) {
         data.history.forEach(msg => {
           const role = msg.role === 'model' ? 'assistant' : msg.role;
           if (msg.parts && msg.parts.length > 0) {
-            const text = msg.parts
+            const textParts = msg.parts
               .filter(p => p.text)
               .map(p => p.text)
               .join('\n');
-            if (text) {
-              addMessageToChat(role, text, false);
+            if (textParts) {
+              addMessageToChat(role, textParts, false);
             }
           }
         });
       } else {
-        // Show welcome message if no history
         showWelcomeMessage();
+      }
+
+      // Display uploaded files
+      if (data.files && data.files.length > 0) {
+        uploadedFiles = data.files;
       }
     } else {
       showWelcomeMessage();
@@ -260,16 +400,17 @@ function showWelcomeMessage() {
   const welcomeEl = document.createElement('div');
   welcomeEl.className = 'message assistant-message';
   welcomeEl.innerHTML = `
-    <p><strong>🤖 Welcome to the Autonomous Agent!</strong></p>
-    <p>I'm powered by Gemini 2.5 Flash and can help you with:</p>
+    <p><strong>🤖 Welcome to Suna-Lite!</strong></p>
+    <p>I'm an autonomous AI agent powered by Gemini 2.0 Flash with enhanced capabilities:</p>
     <ul>
-      <li>🔍 Web research using Google Search</li>
-      <li>💻 Code execution (Python)</li>
-      <li>📄 Document analysis</li>
-      <li>🧠 Multi-step complex tasks</li>
-      <li>🌐 URL analysis and web scraping</li>
+      <li>🔍 <strong>Web Search</strong> - Real-time information from Google</li>
+      <li>💻 <strong>Code Execution</strong> - Run Python code for calculations and analysis</li>
+      <li>📄 <strong>File Analysis</strong> - Process PDFs, CSVs, TXT, and more</li>
+      <li>👁️ <strong>Vision</strong> - Analyze and understand images</li>
+      <li>📊 <strong>Data Analysis</strong> - Comprehensive data processing</li>
+      <li>🧠 <strong>Multi-step Tasks</strong> - Complex task planning and execution</li>
     </ul>
-    <p>For complex tasks, I'll create an execution plan and work through it step by step!</p>
+    <p><strong>Try uploading files</strong> with the 📎 button and asking me to analyze them!</p>
   `;
   chatMessages.appendChild(welcomeEl);
 }
@@ -308,34 +449,73 @@ function addMessageToChat(role, content, scroll = true) {
 }
 
 /**
- * Create execution plan element
+ * Create execution plan element with sections
  */
 function createPlanElement(plan) {
   const planEl = document.createElement('div');
   planEl.className = 'plan-container';
+  
+  const totalSteps = plan.steps?.length || 0;
+  
   planEl.innerHTML = `
     <div class="plan-header">
       <strong>📋 Execution Plan</strong>
-      <span class="plan-status">${plan.steps.length} steps</span>
+      <span class="plan-status">${totalSteps} steps</span>
     </div>
-    <div class="plan-steps"></div>
+    <div class="plan-sections"></div>
   `;
 
-  const stepsContainer = planEl.querySelector('.plan-steps');
-  plan.steps.forEach((step, index) => {
-    const stepEl = document.createElement('div');
-    stepEl.className = 'plan-step';
-    stepEl.dataset.index = index;
-    stepEl.innerHTML = `
-      <span class="step-number">${index + 1}</span>
-      <span class="step-description">${escapeHtml(step.description)}</span>
-      <span class="step-status">pending</span>
-    `;
-    stepsContainer.appendChild(stepEl);
-  });
+  const sectionsContainer = planEl.querySelector('.plan-sections');
+
+  if (plan.sections && plan.sections.length > 0) {
+    // Display with sections
+    plan.sections.forEach((section, sectionIdx) => {
+      const sectionEl = document.createElement('div');
+      sectionEl.className = 'plan-section';
+      sectionEl.innerHTML = `
+        <div class="section-header">${section.name}</div>
+        <div class="plan-steps"></div>
+      `;
+
+      const stepsContainer = sectionEl.querySelector('.plan-steps');
+      section.steps.forEach((step, stepIdx) => {
+        const globalIndex = plan.steps.findIndex(s => s.id === step.id);
+        const stepEl = createStepElement(step, globalIndex);
+        stepsContainer.appendChild(stepEl);
+      });
+
+      sectionsContainer.appendChild(sectionEl);
+    });
+  } else {
+    // Display without sections (flat list)
+    const sectionEl = document.createElement('div');
+    sectionEl.className = 'plan-steps';
+    
+    plan.steps.forEach((step, index) => {
+      const stepEl = createStepElement(step, index);
+      sectionEl.appendChild(stepEl);
+    });
+    
+    sectionsContainer.appendChild(sectionEl);
+  }
 
   chatMessages.appendChild(planEl);
   return planEl;
+}
+
+/**
+ * Create step element
+ */
+function createStepElement(step, index) {
+  const stepEl = document.createElement('div');
+  stepEl.className = 'plan-step';
+  stepEl.dataset.index = index;
+  stepEl.innerHTML = `
+    <span class="step-number">${index + 1}</span>
+    <span class="step-description">${escapeHtml(step.description)}</span>
+    <span class="step-status">pending</span>
+  `;
+  return stepEl;
 }
 
 /**
@@ -357,9 +537,23 @@ function updatePlanStep(planElement, stepIndex, status) {
 function addStatusMessage(message, type = 'info') {
   const statusEl = document.createElement('div');
   statusEl.className = `status-message status-${type}`;
-  const icon = type === 'error' ? '⚠️' : 'ℹ️';
+  const icon = type === 'error' ? '⚠️' : type === 'success' ? '✓' : 'ℹ️';
   statusEl.innerHTML = `<p>${icon} ${escapeHtml(message)}</p>`;
   chatMessages.appendChild(statusEl);
+  scrollToBottom();
+}
+
+/**
+ * Add code result element
+ */
+function addCodeResultElement(result) {
+  const codeEl = document.createElement('div');
+  codeEl.className = 'code-result-container';
+  codeEl.innerHTML = `
+    <div class="code-header"><strong>💻 Code Result</strong></div>
+    <pre>${escapeHtml(result)}</pre>
+  `;
+  chatMessages.appendChild(codeEl);
   scrollToBottom();
 }
 
@@ -427,7 +621,6 @@ function enableInput() {
  * Connection status indicator
  */
 function updateConnectionStatus(status) {
-  // You can add a visual indicator in the UI if desired
   console.log('Connection status:', status);
 }
 
@@ -451,7 +644,7 @@ function escapeHtml(text) {
  * Clear chat history
  */
 async function clearChat() {
-  if (!confirm('Are you sure you want to clear the chat history?')) {
+  if (!confirm('Are you sure you want to clear the chat history and all uploaded files?')) {
     return;
   }
 
@@ -459,6 +652,10 @@ async function clearChat() {
     const response = await fetch('/api/clear', { method: 'POST' });
     if (response.ok) {
       chatMessages.innerHTML = '';
+      uploadedFiles = [];
+      pendingFiles = [];
+      uploadedFilesArea.innerHTML = '';
+      uploadedFilesArea.classList.add('empty');
       showWelcomeMessage();
     }
   } catch (error) {
@@ -483,7 +680,3 @@ userInput.addEventListener("keydown", function (e) {
 
 // Send button click handler
 sendButton.addEventListener("click", sendMessage);
-
-// Optional: Add clear button functionality
-// Create a clear button in your HTML and uncomment this:
-// document.getElementById('clear-button')?.addEventListener('click', clearChat);

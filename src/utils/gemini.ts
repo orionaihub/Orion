@@ -1,18 +1,21 @@
 // src/utils/gemini.ts
-import { GoogleGenerativeAI } from '@google/generative-ai';
-import type { TaskComplexity, ExecutionPlan } from '../types';
+import { GoogleGenerativeAI, GoogleAIFileManager } from '@google/generative-ai';
+import type { TaskComplexity, ExecutionPlan, FileMetadata } from '../types';
+import type { ExecutionConfig } from '../tools';
 
 /**
- * Gemini API wrapper with retry and timeout logic
+ * Gemini API wrapper with Suna-Lite capabilities
  */
 export class GeminiClient {
   private genAI: GoogleGenerativeAI;
+  private fileManager: GoogleAIFileManager;
   private maxRetries = 3;
   private baseBackoff = 1000;
-  private timeout = 30000;
+  private timeout = 60000; // 60 seconds for code execution
 
   constructor(apiKey: string) {
     this.genAI = new GoogleGenerativeAI(apiKey);
+    this.fileManager = new GoogleAIFileManager(apiKey);
   }
 
   /**
@@ -58,12 +61,70 @@ export class GeminiClient {
   }
 
   /**
-   * Analyze task complexity
+   * Upload file to Gemini
    */
-  async analyzeComplexity(query: string): Promise<TaskComplexity> {
+  async uploadFile(fileData: string, mimeType: string, displayName: string): Promise<FileMetadata> {
+    try {
+      // Convert base64 to buffer
+      const buffer = Buffer.from(fileData, 'base64');
+      
+      // Create temporary file
+      const uploadResult = await this.fileManager.uploadFile(buffer as any, {
+        mimeType,
+        displayName,
+      });
+
+      // Get file details
+      const file = await this.fileManager.getFile(uploadResult.file.name);
+
+      return {
+        fileUri: file.uri,
+        mimeType: file.mimeType,
+        name: file.displayName || displayName,
+        sizeBytes: file.sizeBytes || buffer.length,
+        uploadedAt: Date.now(),
+        state: file.state as any,
+        expiresAt: file.expirationTime ? new Date(file.expirationTime).getTime() : undefined,
+      };
+    } catch (error) {
+      console.error('File upload failed:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Get file status
+   */
+  async getFileStatus(fileUri: string): Promise<string> {
+    try {
+      const fileName = fileUri.split('/').pop() || fileUri;
+      const file = await this.fileManager.getFile(fileName);
+      return file.state;
+    } catch (error) {
+      console.error('Get file status failed:', error);
+      return 'FAILED';
+    }
+  }
+
+  /**
+   * Delete file
+   */
+  async deleteFile(fileUri: string): Promise<void> {
+    try {
+      const fileName = fileUri.split('/').pop() || fileUri;
+      await this.fileManager.deleteFile(fileName);
+    } catch (error) {
+      console.error('File deletion failed:', error);
+    }
+  }
+
+  /**
+   * Analyze task complexity (enhanced with file/code awareness)
+   */
+  async analyzeComplexity(query: string, hasFiles: boolean = false): Promise<TaskComplexity> {
     return this.withRetry(async () => {
       const model = this.genAI.getGenerativeModel({
-        model: 'gemini-2.5-flash',
+        model: 'gemini-2.0-flash-exp',
         generationConfig: { responseMimeType: 'application/json' },
       });
 
@@ -76,12 +137,22 @@ export class GeminiClient {
   "type": "simple" | "complex",
   "requiredTools": string[],
   "estimatedSteps": number,
-  "reasoning": "brief explanation"
+  "reasoning": "brief explanation",
+  "requiresFiles": boolean,
+  "requiresCode": boolean,
+  "requiresVision": boolean
 }
 
+Available tools: search, code_execution, file_analysis, vision, data_analysis
+
 Rules:
-- "simple": Single-step queries, direct questions, basic requests
-- "complex": Multi-step tasks, research, analysis requiring multiple tools
+- "simple": Single-step queries, direct questions, basic requests without files
+- "complex": Multi-step tasks, research, analysis, file processing, code execution
+- Set requiresFiles=true if user mentions files, documents, data, or analysis
+- Set requiresCode=true if task needs calculations, data processing, or programming
+- Set requiresVision=true if task involves images or visual content
+
+Context: User ${hasFiles ? 'HAS uploaded files' : 'has NOT uploaded files'}
 
 Request: ${query}` }]
           }],
@@ -96,18 +167,21 @@ Request: ${query}` }]
         type: 'simple',
         requiredTools: [],
         estimatedSteps: 1,
-        reasoning: 'fallback to simple'
+        reasoning: 'fallback to simple',
+        requiresFiles: false,
+        requiresCode: false,
+        requiresVision: false,
       };
     });
   }
 
   /**
-   * Generate execution plan
+   * Generate execution plan (enhanced with sections)
    */
-  async generatePlan(query: string, complexity: TaskComplexity): Promise<ExecutionPlan> {
+  async generatePlan(query: string, complexity: TaskComplexity, hasFiles: boolean): Promise<ExecutionPlan> {
     return this.withRetry(async () => {
       const model = this.genAI.getGenerativeModel({
-        model: 'gemini-2.5-flash',
+        model: 'gemini-2.0-flash-exp',
         generationConfig: { responseMimeType: 'application/json' },
       });
 
@@ -115,41 +189,93 @@ Request: ${query}` }]
         model.generateContent({
           contents: [{
             role: 'user',
-            parts: [{ text: `Create an execution plan as a JSON array:
-[
-  {
-    "id": "step_1",
-    "description": "Clear description of what to do",
-    "action": "search|analyze|code_execute|api_call|synthesize"
-  }
-]
+            parts: [{ text: `Create a detailed execution plan with sections as JSON:
+{
+  "sections": [
+    {
+      "name": "Research & Setup" | "Planning" | "Implementation" | "Analysis" | "Verification",
+      "description": "Brief description",
+      "steps": [
+        {
+          "id": "step_1",
+          "description": "Specific action to take",
+          "action": "search|research|code_execute|file_analysis|vision_analysis|data_analysis|analyze|synthesize"
+        }
+      ]
+    }
+  ]
+}
 
 Available actions:
-- search: Use Google Search for information
-- analyze: Analyze and reason about data
-- code_execute: Execute Python code
-- api_call: Call external APIs
+- search/research: Web search for information
+- code_execute: Execute Python code for calculations/analysis
+- file_analysis: Analyze uploaded documents (PDF, CSV, TXT)
+- vision_analysis: Analyze images
+- data_analysis: Comprehensive data analysis with code
+- analyze: Reason about information
 - synthesize: Combine results into final answer
 
-Request: ${query}
-Complexity: ${JSON.stringify(complexity)}
+Context:
+- User ${hasFiles ? 'HAS uploaded files' : 'has NOT uploaded files'}
+- Complexity: ${JSON.stringify(complexity)}
 
-Create a logical, step-by-step plan:` }]
+Create sections in logical order: Research → Planning → Implementation → Analysis → Verification
+
+Request: ${query}` }]
           }],
         }),
         'Plan generation timed out'
       );
 
-      const text = (await result.response).text?.() ?? '[]';
-      const steps = this.parse<any[]>(text) || [];
+      const text = (await result.response).text?.() ?? '{}';
+      const data = this.parse<{ sections: any[] }>(text);
+
+      if (!data || !data.sections) {
+        return {
+          steps: [{
+            id: 'step_1',
+            description: 'Answer the query directly',
+            action: 'analyze',
+            status: 'pending',
+          }],
+          sections: [{
+            name: 'Execution',
+            description: 'Direct response',
+            steps: [],
+            status: 'pending',
+          }],
+          currentStepIndex: 0,
+          status: 'executing',
+          createdAt: Date.now(),
+        };
+      }
+
+      // Flatten steps from sections
+      const allSteps: any[] = [];
+      const sections = data.sections.map((section, sectionIdx) => {
+        const sectionSteps = section.steps.map((s: any, stepIdx: number) => {
+          const step = {
+            id: s.id || `step_${allSteps.length + 1}`,
+            description: s.description || 'Process step',
+            action: s.action || 'analyze',
+            status: 'pending' as const,
+            section: section.name,
+          };
+          allSteps.push(step);
+          return step;
+        });
+
+        return {
+          name: section.name,
+          description: section.description || '',
+          steps: sectionSteps,
+          status: 'pending' as const,
+        };
+      });
 
       return {
-        steps: steps.map((s, i) => ({
-          id: s.id ?? `step_${i + 1}`,
-          description: s.description || 'Unknown step',
-          action: s.action || 'analyze',
-          status: 'pending' as const,
-        })),
+        steps: allSteps,
+        sections,
         currentStepIndex: 0,
         status: 'executing',
         createdAt: Date.now(),
@@ -162,12 +288,11 @@ Create a logical, step-by-step plan:` }]
    */
   async streamResponse(
     query: string,
-    history: Array<{ role: string; parts: Array<{ text: string }> }>,
+    history: Array<{ role: string; parts: any[] }>,
     onChunk: (text: string) => void
   ): Promise<string> {
     const model = this.genAI.getGenerativeModel({
-      model: 'gemini-2.5-flash',
-      // CRITICAL: No tools for streaming to avoid failures
+      model: 'gemini-2.0-flash-exp',
     });
 
     const chat = model.startChat({ history });
@@ -195,29 +320,53 @@ Create a logical, step-by-step plan:` }]
   }
 
   /**
-   * Execute step with tools (non-streaming)
+   * Execute with configuration (search, code, files)
    */
-  async executeWithTools(
+  async executeWithConfig(
     prompt: string,
-    history: Array<{ role: string; parts: Array<{ text: string }> }>,
-    useTools: boolean
+    history: Array<{ role: string; parts: any[] }>,
+    config: ExecutionConfig
   ): Promise<string> {
     return this.withRetry(async () => {
+      const tools: any[] = [];
+      
+      // Add search tool
+      if (config.useSearch) {
+        tools.push({ googleSearch: {} });
+      }
+      
+      // Add code execution tool
+      if (config.useCodeExecution) {
+        tools.push({ codeExecution: {} });
+      }
+
       const model = this.genAI.getGenerativeModel({
-        model: 'gemini-2.5-flash',
-        ...(useTools && {
-          tools: [
-            { googleSearchRetrieval: {} },
-            { codeExecution: {} }
-          ]
-        }),
+        model: 'gemini-2.0-flash-exp',
+        ...(tools.length > 0 && { tools }),
       });
+
+      // Build message parts
+      const parts: any[] = [{ text: prompt }];
+      
+      // Add file references
+      if (config.files && config.files.length > 0) {
+        for (const file of config.files) {
+          if (file.state === 'ACTIVE') {
+            parts.push({
+              fileData: {
+                mimeType: file.mimeType,
+                fileUri: file.fileUri,
+              }
+            });
+          }
+        }
+      }
 
       const chat = model.startChat({ history });
 
       const result = await this.withTimeout(
-        chat.sendMessage(prompt),
-        'Step execution timed out'
+        chat.sendMessage(parts),
+        'Execution timed out'
       );
 
       return (await result.response).text?.() ?? '[No result]';
@@ -230,11 +379,11 @@ Create a logical, step-by-step plan:` }]
   async synthesize(
     originalQuery: string,
     stepResults: Array<{ description: string; result: string }>,
-    history: Array<{ role: string; parts: Array<{ text: string }> }>
+    history: Array<{ role: string; parts: any[] }>
   ): Promise<string> {
     return this.withRetry(async () => {
       const model = this.genAI.getGenerativeModel({
-        model: 'gemini-2.5-flash',
+        model: 'gemini-2.0-flash-exp',
       });
 
       const prompt = `Original Request: ${originalQuery}
@@ -242,7 +391,7 @@ Create a logical, step-by-step plan:` }]
 Step Results:
 ${stepResults.map((s, i) => `Step ${i + 1} - ${s.description}:\n${s.result}`).join('\n\n')}
 
-Task: Synthesize these results into a clear, concise answer to the original request. Be direct and informative.`;
+Task: Synthesize these results into a comprehensive, well-structured answer. Be clear, detailed, and directly address the original request.`;
 
       const result = await this.withTimeout(
         model.generateContent({

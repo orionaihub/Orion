@@ -7,15 +7,20 @@ export default {
 
     // Route API calls under /api/*
     if (path.startsWith('/api/')) {
-      // Get Durable Object stub
-      const id = env.AGENT.idFromName('default');
-      const stub = env.AGENT.get(id);
-
-      // Forward request to DO
-      return stub.fetch(request);
+      try {
+        const id = env.AGENT.idFromName('default'); // Consider idFromName(sessionId) for multiple DOs
+        const stub = env.AGENT.get(id);
+        return await stub.fetch(request);
+      } catch (err: any) {
+        console.error('[Worker] DO fetch error:', err);
+        return new Response(JSON.stringify({ error: err.message || 'Durable Object Error' }), {
+          status: 500,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
     }
 
-    // Optional: fallback response for root path
+    // Optional: root / health check
     return new Response(
       JSON.stringify({ status: 'ok', message: 'Autonomous Gemini Agent Worker running' }),
       { status: 200, headers: { 'Content-Type': 'application/json' } }

@@ -1,9 +1,9 @@
 // src/autonomous-agent.ts
 import { DurableObject } from 'cloudflare:workers';
-import type { Env, AgentState, PlanStep, TaskComplexity } from './types';
+import type { Env, AgentState, PlanStep, TaskComplexity, FileUploadRequest } from './types';
 import { GeminiClient } from './utils/gemini';
 import { StorageManager } from './storage/manager';
-import { ToolRegistry, executeTool, type ToolExecutionParams } from './tools';
+import { ToolRegistry, executeTool, type ToolExecutionParams, type ExecutionConfig } from './tools';
 import { 
   AgentError, 
   ResponseCache, 
@@ -18,7 +18,7 @@ export class AutonomousAgent extends DurableObject<Env> {
   private toolRegistry: ToolRegistry;
   private cache: ResponseCache;
   private activeConnections: Set<WebSocket> = new Set();
-  private requestQueue: Array<{ userMsg: string; ws: WebSocket | null }> = [];
+  private requestQueue: Array<{ userMsg: string; files?: FileUploadRequest[]; ws: WebSocket | null }> = [];
   private isProcessingQueue = false;
 
   constructor(state: DurableObjectState, env: Env) {
@@ -43,12 +43,21 @@ export class AutonomousAgent extends DurableObject<Env> {
       const pair = new WebSocketPair();
       const [client, server] = Object.values(pair);
       this.ctx.acceptWebSocket(server);
-      this.send(server, { type: 'connected', sessionId: this.ctx.id.toString() });
+      
+      const capabilities = this.toolRegistry.getAllCapabilities();
+      this.send(server, { 
+        type: 'connected', 
+        sessionId: this.ctx.id.toString(),
+        capabilities 
+      });
       return new Response(null, { status: 101, webSocket: client });
     }
 
     // REST endpoints
     if (url.pathname === '/api/chat' && request.method === 'POST') return this.handleChat(request);
+    if (url.pathname === '/api/upload' && request.method === 'POST') return this.handleFileUpload(request);
+    if (url.pathname === '/api/files' && request.method === 'GET') return this.listFiles();
+    if (url.pathname === '/api/files' && request.method === 'DELETE') return this.deleteFileEndpoint(request);
     if (url.pathname === '/api/history' && request.method === 'GET') return this.getHistory();
     if (url.pathname === '/api/clear' && request.method === 'POST') return this.clearHistory();
     if (url.pathname === '/api/status' && request.method === 'GET') return this.getStatus();
@@ -72,9 +81,12 @@ export class AutonomousAgent extends DurableObject<Env> {
       return;
     }
 
-    if (payload.type === 'user_message' && typeof payload.content === 'string') {
-      // Add to queue for processing
-      this.requestQueue.push({ userMsg: sanitizeInput(payload.content), ws });
+    if (payload.type === 'user_message') {
+      this.requestQueue.push({ 
+        userMsg: sanitizeInput(payload.content),
+        files: payload.files,
+        ws 
+      });
       this.processQueue();
     } else {
       this.send(ws, { type: 'error', error: 'Invalid payload' });
@@ -108,7 +120,7 @@ export class AutonomousAgent extends DurableObject<Env> {
     while (this.requestQueue.length > 0) {
       const request = this.requestQueue.shift()!;
       try {
-        await this.process(request.userMsg, request.ws);
+        await this.process(request.userMsg, request.files, request.ws);
       } catch (err) {
         console.error('Queue processing failed:', err);
         if (request.ws) {
@@ -126,11 +138,46 @@ export class AutonomousAgent extends DurableObject<Env> {
   /**
    * Main processing logic
    */
-  private async process(userMsg: string, ws: WebSocket | null): Promise<void> {
+  private async process(userMsg: string, files: FileUploadRequest[] | undefined, ws: WebSocket | null): Promise<void> {
     let state = await this.storage.loadState();
     state.lastActivityAt = Date.now();
 
-    // Check cache first
+    // Upload files if provided
+    if (files && files.length > 0 && ws) {
+      this.send(ws, { type: 'status', message: 'Uploading files...' });
+      
+      for (const fileReq of files) {
+        try {
+          const fileMetadata = await this.gemini.uploadFile(
+            fileReq.data,
+            fileReq.mimeType,
+            fileReq.name
+          );
+          
+          state.uploadedFiles.push(fileMetadata);
+          this.storage.saveFile(fileMetadata);
+          
+          this.send(ws, { 
+            type: 'file_uploaded', 
+            file: {
+              name: fileMetadata.name,
+              size: fileMetadata.sizeBytes,
+              type: fileMetadata.mimeType
+            }
+          });
+        } catch (error) {
+          console.error('File upload failed:', error);
+          this.send(ws, { 
+            type: 'error', 
+            error: `Failed to upload ${fileReq.name}` 
+          });
+        }
+      }
+      
+      await this.storage.saveState(state);
+    }
+
+    // Check cache
     const cached = this.cache.get(userMsg);
     if (cached && ws) {
       this.send(ws, { type: 'chunk', content: cached });
@@ -141,9 +188,10 @@ export class AutonomousAgent extends DurableObject<Env> {
     try {
       // Analyze complexity
       if (ws) this.send(ws, { type: 'status', message: 'Analyzing request...' });
-      const complexity = await this.gemini.analyzeComplexity(userMsg);
+      const hasFiles = state.uploadedFiles.length > 0;
+      const complexity = await this.gemini.analyzeComplexity(userMsg, hasFiles);
 
-      // Save user message AFTER successful analysis
+      // Save user message
       this.storage.saveMessage('user', [{ text: userMsg }], Date.now());
 
       // Route based on complexity
@@ -180,10 +228,7 @@ export class AutonomousAgent extends DurableObject<Env> {
         if (ws) this.send(ws, { type: 'chunk', content: chunk });
       });
 
-      // Save assistant response
       this.storage.saveMessage('model', [{ text: fullResponse }], Date.now());
-
-      // Cache the response
       this.cache.set(query, fullResponse);
 
       if (ws) this.send(ws, { type: 'done' });
@@ -205,7 +250,8 @@ export class AutonomousAgent extends DurableObject<Env> {
   ): Promise<void> {
     // Generate plan
     if (ws) this.send(ws, { type: 'status', message: 'Creating execution plan...' });
-    const plan = await this.gemini.generatePlan(query, complexity);
+    const hasFiles = state.uploadedFiles.length > 0;
+    const plan = await this.gemini.generatePlan(query, complexity, hasFiles);
     
     state.currentPlan = plan;
     await this.storage.saveState(state);
@@ -217,12 +263,21 @@ export class AutonomousAgent extends DurableObject<Env> {
       const step = plan.steps[i];
       plan.currentStepIndex = i;
 
+      // Update section status
+      if (step.section) {
+        const section = plan.sections?.find(s => s.name === step.section);
+        if (section && section.status === 'pending') {
+          section.status = 'active';
+        }
+      }
+
       if (ws) {
         this.send(ws, {
           type: 'step_start',
           step: i + 1,
           total: plan.steps.length,
-          description: step.description
+          description: step.description,
+          section: step.section
         });
       }
 
@@ -246,9 +301,17 @@ export class AutonomousAgent extends DurableObject<Env> {
         step.durationMs = step.completedAt - (step.startedAt || step.completedAt);
 
         if (ws) this.send(ws, { type: 'step_error', step: i + 1, error: step.error });
-        
-        // Continue with other steps even if one fails
         console.error(`Step ${i + 1} failed:`, error);
+      }
+    }
+
+    // Mark sections as completed
+    if (plan.sections) {
+      for (const section of plan.sections) {
+        const allCompleted = section.steps.every(s => s.status === 'completed' || s.status === 'failed');
+        if (allCompleted) {
+          section.status = 'completed';
+        }
       }
     }
 
@@ -271,8 +334,8 @@ export class AutonomousAgent extends DurableObject<Env> {
     const history = this.storage.buildGeminiHistory();
 
     // Create gemini executor function for tools
-    const geminiExecutor = async (toolPrompt: string, useTools: boolean): Promise<string> => {
-      return await this.gemini.executeWithTools(toolPrompt, history, useTools);
+    const geminiExecutor = async (toolPrompt: string, config: ExecutionConfig): Promise<string> => {
+      return await this.gemini.executeWithConfig(toolPrompt, history, config);
     };
 
     const params: ToolExecutionParams = {
@@ -311,8 +374,6 @@ export class AutonomousAgent extends DurableObject<Env> {
 
     try {
       const answer = await this.gemini.synthesize(originalQuery, stepResults, history);
-
-      // Save final response
       this.storage.saveMessage('model', [{ text: answer }], Date.now());
 
       if (ws) {
@@ -338,21 +399,87 @@ export class AutonomousAgent extends DurableObject<Env> {
   }
 
   /**
+   * Handle file upload via REST
+   */
+  private async handleFileUpload(req: Request): Promise<Response> {
+    try {
+      const body = await req.json<FileUploadRequest>();
+      const state = await this.storage.loadState();
+
+      const fileMetadata = await this.gemini.uploadFile(
+        body.data,
+        body.mimeType,
+        body.name
+      );
+
+      state.uploadedFiles.push(fileMetadata);
+      this.storage.saveFile(fileMetadata);
+      await this.storage.saveState(state);
+
+      return new Response(stringifyJSON({ 
+        success: true, 
+        file: fileMetadata 
+      }), {
+        headers: { 'Content-Type': 'application/json' }
+      });
+    } catch (error) {
+      return new Response(stringifyJSON({ 
+        error: 'File upload failed' 
+      }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+  }
+
+  /**
+   * List files
+   */
+  private listFiles(): Response {
+    const files = this.storage.getActiveFiles();
+    return new Response(stringifyJSON({ files }), {
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+
+  /**
+   * Delete file
+   */
+  private async deleteFileEndpoint(req: Request): Promise<Response> {
+    try {
+      const { fileUri } = await req.json<{ fileUri: string }>();
+      
+      await this.gemini.deleteFile(fileUri);
+      this.storage.deleteFile(fileUri);
+      
+      const state = await this.storage.loadState();
+      state.uploadedFiles = state.uploadedFiles.filter(f => f.fileUri !== fileUri);
+      await this.storage.saveState(state);
+
+      return new Response(stringifyJSON({ success: true }));
+    } catch (error) {
+      return new Response(stringifyJSON({ error: 'Failed to delete file' }), { status: 500 });
+    }
+  }
+
+  /**
    * REST API: Handle chat request
    */
   private async handleChat(req: Request): Promise<Response> {
     let message: string;
+    let files: FileUploadRequest[] | undefined;
+    
     try {
-      const body = await req.json<{ message: string }>();
+      const body = await req.json<{ message: string; files?: FileUploadRequest[] }>();
       message = sanitizeInput(body.message);
+      files = body.files;
       if (!message) throw new Error('Empty message');
     } catch {
       return new Response(stringifyJSON({ error: 'Invalid request' }), { status: 400 });
     }
 
-    // Queue for background processing
     this.ctx.waitUntil(
-      this.process(message, null).catch(err => {
+      this.process(message, files, null).catch(err => {
         console.error('Background process failed:', err);
       })
     );
@@ -367,7 +494,9 @@ export class AutonomousAgent extends DurableObject<Env> {
    */
   private getHistory(): Response {
     const messages = this.storage.getHistory();
-    return new Response(stringifyJSON({ history: messages }), {
+    const files = this.storage.getActiveFiles();
+    
+    return new Response(stringifyJSON({ history: messages, files }), {
       headers: { 'Content-Type': 'application/json' }
     });
   }
@@ -377,8 +506,20 @@ export class AutonomousAgent extends DurableObject<Env> {
    */
   private async clearHistory(): Promise<Response> {
     try {
+      const state = await this.storage.loadState();
+      
+      // Delete files from Gemini
+      for (const file of state.uploadedFiles) {
+        try {
+          await this.gemini.deleteFile(file.fileUri);
+        } catch (e) {
+          console.error('Failed to delete file:', e);
+        }
+      }
+      
       this.storage.clearHistory();
       this.cache.clear();
+      
       return new Response(stringifyJSON({ ok: true }), {
         headers: { 'Content-Type': 'application/json' }
       });
@@ -393,10 +534,9 @@ export class AutonomousAgent extends DurableObject<Env> {
   /**
    * REST API: Get current status
    */
-  private getStatus(): Response {
-    const state = this.ctx.blockConcurrencyWhile(async () => {
-      return await this.storage.loadState();
-    });
+  private async getStatus(): Promise<Response> {
+    const state = await this.storage.loadState();
+    const capabilities = this.toolRegistry.getAllCapabilities();
 
     return new Response(stringifyJSON({
       plan: state.currentPlan,
@@ -404,6 +544,8 @@ export class AutonomousAgent extends DurableObject<Env> {
       messageCount: this.storage.getMessageCount(),
       activeConnections: this.activeConnections.size,
       cacheSize: this.cache.size(),
+      uploadedFiles: this.storage.getFileCount(),
+      capabilities,
     }), {
       headers: { 'Content-Type': 'application/json' }
     });
@@ -421,7 +563,10 @@ export class AutonomousAgent extends DurableObject<Env> {
       this.cache.clear();
     }
 
+    // Clean expired files
+    this.storage.cleanExpiredFiles();
+
     // Schedule next cleanup
-    await this.ctx.storage.setAlarm(Date.now() + 60 * 60 * 1000); // 1 hour
+    await this.ctx.storage.setAlarm(Date.now() + 60 * 60 * 1000);
   }
 }

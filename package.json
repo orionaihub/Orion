@@ -1,41 +1,20 @@
 {
-  "name": "ubix-agent",
-  "version": "2.0.0",
-  "description": "Suna-like autonomous agent on Cloudflare Workers free-tier — real Python, POSIX workspace, zero external cost",
+  "name": "orion",
+  "version": "1.0.0",
+  "description": "Cloudflare Worker Autonomous Agent using Google Gemini 2.5",
   "type": "module",
-  "private": true,
   "scripts": {
-    "dev": "wrangler dev --local",
-    "start": "wrangler dev --local",
-    "deploy": "wrangler deploy",
-    "types": "wrangler types",
-    "check": "tsc --noEmit && wrangler deploy --dry-run",
-    "test": "vitest",
-    "format": "prettier --write ."
-  },
-  "keywords": [
-    "cloudflare",
-    "workers",
-    "gemini",
-    "agent",
-    "pyodide",
-    "wasm",
-    "free-tier"
-  ],
-  "author": "Ubix",
-  "license": "MIT",
-  "devDependencies": {
-    "@biomejs/biome": "^2.2.5",
-    "@cloudflare/vitest-pool-workers": "^0.9.12",
-    "@cloudflare/workers-types": "^4.20251008.0",
-    "@types/node": "^24.7.1",
-    "prettier": "^3.6.2",
-    "typescript": "^5.9.3",
-    "vitest": "3.2.4",
-    "wrangler": "^4.42.2"
+    "dev": "wrangler dev src/index.ts",
+    "build": "tsc",
+    "publish": "wrangler publish"
   },
   "dependencies": {
-    "@google/generative-ai": "^0.22.0",
-    "zod": "^3.25.76"
+    "@google/genai": "^1.0.0",
+    "@cloudflare/workers-types": "^4.2025.0",
+    "ai-sdk": "^1.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.3.0",
+    "wrangler": "^3.24.0"
   }
 }

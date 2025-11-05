@@ -1,5 +1,57 @@
 // src/utils/gemini.ts
-import { GoogleGenerativeAI, GoogleAIFileManager } from '@google/generative-ai';
+import { GoogleGenerativeAI, import { GoogleGenAI } from '@google/genai';
+import type { TaskComplexity, ExecutionPlan, FileMetadata } from '../types';
+import type { ExecutionConfig } from '../tools';
+
+export class GeminiClient {
+  private ai: ReturnType<typeof GoogleGenAI>;
+  private maxRetries = 3;
+  private baseBackoff = 1000;
+  private timeout = 60_000;
+
+  constructor(opts?: { apiKey?: string }) {
+    this.ai = new GoogleGenAI(opts || {});
+  }
+
+  private parse<T>(text: string): T | null {
+    try {
+      const cleaned = text?.trim()?.replace(/^```json\s*/, '').replace(/```$/, '');
+      return JSON.parse(cleaned) as T;
+    } catch {
+      return null;
+    }
+  }
+
+  private async withRetry<T>(fn: () => Promise<T>): Promise<T> {
+    let lastError: any = null;
+    for (let i = 0; i < this.maxRetries; i++) {
+      try {
+        return await fn();
+      } catch (err) {
+        lastError = err;
+        await new Promise((res) => setTimeout(res, this.baseBackoff * Math.pow(2, i)));
+      }
+    }
+    throw lastError;
+  }
+
+  private async withTimeout<T>(promise: Promise<T>, errorMessage = 'timed out', ms?: number): Promise<T> {
+    return Promise.race([
+      promise,
+      new Promise<T>((_, rej) => setTimeout(() => rej(new Error(errorMessage)), ms ?? this.timeout)),
+    ]) as Promise<T>;
+  }
+
+  async streamResponse(query: string, history: Array<{ role: string; parts: any[] }>, onChunk: (text: string) => void) {
+    const chat = this.ai.chats.create({ model: 'gemini-2.5-flash', history });
+    const res = await this.withTimeout(chat.sendMessage(query), 'Streaming response timed out');
+    const text = res?.text ?? '';
+    if (text) onChunk(text);
+    return text;
+  }
+}
+
+export default GeminiClient; } from '@google/generative-ai';
 import type { TaskComplexity, ExecutionPlan, FileMetadata } from '../types';
 import type { ExecutionConfig } from '../tools';
 

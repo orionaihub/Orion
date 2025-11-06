@@ -35,57 +35,32 @@ export interface Message {
   timestamp: number;
 }
 
-export interface TaskComplexity {
-  type: 'simple' | 'complex';
-  requiredTools: string[];
-  estimatedSteps: number;
-  reasoning: string;
-  requiresFiles: boolean;
-  requiresCode: boolean;
-  requiresVision: boolean;
+// Autonomous Agent Modes
+export enum AutonomousMode {
+  CHAT = "chat",           // Single-step native tools
+  EXECUTION = "execution"  // Multi-step with external tools via function calling
 }
 
-export interface PlanStep {
-  id: string;
-  description: string;
-  action: string;
-  status: 'pending' | 'executing' | 'completed' | 'failed';
-  result?: string;
-  error?: string;
-  startedAt?: number;
-  completedAt?: number;
-  durationMs?: number;
-  section?: string;
-  dependencies?: string[];
-  metadata?: Record<string, any>;
-}
-
-export interface PlanSection {
-  name: string;
-  description: string;
-  steps: PlanStep[];
-  status: 'pending' | 'executing' | 'completed' | 'failed';
-}
-
-export interface ExecutionPlan {
-  steps: PlanStep[];
-  sections?: PlanSection[];
-  currentStepIndex: number;
-  status: 'planning' | 'executing' | 'completed' | 'failed';
-  createdAt: number;
-  startedAt?: number;
-  completedAt?: number;
-  totalDurationMs?: number;
-  metadata?: Record<string, any>;
+// Autonomous Agent Phases
+export enum AgentPhase {
+  ASSESSMENT = "assessment",     // Initial analysis and clarification
+  PLANNING = "planning",         // Plan generation and user confirmation
+  EXECUTION = "execution",       // Adaptive execution with tool calling
+  COMPLETION = "completion",     // Final response delivery
+  CLARIFICATION = "clarification" // User engagement for better understanding
 }
 
 export interface AgentState {
   sessionId: string;
   conversationHistory: Message[];
   context: AgentContext;
-  currentPlan?: ExecutionPlan;
   lastActivityAt: number;
   metadata?: Record<string, any>;
+  // New autonomous behavior fields
+  currentMode: AutonomousMode;
+  currentPhase: AgentPhase;
+  clarificationContext?: string;
+  executionContext?: { currentTask: string; progress: string[] };
 }
 
 export interface WebSocketMessage {
@@ -93,21 +68,21 @@ export interface WebSocketMessage {
     | 'user_message'
     | 'status'
     | 'chunk'
-    | 'step_chunk'
     | 'final_chunk'
-    | 'plan'
-    | 'step_start'
-    | 'step_complete'
-    | 'step_error'
+    | 'phase_change'
+    | 'clarification_request'
+    | 'progress_update'
+    | 'tool_call'
     | 'final_response'
     | 'done'
     | 'error';
   content?: string;
   message?: string;
   error?: string;
-  plan?: ExecutionPlan;
-  step?: number;
-  description?: string;
+  phase?: AgentPhase;
+  clarificationQuestion?: string;
+  progress?: { currentTask: string; completed: string[] };
+  toolCall?: { tool: string; params: Record<string, any>; result?: any };
   result?: string;
 }
 
@@ -132,9 +107,11 @@ export interface HistoryResponse {
 }
 
 export interface StatusResponse {
-  plan?: ExecutionPlan;
+  currentMode?: AutonomousMode;
+  currentPhase?: AgentPhase;
   lastActivity?: number;
   sessionId?: string;
+  executionContext?: { currentTask: string; progress: string[] };
   metrics?: {
     requestCount: number;
     errorCount: number;

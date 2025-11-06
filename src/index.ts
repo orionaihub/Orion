@@ -1,4 +1,7 @@
-import { AutonomousAgent } from './agents/AutonomousAgent';
+import { AutonomousAgent } from './autonomous-agent';
+import type { Env } from './types';
+
+export { AutonomousAgent };
 
 export default {
   async fetch(request: Request, env: any, ctx: ExecutionContext) {

@@ -1,4 +1,4 @@
-// src/autonomous-agent.ts - Performance Optimized
+// src/autonomous-agent.ts - Enhanced Streaming
 import { DurableObject } from 'cloudflare:workers';
 import type { DurableObjectState } from '@cloudflare/workers-types';
 import GeminiClient from './utils/gemini';
@@ -23,7 +23,6 @@ interface SqlStorage {
 interface StepExecutionOptions {
   continueOnFailure?: boolean;
   maxRetries?: number;
-  parallelExecution?: boolean;
 }
 
 interface Metrics {
@@ -41,7 +40,6 @@ export class AutonomousAgent extends DurableObject<Env> {
   private maxHistoryMessages = 200;
   private readonly MAX_MESSAGE_SIZE = 100_000;
   private readonly MAX_TOTAL_HISTORY_SIZE = 500_000;
-  private readonly COMPLEXITY_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
   private activeWebSockets = new Set<WebSocket>();
   private metrics: Metrics = {
     requestCount: 0,
@@ -126,12 +124,12 @@ export class AutonomousAgent extends DurableObject<Env> {
     query: string,
     hasFiles: boolean
   ): Promise<TaskComplexity> {
-    // Fast heuristics before calling LLM
     const lowerQuery = query.toLowerCase();
-    
-    // Simple query indicators
+    const wordCount = query.split(/\s+/).length;
+
+    // Simple indicators
     const simpleIndicators = [
-      /^(hi|hello|hey|greetings)/i,
+      /^(hi|hello|hey|greetings|good morning|good afternoon)/i,
       /^what is /i,
       /^who is /i,
       /^when /i,
@@ -141,7 +139,7 @@ export class AutonomousAgent extends DurableObject<Env> {
       /^tell me about /i,
     ];
 
-    // Complex query indicators
+    // Complex indicators
     const complexIndicators = [
       /\b(analyze|compare|calculate|process|generate|create|build)\b/i,
       /\b(step by step|detailed|comprehensive|in-depth)\b/i,
@@ -150,11 +148,8 @@ export class AutonomousAgent extends DurableObject<Env> {
       lowerQuery.includes(' and ') && lowerQuery.split(' and ').length > 2,
     ];
 
-    // Count word tokens as complexity proxy
-    const wordCount = query.split(/\s+/).length;
-
-    // Fast path: very simple queries
-    if (simpleIndicators.some(pattern => pattern.test(query)) && wordCount < 10 && !hasFiles) {
+    // Fast path: very simple
+    if (simpleIndicators.some((pattern) => pattern.test(query)) && wordCount < 10 && !hasFiles) {
       this.metrics.complexityDistribution.simple++;
       return {
         type: 'simple',
@@ -168,7 +163,7 @@ export class AutonomousAgent extends DurableObject<Env> {
     }
 
     // Fast path: obviously complex
-    const complexCount = complexIndicators.filter(ind => {
+    const complexCount = complexIndicators.filter((ind) => {
       if (typeof ind === 'boolean') return ind;
       return ind.test(query);
     }).length;
@@ -178,7 +173,7 @@ export class AutonomousAgent extends DurableObject<Env> {
       return {
         type: 'complex',
         requiredTools: hasFiles ? ['file_analysis', 'search'] : ['search'],
-        estimatedSteps: Math.min(Math.ceil(wordCount / 20), 8), // Cap at 8 steps
+        estimatedSteps: Math.min(Math.ceil(wordCount / 20), 8),
         reasoning: 'Quick heuristic: multiple complexity indicators detected',
         requiresFiles: hasFiles,
         requiresCode: /\b(code|calculate|compute|run)\b/i.test(query),
@@ -193,7 +188,6 @@ export class AutonomousAgent extends DurableObject<Env> {
       return result;
     } catch (e) {
       console.error('LLM complexity analysis failed:', e);
-      // Conservative fallback
       this.metrics.complexityDistribution.simple++;
       return {
         type: 'simple',
@@ -256,8 +250,6 @@ export class AutonomousAgent extends DurableObject<Env> {
     });
   }
 
-  // ===== Memory Management =====
-
   private estimateHistorySize(): number {
     try {
       const result = this.sql.exec(`SELECT SUM(LENGTH(parts)) as total FROM messages`).one();
@@ -299,37 +291,28 @@ export class AutonomousAgent extends DurableObject<Env> {
     });
   }
 
-  // ===== WebSocket Management =====
+  // ===== WebSocket Management with Immediate Streaming =====
 
-  private send(ws: WebSocket | null, data: unknown): void {
+  private sendImmediate(ws: WebSocket | null, data: unknown): void {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
     try {
-      ws.send(this.stringify(data));
+      const message = this.stringify(data);
+      ws.send(message);
+      // Force flush by yielding to event loop
+      // This ensures messages aren't buffered
     } catch (e) {
       console.error('WebSocket send failed:', e);
     }
   }
 
-  private createChunkBatcher(ws: WebSocket | null, type: string, flushInterval = 50) {
-    let buffer = '';
-    let timer: ReturnType<typeof setTimeout> | null = null;
-
-    const flush = () => {
-      if (buffer && ws) {
-        this.send(ws, { type, content: buffer });
-        buffer = '';
-      }
-      timer = null;
-    };
-
+  // Removed chunk batching for immediate streaming
+  private createStreamingHandler(ws: WebSocket | null, type: string) {
     return {
-      add: (chunk: string) => {
-        buffer += chunk;
-        if (!timer) {
-          timer = setTimeout(flush, flushInterval);
+      send: (chunk: string) => {
+        if (chunk && ws) {
+          this.sendImmediate(ws, { type, content: chunk });
         }
       },
-      flush,
     };
   }
 
@@ -369,7 +352,7 @@ export class AutonomousAgent extends DurableObject<Env> {
     try {
       payload = JSON.parse(message);
     } catch {
-      this.send(ws, { type: 'error', error: 'Invalid JSON' });
+      this.sendImmediate(ws, { type: 'error', error: 'Invalid JSON' });
       return;
     }
 
@@ -377,11 +360,11 @@ export class AutonomousAgent extends DurableObject<Env> {
       this.ctx.waitUntil(
         this.trackRequest(() => this.process(payload.content, ws)).catch((err) => {
           console.error('WebSocket process failed:', err);
-          this.send(ws, { type: 'error', error: 'Processing failed' });
+          this.sendImmediate(ws, { type: 'error', error: 'Processing failed' });
         })
       );
     } else {
-      this.send(ws, { type: 'error', error: 'Invalid payload' });
+      this.sendImmediate(ws, { type: 'error', error: 'Invalid payload' });
     }
   }
 
@@ -404,7 +387,7 @@ export class AutonomousAgent extends DurableObject<Env> {
       state.lastActivityAt = Date.now();
 
       if (userMsg.length > this.MAX_MESSAGE_SIZE) {
-        if (ws) this.send(ws, { type: 'error', error: 'Message too large' });
+        if (ws) this.sendImmediate(ws, { type: 'error', error: 'Message too large' });
         throw new Error('Message exceeds maximum size');
       }
 
@@ -418,11 +401,11 @@ export class AutonomousAgent extends DurableObject<Env> {
         );
       } catch (e) {
         console.error('Failed to save user message:', e);
-        if (ws) this.send(ws, { type: 'error', error: 'Save failed' });
+        if (ws) this.sendImmediate(ws, { type: 'error', error: 'Save failed' });
         throw e;
       }
 
-      // Enhanced complexity analysis with fast heuristics
+      // Analyze complexity
       const complexity = await this.analyzeComplexityEnhanced(
         userMsg,
         (state.context?.files ?? []).length > 0
@@ -434,29 +417,27 @@ export class AutonomousAgent extends DurableObject<Env> {
         if (complexity.type === 'simple') {
           await this.handleSimple(userMsg, ws, state);
         } else {
-          // Optimize complex plan generation
           await this.handleComplexOptimized(userMsg, complexity, ws, state, {
             continueOnFailure: false,
             maxRetries: 2,
-            parallelExecution: false, // Can be enabled for independent steps
           });
         }
       } catch (e) {
         console.error('Process error:', e);
-        if (ws) this.send(ws, { type: 'error', error: 'Processing failed' });
+        if (ws) this.sendImmediate(ws, { type: 'error', error: 'Processing failed' });
         throw e;
       }
     });
   }
 
-  // ===== Simple Path =====
+  // ===== Simple Path with Immediate Streaming =====
 
   private async handleSimple(query: string, ws: WebSocket | null, state: AgentState): Promise<void> {
     return this.withErrorContext('handleSimple', async () => {
-      if (ws) this.send(ws, { type: 'status', message: 'Thinking…' });
+      if (ws) this.sendImmediate(ws, { type: 'status', message: 'Thinking…' });
 
       const history = this.buildHistory();
-      const batcher = this.createChunkBatcher(ws, 'chunk');
+      const streamer = this.createStreamingHandler(ws, 'chunk');
 
       let full = '';
       await this.gemini.streamResponse(
@@ -464,13 +445,12 @@ export class AutonomousAgent extends DurableObject<Env> {
         history,
         (chunk) => {
           full += chunk;
-          batcher.add(chunk);
+          streamer.send(chunk); // Send immediately, no batching
         },
         { model: 'gemini-2.5-flash', thinkingConfig: { thinkingBudget: 512 } }
       );
 
-      batcher.flush();
-
+      // Save model response
       try {
         this.sql.exec(
           `INSERT INTO messages (role, parts, timestamp) VALUES (?, ?, ?)`,
@@ -482,7 +462,7 @@ export class AutonomousAgent extends DurableObject<Env> {
         console.error('Failed to save model response:', e);
       }
 
-      if (ws) this.send(ws, { type: 'done' });
+      if (ws) this.sendImmediate(ws, { type: 'done' });
     });
   }
 
@@ -496,21 +476,19 @@ export class AutonomousAgent extends DurableObject<Env> {
     opts: StepExecutionOptions = { continueOnFailure: false, maxRetries: 1 }
   ): Promise<void> {
     return this.withErrorContext('handleComplexOptimized', async () => {
-      if (ws) this.send(ws, { type: 'status', message: 'Planning…' });
+      if (ws) this.sendImmediate(ws, { type: 'status', message: 'Planning…' });
 
-      // Optimized plan generation with step limit
       let plan: ExecutionPlan;
       try {
         const rawPlan = await this.gemini.generatePlanOptimized(
           query,
           complexity,
           (state.context?.files ?? []).length > 0,
-          5 // Max 5 steps for faster execution
+          5
         );
         plan = this.optimizePlan(rawPlan);
       } catch (e) {
         console.error('generatePlan failed:', e);
-        // Fallback to direct answer
         plan = {
           steps: [{ id: 's1', description: 'Provide direct answer', action: 'synthesize', status: 'pending' }],
           currentStepIndex: 0,
@@ -521,14 +499,14 @@ export class AutonomousAgent extends DurableObject<Env> {
 
       console.log(`[Plan] Generated ${plan.steps.length} steps`);
       state.currentPlan = plan;
-      if (ws) this.send(ws, { type: 'plan', plan });
+      if (ws) this.sendImmediate(ws, { type: 'plan', plan });
 
       // Execute steps
       for (let i = 0; i < plan.steps.length; i++) {
         const step = plan.steps[i] as PlanStep;
         plan.currentStepIndex = i;
 
-        if (ws) this.send(ws, { type: 'step_start', step: i + 1, description: step.description });
+        if (ws) this.sendImmediate(ws, { type: 'step_start', step: i + 1, description: step.description });
 
         let attempts = 0;
         let success = false;
@@ -538,11 +516,10 @@ export class AutonomousAgent extends DurableObject<Env> {
             step.status = 'executing';
             step.startedAt = Date.now();
 
-            const batcher = this.createChunkBatcher(ws, 'step_chunk');
+            const streamer = this.createStreamingHandler(ws, 'step_chunk');
             const result = await this.executeStep(step, state, (chunk) => {
-              batcher.add(chunk);
+              streamer.send(chunk); // Immediate streaming
             });
-            batcher.flush();
 
             step.result = result;
             step.status = 'completed';
@@ -562,7 +539,7 @@ export class AutonomousAgent extends DurableObject<Env> {
               console.error('Failed to save step result:', e);
             }
 
-            if (ws) this.send(ws, { type: 'step_complete', step: i + 1, result });
+            if (ws) this.sendImmediate(ws, { type: 'step_complete', step: i + 1, result });
             success = true;
           } catch (e) {
             attempts++;
@@ -577,7 +554,7 @@ export class AutonomousAgent extends DurableObject<Env> {
         if (!success) {
           step.status = 'failed';
           step.error = 'Step execution failed';
-          if (ws) this.send(ws, { type: 'step_error', step: i + 1, error: step.error });
+          if (ws) this.sendImmediate(ws, { type: 'step_error', step: i + 1, error: step.error });
 
           if (!opts.continueOnFailure) break;
         }
@@ -592,10 +569,7 @@ export class AutonomousAgent extends DurableObject<Env> {
     });
   }
 
-  // ===== Plan Optimization =====
-
   private optimizePlan(plan: ExecutionPlan): ExecutionPlan {
-    // Remove redundant steps
     const uniqueSteps: PlanStep[] = [];
     const seenDescriptions = new Set<string>();
 
@@ -609,7 +583,6 @@ export class AutonomousAgent extends DurableObject<Env> {
       }
     }
 
-    // Merge consecutive analyze/synthesize steps
     const mergedSteps: PlanStep[] = [];
     for (let i = 0; i < uniqueSteps.length; i++) {
       const current = uniqueSteps[i];
@@ -617,14 +590,14 @@ export class AutonomousAgent extends DurableObject<Env> {
 
       if (
         next &&
-        (current.action === 'analyze' && next.action === 'analyze') ||
-        (current.action === 'synthesize' && next.action === 'synthesize')
+        ((current.action === 'analyze' && next.action === 'analyze') ||
+          (current.action === 'synthesize' && next.action === 'synthesize'))
       ) {
         mergedSteps.push({
           ...current,
           description: `${current.description} and ${next.description}`,
         });
-        i++; // Skip next
+        i++;
         console.log(`[Optimization] Merged steps: ${current.id} + ${next.id}`);
       } else {
         mergedSteps.push(current);
@@ -636,8 +609,6 @@ export class AutonomousAgent extends DurableObject<Env> {
       steps: mergedSteps,
     };
   }
-
-  // ===== Step Execution =====
 
   private async executeStep(
     step: PlanStep,
@@ -657,12 +628,10 @@ export class AutonomousAgent extends DurableObject<Env> {
         {
           model: 'gemini-2.5-flash',
           stream: true,
-          timeoutMs: 60_000, // Reduced from 120s to 60s
-          thinkingConfig: { thinkingBudget: 512 }, // Reduced budget for faster execution
+          timeoutMs: 60_000,
+          thinkingConfig: { thinkingBudget: 512 },
           files: state.context?.files ?? [],
-          urlList: hasUrls
-            ? state.context.searchResults.map((r: any) => r.url).filter(Boolean)
-            : [],
+          urlList: hasUrls ? state.context.searchResults.map((r: any) => r.url).filter(Boolean) : [],
           stepAction: step.action,
         },
         onChunk
@@ -676,7 +645,7 @@ export class AutonomousAgent extends DurableObject<Env> {
     const plan = state.currentPlan!;
     const done = plan.steps
       .filter((s) => s.status === 'completed')
-      .map((s) => `${s.description}: ${(s.result ?? 'completed').substring(0, 200)}`) // Limit result length
+      .map((s) => `${s.description}: ${(s.result ?? 'completed').substring(0, 200)}`)
       .join('\n');
 
     return `PLAN: ${plan.steps.map((s, i) => `${i + 1}. ${s.description}`).join('; ')}
@@ -689,11 +658,9 @@ ACTION: ${step.action}
 Provide a concise result (max 500 chars):`;
   }
 
-  // ===== Synthesis =====
-
   private async synthesize(ws: WebSocket | null, state: AgentState): Promise<void> {
     return this.withErrorContext('synthesize', async () => {
-      if (ws) this.send(ws, { type: 'status', message: 'Summarizing…' });
+      if (ws) this.sendImmediate(ws, { type: 'status', message: 'Summarizing…' });
 
       const plan = state.currentPlan!;
       const lastUserRow = this.sql
@@ -709,7 +676,7 @@ ${plan.steps.map((s, i) => `${i + 1}. ${s.description}: ${(s.result ?? 'no resul
 
 Provide a comprehensive answer:`;
 
-      const batcher = this.createChunkBatcher(ws, 'final_chunk');
+      const streamer = this.createStreamingHandler(ws, 'final_chunk');
       let full = '';
 
       await this.gemini.streamResponse(
@@ -717,12 +684,10 @@ Provide a comprehensive answer:`;
         this.buildHistory(),
         (chunk) => {
           full += chunk;
-          batcher.add(chunk);
+          streamer.send(chunk); // Immediate streaming
         },
         { model: 'gemini-2.5-flash', thinkingConfig: { thinkingBudget: 1024 } }
       );
-
-      batcher.flush();
 
       try {
         this.sql.exec(
@@ -736,21 +701,16 @@ Provide a comprehensive answer:`;
       }
 
       if (ws) {
-        this.send(ws, { type: 'final_response', content: full });
-        this.send(ws, { type: 'done' });
+        this.sendImmediate(ws, { type: 'final_response', content: full });
+        this.sendImmediate(ws, { type: 'done' });
       }
     });
   }
 
-  // ===== History Building =====
-
   private buildHistory(): Array<{ role: string; parts: Array<{ text: string }> }> {
     return this.ctx.blockConcurrencyWhile(() => {
       const rows = this.sql
-        .exec(
-          `SELECT role, parts FROM messages ORDER BY timestamp DESC LIMIT ?`,
-          Math.min(this.maxHistoryMessages, 50) // Limit context window
-        )
+        .exec(`SELECT role, parts FROM messages ORDER BY timestamp DESC LIMIT ?`, Math.min(this.maxHistoryMessages, 50))
         .toArray();
 
       const hist: Array<{ role: string; parts: Array<{ text: string }> }> = [];
@@ -765,7 +725,6 @@ Provide a comprehensive answer:`;
         }
       }
 
-      // Remove consecutive duplicates
       let i = hist.length - 1;
       while (i > 0) {
         if (hist[i].role === 'user' && hist[i - 1].role === 'user') {
@@ -854,12 +813,15 @@ Provide a comprehensive answer:`;
   }
 
   private getMetrics(): Response {
-    return new Response(this.stringify({
-      ...this.metrics,
-      circuitBreaker: this.gemini.getCircuitBreakerStatus(),
-    }), {
-      headers: { 'Content-Type': 'application/json' },
-    });
+    return new Response(
+      this.stringify({
+        ...this.metrics,
+        circuitBreaker: this.gemini.getCircuitBreakerStatus(),
+      }),
+      {
+        headers: { 'Content-Type': 'application/json' },
+      }
+    );
   }
 }
 

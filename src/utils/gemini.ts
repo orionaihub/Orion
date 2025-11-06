@@ -1,6 +1,6 @@
-// src/utils/gemini.ts - Performance Optimized
+// src/utils/gemini.ts - Unified Autonomous Agent
 import { GoogleGenAI } from '@google/genai';
-import type { TaskComplexity, ExecutionPlan, FileMetadata } from '../types';
+import type { FileMetadata, AutonomousMode, AgentPhase } from '../types';
 
 export interface ExecutionConfig {
   model?: string;

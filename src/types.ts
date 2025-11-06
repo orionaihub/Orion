@@ -68,21 +68,21 @@ export interface WebSocketMessage {
     | 'user_message'
     | 'status'
     | 'chunk'
-    | 'step_chunk'
     | 'final_chunk'
-    | 'plan'
-    | 'step_start'
-    | 'step_complete'
-    | 'step_error'
+    | 'phase_change'
+    | 'clarification_request'
+    | 'progress_update'
+    | 'tool_call'
     | 'final_response'
     | 'done'
     | 'error';
   content?: string;
   message?: string;
   error?: string;
-  plan?: ExecutionPlan;
-  step?: number;
-  description?: string;
+  phase?: AgentPhase;
+  clarificationQuestion?: string;
+  progress?: { currentTask: string; completed: string[] };
+  toolCall?: { tool: string; params: Record<string, any>; result?: any };
   result?: string;
 }
 

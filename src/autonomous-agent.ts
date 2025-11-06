@@ -1,4 +1,4 @@
-// src/autonomous-agent.ts
+// src/autonomous-agent.ts - Performance Optimized
 import { DurableObject } from 'cloudflare:workers';
 import type { DurableObjectState } from '@cloudflare/workers-types';
 import GeminiClient from './utils/gemini';
@@ -12,23 +12,18 @@ import type {
   FileMetadata,
 } from './types';
 
-// SQLite storage interface
 interface SqlStorage {
   exec(query: string, ...params: any[]): {
     one(): any;
     toArray(): any[];
     [Symbol.iterator](): Iterator<any>;
   };
-  prepare?(query: string): {
-    run(...params: any[]): void;
-    one(...params: any[]): any;
-    all(...params: any[]): any[];
-  };
 }
 
 interface StepExecutionOptions {
   continueOnFailure?: boolean;
   maxRetries?: number;
+  parallelExecution?: boolean;
 }
 
 interface Metrics {
@@ -37,14 +32,16 @@ interface Metrics {
   avgResponseTime: number;
   activeConnections: number;
   totalResponseTime: number;
+  complexityDistribution: { simple: number; complex: number };
 }
 
 export class AutonomousAgent extends DurableObject<Env> {
   private sql: SqlStorage;
   private gemini: GeminiClient;
   private maxHistoryMessages = 200;
-  private readonly MAX_MESSAGE_SIZE = 100_000; // chars
-  private readonly MAX_TOTAL_HISTORY_SIZE = 500_000; // chars
+  private readonly MAX_MESSAGE_SIZE = 100_000;
+  private readonly MAX_TOTAL_HISTORY_SIZE = 500_000;
+  private readonly COMPLEXITY_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
   private activeWebSockets = new Set<WebSocket>();
   private metrics: Metrics = {
     requestCount: 0,
@@ -52,6 +49,7 @@ export class AutonomousAgent extends DurableObject<Env> {
     avgResponseTime: 0,
     activeConnections: 0,
     totalResponseTime: 0,
+    complexityDistribution: { simple: 0, complex: 0 },
   };
 
   constructor(state: DurableObjectState, env: Env) {
@@ -59,7 +57,6 @@ export class AutonomousAgent extends DurableObject<Env> {
     this.sql = state.storage.sql as SqlStorage;
     this.gemini = new GeminiClient({ apiKey: env.GEMINI_API_KEY });
 
-    // Initialize SQLite tables if not present
     try {
       this.sql.exec(`
         CREATE TABLE IF NOT EXISTS messages (
@@ -123,7 +120,94 @@ export class AutonomousAgent extends DurableObject<Env> {
       });
   }
 
-  // ===== State Management with Transaction Support =====
+  // ===== Enhanced Complexity Analysis =====
+
+  private async analyzeComplexityEnhanced(
+    query: string,
+    hasFiles: boolean
+  ): Promise<TaskComplexity> {
+    // Fast heuristics before calling LLM
+    const lowerQuery = query.toLowerCase();
+    
+    // Simple query indicators
+    const simpleIndicators = [
+      /^(hi|hello|hey|greetings)/i,
+      /^what is /i,
+      /^who is /i,
+      /^when /i,
+      /^where /i,
+      /^define /i,
+      /^explain /i,
+      /^tell me about /i,
+    ];
+
+    // Complex query indicators
+    const complexIndicators = [
+      /\b(analyze|compare|calculate|process|generate|create|build)\b/i,
+      /\b(step by step|detailed|comprehensive|in-depth)\b/i,
+      /\b(multiple|several|various)\b/i,
+      hasFiles,
+      lowerQuery.includes(' and ') && lowerQuery.split(' and ').length > 2,
+    ];
+
+    // Count word tokens as complexity proxy
+    const wordCount = query.split(/\s+/).length;
+
+    // Fast path: very simple queries
+    if (simpleIndicators.some(pattern => pattern.test(query)) && wordCount < 10 && !hasFiles) {
+      this.metrics.complexityDistribution.simple++;
+      return {
+        type: 'simple',
+        requiredTools: [],
+        estimatedSteps: 1,
+        reasoning: 'Quick heuristic: simple greeting or basic question',
+        requiresFiles: false,
+        requiresCode: false,
+        requiresVision: false,
+      };
+    }
+
+    // Fast path: obviously complex
+    const complexCount = complexIndicators.filter(ind => {
+      if (typeof ind === 'boolean') return ind;
+      return ind.test(query);
+    }).length;
+
+    if (complexCount >= 3 || wordCount > 50) {
+      this.metrics.complexityDistribution.complex++;
+      return {
+        type: 'complex',
+        requiredTools: hasFiles ? ['file_analysis', 'search'] : ['search'],
+        estimatedSteps: Math.min(Math.ceil(wordCount / 20), 8), // Cap at 8 steps
+        reasoning: 'Quick heuristic: multiple complexity indicators detected',
+        requiresFiles: hasFiles,
+        requiresCode: /\b(code|calculate|compute|run)\b/i.test(query),
+        requiresVision: /\b(image|picture|photo|visual)\b/i.test(query),
+      };
+    }
+
+    // Use LLM for ambiguous cases
+    try {
+      const result = await this.gemini.analyzeComplexity(query, hasFiles);
+      this.metrics.complexityDistribution[result.type]++;
+      return result;
+    } catch (e) {
+      console.error('LLM complexity analysis failed:', e);
+      // Conservative fallback
+      this.metrics.complexityDistribution.simple++;
+      return {
+        type: 'simple',
+        requiredTools: [],
+        estimatedSteps: 1,
+        reasoning: 'fallback due to analysis error',
+        requiresFiles: hasFiles,
+        requiresCode: false,
+        requiresVision: false,
+      };
+    }
+  }
+
+  // ===== State Management =====
 
   private async loadState(): Promise<AgentState> {
     let state: AgentState | null = null;
@@ -146,9 +230,7 @@ export class AutonomousAgent extends DurableObject<Env> {
       } as AgentState;
     }
 
-    // Check memory pressure
     await this.checkMemoryPressure();
-
     return state;
   }
 
@@ -321,7 +403,6 @@ export class AutonomousAgent extends DurableObject<Env> {
     return this.withStateTransaction(async (state) => {
       state.lastActivityAt = Date.now();
 
-      // Validate message size
       if (userMsg.length > this.MAX_MESSAGE_SIZE) {
         if (ws) this.send(ws, { type: 'error', error: 'Message too large' });
         throw new Error('Message exceeds maximum size');
@@ -341,34 +422,23 @@ export class AutonomousAgent extends DurableObject<Env> {
         throw e;
       }
 
-      // Analyze complexity
-      let complexity: TaskComplexity;
-      try {
-        complexity = await this.gemini.analyzeComplexity(
-          userMsg,
-          (state.context?.files ?? []).length > 0
-        );
-      } catch (e) {
-        console.error('Complexity analysis failed:', e);
-        complexity = {
-          type: 'simple',
-          requiredTools: [],
-          estimatedSteps: 1,
-          reasoning: 'fallback due to analysis error',
-          requiresFiles: false,
-          requiresCode: false,
-          requiresVision: false,
-        };
-      }
+      // Enhanced complexity analysis with fast heuristics
+      const complexity = await this.analyzeComplexityEnhanced(
+        userMsg,
+        (state.context?.files ?? []).length > 0
+      );
 
-      // Route based on complexity
+      console.log(`[Complexity] ${complexity.type} - ${complexity.reasoning}`);
+
       try {
         if (complexity.type === 'simple') {
           await this.handleSimple(userMsg, ws, state);
         } else {
-          await this.handleComplex(userMsg, complexity, ws, state, {
+          // Optimize complex plan generation
+          await this.handleComplexOptimized(userMsg, complexity, ws, state, {
             continueOnFailure: false,
             maxRetries: 2,
+            parallelExecution: false, // Can be enabled for independent steps
           });
         }
       } catch (e) {
@@ -401,7 +471,6 @@ export class AutonomousAgent extends DurableObject<Env> {
 
       batcher.flush();
 
-      // Save model response
       try {
         this.sql.exec(
           `INSERT INTO messages (role, parts, timestamp) VALUES (?, ?, ?)`,
@@ -417,40 +486,44 @@ export class AutonomousAgent extends DurableObject<Env> {
     });
   }
 
-  // ===== Complex Path =====
+  // ===== Optimized Complex Path =====
 
-  private async handleComplex(
+  private async handleComplexOptimized(
     query: string,
     complexity: TaskComplexity,
     ws: WebSocket | null,
     state: AgentState,
     opts: StepExecutionOptions = { continueOnFailure: false, maxRetries: 1 }
   ): Promise<void> {
-    return this.withErrorContext('handleComplex', async () => {
+    return this.withErrorContext('handleComplexOptimized', async () => {
       if (ws) this.send(ws, { type: 'status', message: 'Planning…' });
 
-      // Generate plan
+      // Optimized plan generation with step limit
       let plan: ExecutionPlan;
       try {
-        plan = await this.gemini.generatePlan(
+        const rawPlan = await this.gemini.generatePlanOptimized(
           query,
           complexity,
-          (state.context?.files ?? []).length > 0
+          (state.context?.files ?? []).length > 0,
+          5 // Max 5 steps for faster execution
         );
+        plan = this.optimizePlan(rawPlan);
       } catch (e) {
         console.error('generatePlan failed:', e);
+        // Fallback to direct answer
         plan = {
-          steps: [{ id: 's1', description: 'Answer directly', action: 'synthesize', status: 'pending' }],
+          steps: [{ id: 's1', description: 'Provide direct answer', action: 'synthesize', status: 'pending' }],
           currentStepIndex: 0,
           status: 'executing',
           createdAt: Date.now(),
         } as ExecutionPlan;
       }
 
+      console.log(`[Plan] Generated ${plan.steps.length} steps`);
       state.currentPlan = plan;
       if (ws) this.send(ws, { type: 'plan', plan });
 
-      // Execute steps with retry logic
+      // Execute steps
       for (let i = 0; i < plan.steps.length; i++) {
         const step = plan.steps[i] as PlanStep;
         plan.currentStepIndex = i;
@@ -458,7 +531,6 @@ export class AutonomousAgent extends DurableObject<Env> {
         if (ws) this.send(ws, { type: 'step_start', step: i + 1, description: step.description });
 
         let attempts = 0;
-        let lastError: Error | null = null;
         let success = false;
 
         while (attempts < opts.maxRetries && !success) {
@@ -477,7 +549,8 @@ export class AutonomousAgent extends DurableObject<Env> {
             step.completedAt = Date.now();
             step.durationMs = (step.completedAt ?? Date.now()) - (step.startedAt ?? Date.now());
 
-            // Save step result
+            console.log(`[Step ${i + 1}] Completed in ${step.durationMs}ms`);
+
             try {
               this.sql.exec(
                 `INSERT INTO messages (role, parts, timestamp) VALUES (?, ?, ?)`,
@@ -492,35 +565,76 @@ export class AutonomousAgent extends DurableObject<Env> {
             if (ws) this.send(ws, { type: 'step_complete', step: i + 1, result });
             success = true;
           } catch (e) {
-            lastError = e as Error;
             attempts++;
             console.error(`Step ${i + 1} attempt ${attempts} failed:`, e);
 
             if (attempts < opts.maxRetries) {
-              const backoffMs = 1000 * attempts;
-              await new Promise((r) => setTimeout(r, backoffMs));
+              await new Promise((r) => setTimeout(r, 1000 * attempts));
             }
           }
         }
 
-        if (!success && lastError) {
+        if (!success) {
           step.status = 'failed';
-          step.error = lastError.message;
+          step.error = 'Step execution failed';
           if (ws) this.send(ws, { type: 'step_error', step: i + 1, error: step.error });
 
-          if (!opts.continueOnFailure) {
-            break;
-          }
+          if (!opts.continueOnFailure) break;
         }
       }
 
-      // Synthesize final answer
+      // Synthesize
       await this.synthesize(ws, state);
 
       plan.status = 'completed';
       plan.completedAt = Date.now();
       state.currentPlan = plan;
     });
+  }
+
+  // ===== Plan Optimization =====
+
+  private optimizePlan(plan: ExecutionPlan): ExecutionPlan {
+    // Remove redundant steps
+    const uniqueSteps: PlanStep[] = [];
+    const seenDescriptions = new Set<string>();
+
+    for (const step of plan.steps) {
+      const normalized = step.description.toLowerCase().trim();
+      if (!seenDescriptions.has(normalized)) {
+        uniqueSteps.push(step);
+        seenDescriptions.add(normalized);
+      } else {
+        console.log(`[Optimization] Removed duplicate step: ${step.description}`);
+      }
+    }
+
+    // Merge consecutive analyze/synthesize steps
+    const mergedSteps: PlanStep[] = [];
+    for (let i = 0; i < uniqueSteps.length; i++) {
+      const current = uniqueSteps[i];
+      const next = uniqueSteps[i + 1];
+
+      if (
+        next &&
+        (current.action === 'analyze' && next.action === 'analyze') ||
+        (current.action === 'synthesize' && next.action === 'synthesize')
+      ) {
+        mergedSteps.push({
+          ...current,
+          description: `${current.description} and ${next.description}`,
+        });
+        i++; // Skip next
+        console.log(`[Optimization] Merged steps: ${current.id} + ${next.id}`);
+      } else {
+        mergedSteps.push(current);
+      }
+    }
+
+    return {
+      ...plan,
+      steps: mergedSteps,
+    };
   }
 
   // ===== Step Execution =====
@@ -543,8 +657,8 @@ export class AutonomousAgent extends DurableObject<Env> {
         {
           model: 'gemini-2.5-flash',
           stream: true,
-          timeoutMs: 120_000,
-          thinkingConfig: { thinkingBudget: 1024 },
+          timeoutMs: 60_000, // Reduced from 120s to 60s
+          thinkingConfig: { thinkingBudget: 512 }, // Reduced budget for faster execution
           files: state.context?.files ?? [],
           urlList: hasUrls
             ? state.context.searchResults.map((r: any) => r.url).filter(Boolean)
@@ -562,22 +676,17 @@ export class AutonomousAgent extends DurableObject<Env> {
     const plan = state.currentPlan!;
     const done = plan.steps
       .filter((s) => s.status === 'completed')
-      .map((s) => `${s.description}: ${s.result ?? 'completed'}`)
+      .map((s) => `${s.description}: ${(s.result ?? 'completed').substring(0, 200)}`) // Limit result length
       .join('\n');
 
-    return `EXECUTION PLAN:
-${plan.steps.map((s, i) => `${i + 1}. ${s.description}`).join('\n')}
+    return `PLAN: ${plan.steps.map((s, i) => `${i + 1}. ${s.description}`).join('; ')}
 
-COMPLETED STEPS:
-${done || 'None yet'}
+COMPLETED: ${done || 'None'}
 
-CURRENT STEP:
-${step.description}
+CURRENT STEP: ${step.description}
+ACTION: ${step.action}
 
-ACTION TYPE:
-${step.action}
-
-Provide a concise result for this step only:`;
+Provide a concise result (max 500 chars):`;
   }
 
   // ===== Synthesis =====
@@ -593,12 +702,12 @@ Provide a concise result for this step only:`;
       const lastUserPartsStr = lastUserRow?.parts as string | undefined;
       const original = lastUserPartsStr ? this.parse<any[]>(lastUserPartsStr)?.[0]?.text || '' : '';
 
-      const prompt = `Original Request: ${original}
+      const prompt = `Request: ${original}
 
-Execution Results:
-${plan.steps.map((s, i) => `Step ${i + 1} (${s.description}): ${s.result ?? 'no result'}`).join('\n\n')}
+Results:
+${plan.steps.map((s, i) => `${i + 1}. ${s.description}: ${(s.result ?? 'no result').substring(0, 300)}`).join('\n')}
 
-Task: Provide a comprehensive, well-structured answer that directly addresses the original request based on the execution results above.`;
+Provide a comprehensive answer:`;
 
       const batcher = this.createChunkBatcher(ws, 'final_chunk');
       let full = '';
@@ -610,12 +719,11 @@ Task: Provide a comprehensive, well-structured answer that directly addresses th
           full += chunk;
           batcher.add(chunk);
         },
-        { model: 'gemini-2.5-flash', thinkingConfig: { thinkingBudget: 1536 } }
+        { model: 'gemini-2.5-flash', thinkingConfig: { thinkingBudget: 1024 } }
       );
 
       batcher.flush();
 
-      // Save final answer
       try {
         this.sql.exec(
           `INSERT INTO messages (role, parts, timestamp) VALUES (?, ?, ?)`,
@@ -641,7 +749,7 @@ Task: Provide a comprehensive, well-structured answer that directly addresses th
       const rows = this.sql
         .exec(
           `SELECT role, parts FROM messages ORDER BY timestamp DESC LIMIT ?`,
-          this.maxHistoryMessages
+          Math.min(this.maxHistoryMessages, 50) // Limit context window
         )
         .toArray();
 
@@ -657,7 +765,7 @@ Task: Provide a comprehensive, well-structured answer that directly addresses th
         }
       }
 
-      // Remove consecutive duplicate user entries
+      // Remove consecutive duplicates
       let i = hist.length - 1;
       while (i > 0) {
         if (hist[i].role === 'user' && hist[i - 1].role === 'user') {
@@ -746,7 +854,10 @@ Task: Provide a comprehensive, well-structured answer that directly addresses th
   }
 
   private getMetrics(): Response {
-    return new Response(this.stringify(this.metrics), {
+    return new Response(this.stringify({
+      ...this.metrics,
+      circuitBreaker: this.gemini.getCircuitBreakerStatus(),
+    }), {
       headers: { 'Content-Type': 'application/json' },
     });
   }

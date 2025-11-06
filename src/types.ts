@@ -107,9 +107,11 @@ export interface HistoryResponse {
 }
 
 export interface StatusResponse {
-  plan?: ExecutionPlan;
+  currentMode?: AutonomousMode;
+  currentPhase?: AgentPhase;
   lastActivity?: number;
   sessionId?: string;
+  executionContext?: { currentTask: string; progress: string[] };
   metrics?: {
     requestCount: number;
     errorCount: number;

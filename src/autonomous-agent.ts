@@ -481,25 +481,11 @@ export class AutonomousAgent extends DurableObject<Env> {
         throw e;
       }
 
-      // Enhanced complexity analysis with fast heuristics
-      const complexity = await this.analyzeComplexityEnhanced(
-        userMsg,
-        (state.context?.files ?? []).length > 0
-      );
-
-      console.log(`[Complexity] ${complexity.type} - ${complexity.reasoning}`);
+      // Unified autonomous processing - no more complexity analysis branching
+      console.log(`[Autonomous] Processing with unified approach`);
 
       try {
-        if (complexity.type === 'simple') {
-          await this.handleSimple(userMsg, ws, state);
-        } else {
-          // Optimize complex plan generation
-          await this.handleComplexOptimized(userMsg, complexity, ws, state, {
-            continueOnFailure: false,
-            maxRetries: 2,
-            parallelExecution: false, // Can be enabled for independent steps
-          });
-        }
+        await this.processAutonomous(userMsg, ws, state);
       } catch (e) {
         console.error('Process error:', e);
         if (ws) this.send(ws, { type: 'error', error: 'Processing failed' });

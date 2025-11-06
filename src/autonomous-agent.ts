@@ -49,7 +49,6 @@ export class AutonomousAgent extends DurableObject<Env> {
     avgResponseTime: 0,
     activeConnections: 0,
     totalResponseTime: 0,
-    complexityDistribution: { simple: 0, complex: 0 },
   };
 
   constructor(state: DurableObjectState, env: Env) {

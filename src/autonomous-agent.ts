@@ -1,4 +1,4 @@
-// src/autonomous-agent.ts - Fixed Constructor
+// src/autonomous-agent.ts - Fixed with proper error handling and streaming
 import { DurableObject } from 'cloudflare:workers';
 import type { DurableObjectState } from '@cloudflare/workers-types';
 import GeminiClient from './utils/gemini';
@@ -9,7 +9,6 @@ import type {
   FileMetadata,
   AutonomousMode,
   AgentPhase,
-  WebSocketMessage,
 } from './types';
 
 interface SqlStorage {
@@ -18,12 +17,6 @@ interface SqlStorage {
     toArray(): any[];
     [Symbol.iterator](): Iterator<any>;
   };
-}
-
-interface StepExecutionOptions {
-  continueOnFailure?: boolean;
-  maxRetries?: number;
-  parallelExecution?: boolean;
 }
 
 interface Metrics {
@@ -40,7 +33,6 @@ export class AutonomousAgent extends DurableObject<Env> {
   private maxHistoryMessages = 200;
   private readonly MAX_MESSAGE_SIZE = 100_000;
   private readonly MAX_TOTAL_HISTORY_SIZE = 500_000;
-  private readonly COMPLEXITY_CACHE_TTL = 5 * 60 * 1000;
   private activeWebSockets = new Set<WebSocket>();
   private metrics: Metrics = {
     requestCount: 0,
@@ -129,7 +121,7 @@ export class AutonomousAgent extends DurableObject<Env> {
       });
   }
 
-  // ===== Unified Autonomous Agent Methods =====
+  // ===== Context Building =====
 
   private buildUnifiedContext(state: AgentState): {
     conversationHistory: Array<{ role: string; parts: any[] }>;
@@ -153,7 +145,7 @@ export class AutonomousAgent extends DurableObject<Env> {
   private determineAvailableTools(state: AgentState): string[] {
     const tools: string[] = [];
 
-    tools.push('thinking', 'search_grounding', 'url_context', 'code_execution');
+    tools.push('thinking', 'search_grounding', 'code_execution');
 
     if (state.context?.files && state.context.files.length > 0) {
       tools.push('file_analysis');
@@ -170,88 +162,93 @@ export class AutonomousAgent extends DurableObject<Env> {
     return tools;
   }
 
+  // FIXED: Proper autonomous processing with error handling
   private async processAutonomous(
     userMsg: string,
     ws: WebSocket | null,
     state: AgentState
   ): Promise<void> {
     return this.withErrorContext('processAutonomous', async () => {
+      console.log('[processAutonomous] Starting processing');
+      
       state.currentPhase = AgentPhase.ASSESSMENT;
 
       const context = this.buildUnifiedContext(state);
 
-      const result = await this.gemini.executeUnifiedAutonomous(
-        {
-          userRequest: userMsg,
-          currentPhase: state.currentPhase,
-          conversationHistory: context.conversationHistory,
-          availableTools: context.availableTools,
-          files: context.files,
-          urlList: context.urlList,
-        },
-        (chunk) => {
-          if (ws) {
-            const batcher = this.createChunkBatcher(ws, 'chunk');
-            batcher.add(chunk);
-            batcher.flush();
-          }
-        }
-      );
-
-      if (result.phaseChanges) {
-        for (const phase of result.phaseChanges) {
-          state.currentPhase = phase as AgentPhase;
-          if (ws) {
-            this.send(ws, {
-              type: 'phase_change',
-              phase,
-              message: `Transitioning to ${phase} phase`,
-            });
-          }
-        }
-      }
-
-      if (result.clarificationRequests && result.clarificationRequests.length > 0) {
-        state.currentPhase = AgentPhase.CLARIFICATION;
-        state.clarificationContext = result.clarificationRequests[0];
-
-        if (ws) {
-          this.send(ws, {
-            type: 'clarification_request',
-            clarificationQuestion: result.clarificationRequests[0],
-          });
-        }
-      }
-
-      if (result.toolCalls) {
-        for (const toolCall of result.toolCalls) {
-          if (ws) {
-            this.send(ws, {
-              type: 'tool_call',
-              toolCall,
-            });
-          }
-        }
+      // Send initial phase
+      if (ws) {
+        this.send(ws, {
+          type: 'phase_change',
+          phase: AgentPhase.ASSESSMENT,
+          message: 'Analyzing your request',
+        });
       }
 
       try {
-        this.sql.exec(
-          `INSERT INTO messages (role, parts, timestamp) VALUES (?, ?, ?)`,
-          'model',
-          this.stringify([{ text: result.response }]),
-          Date.now()
+        console.log('[processAutonomous] Calling executeUnifiedAutonomous');
+        
+        const result = await this.gemini.executeUnifiedAutonomous(
+          {
+            userRequest: userMsg,
+            currentPhase: state.currentPhase,
+            conversationHistory: context.conversationHistory,
+            availableTools: context.availableTools,
+            files: context.files,
+            urlList: context.urlList,
+          },
+          (chunk) => {
+            // Stream chunks to WebSocket
+            if (ws && ws.readyState === WebSocket.OPEN) {
+              try {
+                this.send(ws, { type: 'chunk', content: chunk });
+              } catch (e) {
+                console.error('[processAutonomous] Failed to send chunk:', e);
+              }
+            }
+          }
         );
-      } catch (e) {
-        console.error('Failed to save autonomous response:', e);
-      }
 
-      state.currentPhase = AgentPhase.COMPLETION;
-      if (ws) {
-        this.send(ws, {
-          type: 'final_response',
-          content: result.response,
-        });
-        this.send(ws, { type: 'done' });
+        console.log('[processAutonomous] Got result, length:', result.response?.length);
+
+        if (!result.response) {
+          throw new Error('No response from Gemini API');
+        }
+
+        // Save the response
+        try {
+          this.sql.exec(
+            `INSERT INTO messages (role, parts, timestamp) VALUES (?, ?, ?)`,
+            'model',
+            this.stringify([{ text: result.response }]),
+            Date.now()
+          );
+        } catch (e) {
+          console.error('[processAutonomous] Failed to save response:', e);
+        }
+
+        // Send completion
+        state.currentPhase = AgentPhase.COMPLETION;
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          this.send(ws, {
+            type: 'final_response',
+            content: result.response,
+          });
+          this.send(ws, { type: 'done' });
+        }
+
+        console.log('[processAutonomous] Processing completed successfully');
+      } catch (error) {
+        console.error('[processAutonomous] Error during processing:', error);
+        
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          this.send(ws, {
+            type: 'error',
+            error: 'Processing failed',
+            details: error instanceof Error ? error.message : String(error),
+          });
+        }
+        
+        throw error;
       }
     });
   }
@@ -365,29 +362,6 @@ export class AutonomousAgent extends DurableObject<Env> {
     }
   }
 
-  private createChunkBatcher(ws: WebSocket | null, type: string, flushInterval = 50) {
-    let buffer = '';
-    let timer: ReturnType<typeof setTimeout> | null = null;
-
-    const flush = () => {
-      if (buffer && ws) {
-        this.send(ws, { type, content: buffer });
-        buffer = '';
-      }
-      timer = null;
-    };
-
-    return {
-      add: (chunk: string) => {
-        buffer += chunk;
-        if (!timer) {
-          timer = setTimeout(flush, flushInterval);
-        }
-      },
-      flush,
-    };
-  }
-
   // ===== HTTP Fetch Handler =====
 
   async fetch(request: Request): Promise<Response> {
@@ -450,19 +424,19 @@ export class AutonomousAgent extends DurableObject<Env> {
     console.log('[AutonomousAgent] WebSocket message received');
     
     if (typeof message !== 'string') {
-      console.warn('[AutonomousAgent] Non-string message received, ignoring');
+      console.warn('[AutonomousAgent] Non-string message received');
       return;
     }
     
     if (ws.readyState !== WebSocket.OPEN) {
-      console.warn('[AutonomousAgent] WebSocket not open, discarding message');
+      console.warn('[AutonomousAgent] WebSocket not open');
       return;
     }
 
     let payload: any;
     try {
       payload = JSON.parse(message);
-      console.log('[AutonomousAgent] Parsed message:', payload.type);
+      console.log('[AutonomousAgent] Parsed message type:', payload.type);
     } catch (parseError) {
       console.error('[AutonomousAgent] JSON parse failed:', parseError);
       this.send(ws, { type: 'error', error: 'Invalid JSON' });
@@ -470,14 +444,14 @@ export class AutonomousAgent extends DurableObject<Env> {
     }
 
     if (payload.type === 'user_message' && typeof payload.content === 'string') {
-      console.log('[AutonomousAgent] Processing user message...');
+      console.log('[AutonomousAgent] Processing user message');
       this.ctx.waitUntil(
         this.trackRequest(() => this.process(payload.content, ws))
           .then(() => {
             console.log('[AutonomousAgent] Message processed successfully');
           })
           .catch((err) => {
-            console.error('[AutonomousAgent] WebSocket process failed:', err);
+            console.error('[AutonomousAgent] Process failed:', err);
             this.send(ws, { 
               type: 'error', 
               error: 'Processing failed',
@@ -486,7 +460,7 @@ export class AutonomousAgent extends DurableObject<Env> {
           })
       );
     } else {
-      console.warn('[AutonomousAgent] Invalid payload structure');
+      console.warn('[AutonomousAgent] Invalid payload');
       this.send(ws, { type: 'error', error: 'Invalid payload' });
     }
   }
@@ -503,10 +477,11 @@ export class AutonomousAgent extends DurableObject<Env> {
     this.metrics.activeConnections = this.activeWebSockets.size;
   }
 
-  // ===== Core Processing Logic =====
+  // ===== Core Processing =====
 
   private async process(userMsg: string, ws: WebSocket | null): Promise<void> {
     return this.withStateTransaction(async (state) => {
+      console.log('[process] Starting');
       state.lastActivityAt = Date.now();
 
       if (userMsg.length > this.MAX_MESSAGE_SIZE) {
@@ -514,6 +489,7 @@ export class AutonomousAgent extends DurableObject<Env> {
         throw new Error('Message exceeds maximum size');
       }
 
+      // Save user message
       try {
         this.sql.exec(
           `INSERT INTO messages (role, parts, timestamp) VALUES (?, ?, ?)`,
@@ -522,18 +498,22 @@ export class AutonomousAgent extends DurableObject<Env> {
           Date.now()
         );
       } catch (e) {
-        console.error('Failed to save user message:', e);
+        console.error('[process] Failed to save user message:', e);
         if (ws) this.send(ws, { type: 'error', error: 'Save failed' });
         throw e;
       }
 
-      console.log(`[Autonomous] Processing with unified approach`);
+      console.log('[process] Processing with autonomous approach');
 
       try {
         await this.processAutonomous(userMsg, ws, state);
       } catch (e) {
-        console.error('Process error:', e);
-        if (ws) this.send(ws, { type: 'error', error: 'Processing failed' });
+        console.error('[process] Error:', e);
+        if (ws) this.send(ws, { 
+          type: 'error', 
+          error: 'Processing failed',
+          details: e instanceof Error ? e.message : String(e)
+        });
         throw e;
       }
     });
@@ -562,6 +542,7 @@ export class AutonomousAgent extends DurableObject<Env> {
         }
       }
 
+      // Remove consecutive duplicates
       let i = hist.length - 1;
       while (i > 0) {
         if (hist[i].role === 'user' && hist[i - 1].role === 'user') {
@@ -645,8 +626,6 @@ export class AutonomousAgent extends DurableObject<Env> {
         currentPhase: state?.currentPhase,
         lastActivity: state?.lastActivityAt,
         sessionId: state?.sessionId,
-        executionContext: state?.executionContext,
-        clarificationContext: state?.clarificationContext,
       }),
       { headers: { 'Content-Type': 'application/json' } }
     );

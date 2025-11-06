@@ -226,9 +226,17 @@ export class AutonomousAgent extends DurableObject<Env> {
         context: { files: [], searchResults: [] },
         sessionId: this.ctx?.id?.toString ? this.ctx.id.toString() : Date.now().toString(),
         lastActivityAt: Date.now(),
-        currentPlan: undefined,
+        // Initialize autonomous behavior fields
+        currentMode: AutonomousMode.CHAT,
+        currentPhase: AgentPhase.ASSESSMENT,
+        clarificationContext: undefined,
+        executionContext: undefined,
       } as AgentState;
     }
+
+    // Ensure new fields exist for existing state
+    if (!state.currentMode) state.currentMode = AutonomousMode.CHAT;
+    if (!state.currentPhase) state.currentPhase = AgentPhase.ASSESSMENT;
 
     await this.checkMemoryPressure();
     return state;

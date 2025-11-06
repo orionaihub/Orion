@@ -1,159 +1,194 @@
-// src/utils/gemini.ts
-import { GoogleGenAI } from '@google/genai';
+import { GoogleGenerativeAI, GoogleAIFileManager } from '@google/generative-ai';
 import type { TaskComplexity, ExecutionPlan, FileMetadata } from '../types';
 import type { ExecutionConfig } from '../tools';
 
-/**
-
-* Gemini API wrapper for AI agent, streaming user responses only.
-*/
 export class GeminiClient {
-private ai: ReturnType<typeof GoogleGenAI>;
+private genAI: GoogleGenerativeAI;
+private fileManager: GoogleAIFileManager;
 private maxRetries = 3;
 private baseBackoff = 1000;
-private defaultTimeoutMs = 60_000;
+private timeout = 60000; // 60 seconds
 
-constructor(opts?: { apiKey?: string }) {
-this.ai = new GoogleGenAI({ apiKey: opts?.apiKey });
+constructor(apiKey: string) {
+this.genAI = new GoogleGenerativeAI(apiKey);
+this.fileManager = new GoogleAIFileManager(apiKey);
 }
 
-// ---------------- Helper methods ----------------
-
+/** Parse JSON safely */
 private parse<T>(text: string): T | null {
 try {
 const trimmed = text.trim().replace(/^"json\s*/, '').replace(/"$/, '');
+if (!trimmed) return null;
 return JSON.parse(trimmed) as T;
 } catch (e) {
-console.warn('[GeminiClient] JSON parse failed', e);
+console.error('JSON parse failed:', e, 'Raw:', text);
 return null;
 }
 }
 
+/** Retry wrapper */
 private async withRetry<T>(fn: () => Promise<T>): Promise<T> {
-let lastError: any;
 for (let i = 0; i < this.maxRetries; i++) {
 try {
 return await fn();
-} catch (err) {
-lastError = err;
-if (i < this.maxRetries - 1) {
-const delay = this.baseBackoff * Math.pow(2, i);
-await new Promise((r) => setTimeout(r, delay));
+} catch (error) {
+if (i === this.maxRetries - 1) throw error;
+const delay = this.baseBackoff * 2 ** i;
+console.log("Retry ${i + 1}/${this.maxRetries} after ${delay}ms");
+await new Promise((resolve) => setTimeout(resolve, delay));
 }
 }
-}
-throw lastError;
-}
-
-private async withTimeout<T>(promise: Promise<T>, errorMsg = 'timeout', ms?: number): Promise<T> {
-const timeoutMs = ms ?? this.defaultTimeoutMs;
-return Promise.race([
-promise,
-new Promise<T>((_, reject) => setTimeout(() => reject(new Error(errorMsg)), timeoutMs))
-]) as Promise<T>;
+throw new Error('Max retries exceeded');
 }
 
-// ---------------- File operations ----------------
-
-async uploadFile(fileDataBase64: string, mimeType: string, displayName: string): Promise<FileMetadata> {
-return this.withRetry(async () => {
-const buffer = Buffer.from(fileDataBase64, 'base64');
-const uploadResp = await this.withTimeout(
-this.ai.files.upload({ file: buffer as any, config: { mimeType, displayName } }),
-'uploadFile timed out'
+/** Timeout wrapper */
+private async withTimeout<T>(promise: Promise<T>, errorMessage: string): Promise<T> {
+const timeoutPromise = new Promise<never>((_, reject) =>
+setTimeout(() => reject(new Error(errorMessage)), this.timeout)
 );
-const name = uploadResp.name;
-const meta = await this.ai.files.get({ name });
-return {
-fileUri: meta.uri,
-mimeType: meta.mimeType,
-name: meta.displayName ?? displayName,
-sizeBytes: meta.sizeBytes ?? buffer.length,
-uploadedAt: Date.now(),
-state: meta.state as any,
-expiresAt: meta.expirationTime ? new Date(meta.expirationTime).getTime() : undefined,
-};
-});
+return Promise.race([promise, timeoutPromise]);
 }
 
-async getFileStatus(fileUriOrName: string): Promise<string> {
+/** Upload file */
+async uploadFile(fileData: string, mimeType: string, displayName: string): Promise<FileMetadata> {
+const buffer = Buffer.from(fileData, 'base64');
+const uploadResult = await this.fileManager.uploadFile(buffer as any, { mimeType, displayName });
+const file = await this.fileManager.getFile(uploadResult.file.name);
+return {
+fileUri: file.uri,
+mimeType: file.mimeType,
+name: file.displayName || displayName,
+sizeBytes: file.sizeBytes || buffer.length,
+uploadedAt: Date.now(),
+state: file.state as any,
+expiresAt: file.expirationTime ? new Date(file.expirationTime).getTime() : undefined,
+};
+}
+
+async getFileStatus(fileUri: string): Promise<string> {
 try {
-const name = fileUriOrName.split('/').pop() ?? fileUriOrName;
-const meta = await this.ai.files.get({ name });
-return meta.state ?? 'UNKNOWN';
-} catch (e) {
-console.warn('[GeminiClient] getFileStatus failed', e);
+const fileName = fileUri.split('/').pop() || fileUri;
+const file = await this.fileManager.getFile(fileName);
+return file.state;
+} catch (err) {
+console.error('Get file status failed:', err);
 return 'FAILED';
 }
 }
 
-async deleteFile(fileUriOrName: string): Promise<void> {
+async deleteFile(fileUri: string): Promise<void> {
 try {
-const name = fileUriOrName.split('/').pop() ?? fileUriOrName;
-await this.ai.files.delete({ name });
-} catch (e) {
-console.warn('[GeminiClient] deleteFile failed', e);
+const fileName = fileUri.split('/').pop() || fileUri;
+await this.fileManager.deleteFile(fileName);
+} catch (err) {
+console.error('File deletion failed:', err);
 }
 }
 
-// ---------------- Task complexity ----------------
-
+/** Analyze task complexity */
 async analyzeComplexity(query: string, hasFiles = false): Promise<TaskComplexity> {
 return this.withRetry(async () => {
-const prompt = "Analyze this request and return JSON with type, requiredTools, estimatedSteps, reasoning, requiresFiles, requiresCode, requiresVision. Context: User ${hasFiles ? 'HAS uploaded files' : 'has NOT uploaded files'} Request: ${query}";
-const resp = await this.withTimeout(
-this.ai.models.generateContent({
+const model = this.genAI.getGenerativeModel({
 model: 'gemini-2.5-flash',
-contents: [{ role: 'user', parts: [{ text: prompt }] }],
-config: { thinkingConfig: { thinkingBudget: 1024 } }
-}),
-'analyzeComplexity timed out'
-);
-const parsed = this.parse<TaskComplexity>(resp.text ?? '');
-return parsed ?? {
-type: 'simple',
-requiredTools: [],
-estimatedSteps: 1,
-reasoning: 'fallback',
-requiresFiles: hasFiles,
-requiresCode: false,
-requiresVision: false
-};
+generationConfig: { responseMimeType: 'application/json' },
 });
+
+  const result = await this.withTimeout(
+    model.generateContent({
+      contents: [
+        {
+          role: 'user',
+          parts: [
+            {
+              text: `Analyze task complexity and return JSON:
+
+{
+"type": "simple" | "complex",
+"requiredTools": string[],
+"estimatedSteps": number,
+"reasoning": "brief explanation",
+"requiresFiles": boolean,
+"requiresCode": boolean,
+"requiresVision": boolean
+}
+Context: User ${hasFiles ? 'HAS uploaded files' : 'has NOT uploaded files'}
+Request: ${query}`,
+},
+],
+},
+],
+}),
+'Complexity analysis timed out'
+);
+
+  const text = (await result.response).text?.() ?? '{}';
+  return this.parse<TaskComplexity>(text) || {
+    type: 'simple',
+    requiredTools: [],
+    estimatedSteps: 1,
+    reasoning: 'fallback',
+    requiresFiles: false,
+    requiresCode: false,
+    requiresVision: false,
+  };
+});
+
 }
 
-// ---------------- Execution plan ----------------
-
+/** Generate execution plan */
 async generatePlan(query: string, complexity: TaskComplexity, hasFiles: boolean): Promise<ExecutionPlan> {
 return this.withRetry(async () => {
-const prompt = "Create a detailed execution plan with sections in JSON format. Context: User ${hasFiles ? 'HAS uploaded files' : 'has NOT uploaded files'} Complexity: ${JSON.stringify(complexity)} Request: ${query}";
-const resp = await this.withTimeout(
-this.ai.models.generateContent({
+const model = this.genAI.getGenerativeModel({
 model: 'gemini-2.5-flash',
-contents: [{ role: 'user', parts: [{ text: prompt }] }],
-config: { thinkingConfig: { thinkingBudget: 2048 } }
-}),
-'generatePlan timed out'
-);
-const parsed = this.parse<{ sections: any[] }>(resp.text ?? '');
-if (!parsed?.sections) {
-return { steps: [], sections: [], currentStepIndex: 0, status: 'executing', createdAt: Date.now() };
-}
+generationConfig: { responseMimeType: 'application/json' },
+});
 
+  const result = await this.withTimeout(
+    model.generateContent({
+      contents: [
+        {
+          role: 'user',
+          parts: [
+            {
+              text: `Create detailed multi-step execution plan (JSON) with sections:
+
+Context: ${hasFiles ? 'User HAS files' : 'User has NO files'}
+Complexity: ${JSON.stringify(complexity)}
+Request: ${query}`,
+},
+],
+},
+],
+}),
+'Plan generation timed out'
+);
+
+  const data = this.parse<{ sections: any[] }>((await result.response).text?.() ?? '{}');
+  if (!data?.sections) {
+    return {
+      steps: [{ id: 'step_1', description: 'Directly answer query', action: 'analyze', status: 'pending' }],
+      sections: [{ name: 'Execution', description: 'Direct response', steps: [], status: 'pending' }],
+      currentStepIndex: 0,
+      status: 'executing',
+      createdAt: Date.now(),
+    };
+  }
+
+  // Flatten steps
   const allSteps: any[] = [];
-  const sections = parsed.sections.map((sec) => {
-    const steps = (sec.steps || []).map((s: any) => {
+  const sections = data.sections.map((section) => {
+    const sectionSteps = section.steps.map((s: any) => {
       const step = {
-        id: s.id ?? `step_${allSteps.length + 1}`,
-        description: s.description ?? '',
-        action: s.action ?? 'analyze',
+        id: s.id || `step_${allSteps.length + 1}`,
+        description: s.description || 'Process step',
+        action: s.action || 'analyze',
         status: 'pending' as const,
-        section: sec.name
+        section: section.name,
       };
       allSteps.push(step);
       return step;
     });
-    return { name: sec.name, description: sec.description ?? '', steps, status: 'pending' as const };
+    return { name: section.name, description: section.description || '', steps: sectionSteps, status: 'pending' as const };
   });
 
   return { steps: allSteps, sections, currentStepIndex: 0, status: 'executing', createdAt: Date.now() };
@@ -161,112 +196,65 @@ return { steps: [], sections: [], currentStepIndex: 0, status: 'executing', crea
 
 }
 
-// ---------------- Streaming response to user only ----------------
-
-async streamResponse(
-query: string,
-history: Array<{ role: string; parts: any[] }>,
-onChunk: (text: string) => void
-): Promise<string> {
-const streamResp = await this.ai.models.generateContent({
-model: 'gemini-2.5-flash',
-contents: [
-...history,
-{ role: 'user', parts: [{ text: query }] }
-],
-config: { stream: true }
-} as any); // cast due to SDK typings
-
-let fullText = '';
-
-if (streamResp[Symbol.asyncIterator]) {
-  for await (const chunk of streamResp as AsyncIterable<{ text?: string }>) {
-    const txt = chunk.text ?? '';
-    if (txt) {
-      fullText += txt;
-      onChunk(txt);
-    }
-  }
-} else {
-  // fallback if SDK returns full text synchronously
-  const txt = (await streamResp).text ?? '';
-  fullText = txt;
-  onChunk(txt);
-}
-
-return fullText;
-
-}
-
-// ---------------- Execute tools synchronously ----------------
-
-async executeWithConfig(
-prompt: string,
-history: Array<{ role: string; parts: any[] }>,
-config: ExecutionConfig
-): Promise<string> {
+/** Execute a step with tools and function calls */
+async executeWithConfig(prompt: string, history: any[], config: ExecutionConfig): Promise<string> {
 return this.withRetry(async () => {
 const tools: any[] = [];
 
-  if (config.useSearch) tools.push({ googleSearch: {} });
-  if (config.useCodeExecution) tools.push({ codeExecution: {} });
-  if (config.useMapsGrounding) tools.push({ googleMaps: {} });
-  if (config.useUrlContext && config.urlList?.length) tools.push({ urlContext: {} });
-  if (config.allowComputerUse) tools.push({ computerUse: {} });
+  if (config.useSearch) tools.push({ name: 'google_search', input: { query: prompt, top_k: 3 } });
+  if (config.useCodeExecution) tools.push({ name: 'code_execute', input: { code: prompt } });
+  if (config.urlList?.length) tools.push({ name: 'url_context', input: { urls: config.urlList } });
+  if (config.functionCalls?.length) {
+    tools.push(...config.functionCalls.map((fn) => ({ name: fn.name, input: fn.args })));
+  }
 
-  const contents: any[] = [...history.map(h => ({ role: h.role, parts: h.parts }))];
+  const model = this.genAI.getGenerativeModel({ model: 'gemini-2.5-flash', tools });
+
+  const parts: any[] = [{ text: prompt }];
 
   if (config.files?.length) {
-    const fileParts = config.files
-      .filter(f => f.state === 'ACTIVE' && f.fileUri)
-      .map(f => ({ file_data: { mime_type: f.mimeType, file_uri: f.fileUri } }));
-    contents.push({ parts: fileParts });
+    for (const file of config.files) {
+      if (file.state === 'ACTIVE') parts.push({ fileData: { mimeType: file.mimeType, fileUri: file.fileUri } });
+    }
   }
 
-  if (config.urlList?.length) {
-    const urlParts = config.urlList.map(u => ({ url: u }));
-    contents.push({ parts: urlParts });
-  }
+  const chat = model.startChat({ history });
+  const result = await this.withTimeout(chat.sendMessage(parts), 'Execution timed out');
 
-  contents.push({ parts: [{ text: prompt }] });
-
-  const res = await this.withTimeout(
-    this.ai.models.generateContent({
-      model: config.model ?? 'gemini-2.5-flash',
-      contents,
-      config: { tools: tools.length ? tools : undefined }
-    } as any),
-    'executeWithConfig timed out',
-    config.timeoutMs
-  );
-
-  return res.text ?? '[no-result]';
+  return (await result.response).text?.() ?? '[No result]';
 });
 
 }
 
-// ---------------- Synthesis ----------------
-
-async synthesize(
-originalQuery: string,
-stepResults: Array<{ description: string; result: string }>,
-history: Array<{ role: string; parts: any[] }>
+/** Stream response to user (simple queries) */
+async streamResponse(
+query: string,
+history: any[],
+onChunk: (text: string) => void
 ): Promise<string> {
+const model = this.genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
+const chat = model.startChat({ history });
+let fullText = '';
+
+try {
+  const result = await this.withTimeout(chat.sendMessageStream(query), 'Streaming timed out');
+  for await (const chunk of result.stream) {
+    const text = chunk.text?.() ?? '';
+    if (text) {
+      fullText += text;
+      onChunk(text);
+    }
+  }
+  return fullText;
+} catch (err) {
+  console.error('Streaming failed:', err);
+  throw err;
+}
+
+}
+
+/** Synthesize multiple step results */
+async synthesize(originalQuery: string, stepResults: Array<{ description: string; result: string }>, history: any[]): Promise<string> {
 return this.withRetry(async () => {
-const prompt = "Original Request: ${originalQuery}\n\nStep Results:\n${stepResults .map((s, i) => "Step ${i + 1} - ${s.description}:\n${s.result}") .join('\n\n')}\n\nTask: Synthesize into a well-structured answer.";
-
-  const resp = await this.withTimeout(
-    this.ai.models.generateContent({
-      model: 'gemini-2.5-flash',
-      contents: [{ role: 'user', parts: [{ text: prompt }] }],
-      config: { thinkingConfig: { thinkingBudget: 2048 } }
-    }),
-    'synthesize timed out'
-  );
-  return resp.text ?? '[no-answer]';
-});
-
-}
-}
-
-export default GeminiClient;
+const model = this.genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
+const prompt = `Original Request: ${originalQuery}\n\nStep Results

@@ -1,6 +1,6 @@
-// src/utils/gemini.ts - Performance Optimized
+// src/utils/gemini.ts - Unified Autonomous Agent
 import { GoogleGenAI } from '@google/genai';
-import type { TaskComplexity, ExecutionPlan, FileMetadata } from '../types';
+import type { FileMetadata, AutonomousMode, AgentPhase } from '../types';
 
 export interface ExecutionConfig {
   model?: string;
@@ -77,12 +77,176 @@ class CircuitBreaker {
   }
 }
 
+// Dynamic Prompt Builder for Modular Assembly
+class DynamicPromptBuilder {
+  private readonly BASE_AUTONOMOUS_PROMPT = `
+You are an autonomous AI agent with full decision-making authority. You operate independently to analyze, plan, execute, and complete user requests.
+
+## Your Capabilities
+- Native tools: thinking, search grounding, URL context, code execution
+- External tools: via function calling (search, file analysis, vision, maps, etc.)
+- Full autonomy: make decisions independently, adapt plans freely
+
+## Workflow Phases
+
+### 1. ASSESSMENT PHASE
+- Analyze user request thoroughly
+- Determine if clarification needed (proactively engage when beneficial)
+- Decide between CHAT mode (single-step native tools) vs EXECUTION mode (multi-step with external tools)
+- Set clear objectives, constraints, and expected outcomes
+
+### 2. PLANNING PHASE (EXECUTION mode only)
+- Create explicit step-by-step plan and display to user
+- Explain your reasoning and approach
+- Be ready to adapt plan based on user feedback or execution discoveries
+
+### 3. EXECUTION PHASE
+- Execute plan steps using appropriate tools (native + function calling)
+- Adapt freely based on results and insights
+- Provide natural language explanations of progress
+- Use function calls for external tools, native tools for direct capabilities
+
+### 4. CLARIFICATION PHASE (as needed)
+- Engage user proactively when clarification would be beneficial
+- Ask specific, targeted questions
+- Continue until clear understanding achieved
+
+### 5. COMPLETION PHASE
+- Deliver comprehensive final response
+- Summarize execution process and results
+- Provide value-added insights when appropriate
+
+## Response Format
+- Natural language explanations of what you're doing
+- Progress tracking updates
+- Function calls for external tools (when needed)
+- Never use structured JSON - respond conversationally
+- Use thinking tool for complex reasoning
+
+## Decision-Making Guidelines
+- Prioritize user value and successful outcomes
+- Adapt plans when better approaches emerge
+- Be proactive about clarifications when user might not know what's needed
+- Use minimal steps for simple tasks, thorough approach for complex ones
+- Always explain your reasoning clearly
+`;
+
+  private readonly PHASE_MODULES = new Map<AgentPhase, string>([
+    [AgentPhase.ASSESSMENT, `
+## Current Phase: ASSESSMENT
+- Analyze the user's request: {{USER_REQUEST}}
+- Consider context: {{CONTEXT}}
+- Determine complexity and appropriate mode (CHAT vs EXECUTION)
+- Identify any ambiguities or missing information
+- Decide if clarification is needed proactively
+- If request is simple and can be handled in one turn with native tools, stay in CHAT mode
+- If request is complex or requires external tools, transition to PLANNING phase in EXECUTION mode
+`],
+    [AgentPhase.PLANNING, `
+## Current Phase: PLANNING
+- Create a clear, explicit step-by-step plan for EXECUTION mode
+- Display the plan to the user with explanations
+- Consider all available tools and resources
+- Estimate what can be accomplished in each step
+- Be ready to adapt based on user feedback
+`],
+    [AgentPhase.EXECUTION, `
+## Current Phase: EXECUTION
+- Execute the plan step by step
+- Use appropriate tools (native + function calling)
+- Provide natural language progress updates
+- Adapt freely based on results and new insights
+- Modify plan if better approaches emerge
+- Use function calls for external tools when needed
+`],
+    [AgentPhase.CLARIFICATION, `
+## Current Phase: CLARIFICATION
+- Ask targeted questions to understand the user's needs better
+- Be specific about what information would help
+- Guide user toward providing necessary details
+- Continue clarification until clear understanding achieved
+`],
+    [AgentPhase.COMPLETION, `
+## Current Phase: COMPLETION
+- Provide comprehensive final response
+- Summarize what was accomplished
+- Share key insights and findings
+- Deliver the value the user was seeking
+`]
+  ]);
+
+  private readonly CONTEXT_MODULES = new Map<string, string>([
+    ['fileHandling', `
+## File Processing Context
+- You have access to uploaded files that may contain important data
+- Use file analysis tools to extract and understand file contents
+- Consider file types (documents, images, data files) when planning approach
+`],
+    ['complexExecution', `
+## Complex Task Execution
+- This request requires multiple steps and careful planning
+- Break down the task into manageable components
+- Use external tools via function calling when needed
+- Provide clear progress updates throughout execution
+`],
+    ['searchRequired', `
+## Search and Research Context
+- This request requires current information from external sources
+- Use search tools to gather relevant and up-to-date information
+- Synthesize findings into coherent insights
+`]
+  ]);
+
+  buildPrompt(
+    context: {
+      userRequest: string;
+      currentPhase: AgentPhase;
+      availableTools: string[];
+      context: string;
+    }
+  ): string {
+    let prompt = this.BASE_AUTONOMOUS_PROMPT;
+
+    // Add phase-specific instructions
+    const phaseModule = this.PHASE_MODULES.get(context.currentPhase);
+    if (phaseModule) {
+      prompt += phaseModule.replace('{{USER_REQUEST}}', context.userRequest)
+                        .replace('{{CONTEXT}}', context.context);
+    }
+
+    // Add context-specific guidance based on available resources
+    if (context.context.includes('files') && context.context.includes('file data')) {
+      prompt += this.CONTEXT_MODULES.get('fileHandling') || '';
+    }
+
+    if (context.availableTools.includes('search') || context.availableTools.includes('googleSearch')) {
+      prompt += this.CONTEXT_MODULES.get('searchRequired') || '';
+    }
+
+    if (context.currentPhase === AgentPhase.EXECUTION && context.availableTools.length > 2) {
+      prompt += this.CONTEXT_MODULES.get('complexExecution') || '';
+    }
+
+    // Add current state information
+    prompt += `\n\n## Current State
+User Request: ${context.userRequest}
+Current Phase: ${context.currentPhase}
+Available Tools: ${context.availableTools.join(', ') || 'native tools only'}
+Context: ${context.context}
+
+Begin your autonomous process.\n`;
+
+    return prompt;
+  }
+}
+
 export class GeminiClient {
   private ai: ReturnType<typeof GoogleGenAI>;
   private maxRetries = 3;
   private baseBackoff = 1000;
   private defaultTimeoutMs = 60_000;
   private circuitBreaker = new CircuitBreaker();
+  private promptBuilder = new DynamicPromptBuilder();
 
   private readonly ACTION_TOOL_MAP: Record<string, ToolConfig> = {
     search: { tools: [{ googleSearch: {} }] },
@@ -340,227 +504,157 @@ export class GeminiClient {
     }
   }
 
-  async analyzeComplexity(query: string, hasFiles = false): Promise<TaskComplexity> {
-    return this.withRetry(async () => {
-      const prompt = `Analyze request complexity - respond with JSON only:
-{
-  "type": "simple" | "complex",
-  "requiredTools": string[],
-  "estimatedSteps": number,
-  "reasoning": "brief",
-  "requiresFiles": boolean,
-  "requiresCode": boolean,
-  "requiresVision": boolean
-}
+  // ===== Unified Autonomous Agent Method =====
 
-Rules:
-- simple: greetings, basic questions, single-step tasks
-- complex: research, multi-step analysis, file processing
-
-Files: ${hasFiles ? 'YES' : 'NO'}
-Query: ${query}`;
-
-      const resp = await this.withTimeout(
-        this.ai.models.generateContent({
-          model: 'gemini-2.5-flash',
-          contents: prompt,
-          config: { thinkingConfig: { thinkingBudget: 512 } }, // Reduced budget
-        }),
-        'analyzeComplexity timed out',
-        30_000 // 30s timeout
-      );
-
-      const text = (resp?.text ?? '') as string;
-      const parsed = this.parse<TaskComplexity>(text);
-      if (parsed) return parsed;
-
-      return {
-        type: 'simple',
-        requiredTools: [],
-        estimatedSteps: 1,
-        reasoning: 'fallback',
-        requiresFiles: hasFiles,
-        requiresCode: false,
-        requiresVision: false,
-      } as TaskComplexity;
-    });
-  }
-
-  // NEW: Optimized plan generation with step limit
-  async generatePlanOptimized(
-    query: string,
-    complexity: TaskComplexity,
-    hasFiles: boolean,
-    maxSteps: number = 5
-  ): Promise<ExecutionPlan> {
-    return this.withRetry(async () => {
-      const prompt = `Create execution plan (MAX ${maxSteps} steps) - JSON only:
-{
-  "steps": [
-    {
-      "id": "s1",
-      "description": "concise action",
-      "action": "search|code_execute|file_analysis|analyze|synthesize"
-    }
-  ]
-}
-
-Rules:
-- Keep steps minimal and focused
-- Combine related actions
-- Use "search" for research, "analyze" for thinking, "synthesize" for final answer
-- MAX ${maxSteps} steps total
-
-Context: ${hasFiles ? 'Has files' : 'No files'}
-Tools needed: ${complexity.requiredTools.join(', ') || 'none'}
-
-Query: ${query}`;
-
-      const resp = await this.withTimeout(
-        this.ai.models.generateContent({
-          model: 'gemini-2.5-flash',
-          contents: prompt,
-          config: { thinkingConfig: { thinkingBudget: 1024 } }, // Reduced budget
-        }),
-        'generatePlan timed out',
-        30_000 // 30s timeout
-      );
-
-      const text = (resp?.text ?? '') as string;
-      const parsed = this.parse<{ steps: any[] }>(text);
-
-      if (!parsed || !parsed.steps) {
-        return {
-          steps: [
-            {
-              id: 's1',
-              description: 'Provide direct answer',
-              action: 'synthesize',
-              status: 'pending',
-            },
-          ],
-          currentStepIndex: 0,
-          status: 'executing',
-          createdAt: Date.now(),
-        } as ExecutionPlan;
-      }
-
-      // Limit steps to maxSteps
-      const limitedSteps = parsed.steps.slice(0, maxSteps).map((s: any, i: number) => ({
-        id: s.id ?? `s${i + 1}`,
-        description: s.description ?? 'Step',
-        action: s.action ?? 'analyze',
-        status: 'pending' as const,
-      }));
-
-      return {
-        steps: limitedSteps,
-        currentStepIndex: 0,
-        status: 'executing',
-        createdAt: Date.now(),
-      } as ExecutionPlan;
-    });
-  }
-
-  // Keep original for backward compatibility
-  async generatePlan(query: string, complexity: TaskComplexity, hasFiles: boolean): Promise<ExecutionPlan> {
-    return this.generatePlanOptimized(query, complexity, hasFiles, 8); // Default 8 steps
-  }
-
-  async streamResponse(
-    query: string,
-    history: Array<{ role: string; parts: any[] }>,
+  async executeUnifiedAutonomous(
+    context: {
+      userRequest: string;
+      currentPhase: AgentPhase;
+      conversationHistory: Array<{ role: string; parts: any[] }>;
+      availableTools: string[];
+      files?: FileMetadata[];
+      urlList?: string[];
+    },
     onChunk?: (text: string) => void,
     opts?: { model?: string; thinkingConfig?: any; timeoutMs?: number }
-  ): Promise<string> {
-    const modelName = opts?.model ?? 'gemini-2.5-flash';
-    const contents = this.buildContents(query, history);
-
-    const streamCall = this.ai.models.generateContent({
-      model: modelName,
-      contents,
-      config: {
-        thinkingConfig: opts?.thinkingConfig ?? { thinkingBudget: 512 }, // Reduced default
-        stream: true,
-      },
-    } as any);
-
-    return await this.handleStreamedResponse(streamCall, onChunk);
-  }
-
-  async executeWithConfig(
-    prompt: string,
-    history: Array<{ role: string; parts: any[] }>,
-    config: ExecutionConfig,
-    onChunk?: (text: string) => void
-  ): Promise<string> {
+  ): Promise<{
+    response: string;
+    phaseChanges?: AgentPhase[];
+    toolCalls?: Array<{ tool: string; params: Record<string, any>; result: any }>;
+    clarificationRequests?: string[];
+  }> {
     return this.withRetry(async () => {
+      // Build unified prompt using dynamic prompt builder
+      const contextStr = this.buildContextString(context);
+      const prompt = this.promptBuilder.buildPrompt({
+        userRequest: context.userRequest,
+        currentPhase: context.currentPhase,
+        availableTools: context.availableTools,
+        context: contextStr
+      });
+
+      // Determine tools based on phase and available resources
       let tools: Array<Record<string, unknown>> = [];
+      const hasFiles = (context.files ?? []).length > 0;
+      const hasUrls = (context.urlList ?? []).length > 0;
 
-      const hasFiles = (config.files ?? []).length > 0;
-      const hasUrls = (config.urlList ?? []).length > 0;
-
-      if (config.stepAction) {
-        tools = this.mapActionToTools(config.stepAction, { hasFiles, hasUrls });
-      } else {
-        if (config.useSearch) tools.push({ googleSearch: {} });
-        if (config.useCodeExecution) tools.push({ codeExecution: {} });
-        if (config.useMapsGrounding) tools.push({ googleMaps: {} });
-        if (config.useUrlContext && hasUrls) tools.push({ urlContext: {} });
-        if (config.allowComputerUse) tools.push({ computerUse: {} });
-        if (hasFiles) tools.push({ fileAnalysis: {} });
-        if (config.useVision) tools.push({ vision: {} });
+      // Configure tools based on current phase and needs
+      if (context.currentPhase === AgentPhase.EXECUTION) {
+        // In execution phase, enable all relevant tools
+        if (context.availableTools.includes('search')) tools.push({ googleSearch: {} });
+        if (context.availableTools.includes('file_analysis') && hasFiles) tools.push({ fileAnalysis: {} });
+        if (context.availableTools.includes('code_execution')) tools.push({ codeExecution: {} });
+        if (context.availableTools.includes('vision') && hasFiles) tools.push({ vision: {} });
+        if (context.availableTools.includes('maps')) tools.push({ googleMaps: {} });
+        if (context.availableTools.includes('url_context') && hasUrls) tools.push({ urlContext: {} });
       }
 
-      const contents = this.buildContents(prompt, history, config.files ?? [], config.urlList ?? []);
+      // Build contents with context
+      const contents = this.buildContents(prompt, context.conversationHistory, context.files, context.urlList);
 
-      const call = this.ai.models.generateContent({
-        model: config.model ?? 'gemini-2.5-flash',
-        contents,
-        config: {
-          thinkingConfig: config.thinkingConfig ?? { thinkingBudget: 512 }, // Reduced default
-          tools: tools.length ? tools : undefined,
-          stream: config.stream === true,
-        },
-      } as any);
-
-      if (config.stream === true) {
-        return await this.handleStreamedResponse(call, onChunk);
-      }
-
-      const resp = await this.withTimeout(call, 'executeWithConfig timed out', config.timeoutMs);
-      const text = (resp?.text ?? '') as string;
-      return text || '[no-result]';
-    });
-  }
-
-  async synthesize(
-    originalQuery: string,
-    stepResults: Array<{ description: string; result: string }>,
-    history: Array<{ role: string; parts: any[] }>
-  ): Promise<string> {
-    return this.withRetry(async () => {
-      const prompt = `Request: ${originalQuery}
-
-Results:
-${stepResults.map((s, i) => `${i + 1}. ${s.description}: ${s.result.substring(0, 300)}`).join('\n')}
-
-Provide comprehensive answer:`;
-
-      const resp = await this.withTimeout(
+      const response = await this.withTimeout(
         this.ai.models.generateContent({
-          model: 'gemini-2.5-flash',
-          contents: prompt,
-          config: { thinkingConfig: { thinkingBudget: 1024 } },
-        }),
-        'synthesize timed out',
-        45_000 // 45s timeout
+          model: opts?.model ?? 'gemini-2.5-flash',
+          contents,
+          config: {
+            thinkingConfig: opts?.thinkingConfig ?? { thinkingBudget: 1024 },
+            tools: tools.length ? tools : undefined,
+            stream: true,
+          },
+        } as any),
+        'executeUnifiedAutonomous timed out',
+        opts?.timeoutMs ?? 120_000
       );
 
-      const text = (resp?.text ?? '') as string;
-      return text || '[no-answer]';
+      // Handle streaming response and extract structured information
+      let fullResponse = '';
+      const phaseChanges: AgentPhase[] = [];
+      const toolCalls: Array<{ tool: string; params: Record<string, any>; result: any }> = [];
+      const clarificationRequests: string[] = [];
+
+      if (response && Symbol.asyncIterator in response) {
+        for await (const chunk of response) {
+          const text = this.extractTextFromChunk(chunk);
+          if (text) {
+            fullResponse += text;
+
+            // Send chunk to callback
+            try {
+              if (onChunk) onChunk(text);
+            } catch (e) {
+              console.warn('[GeminiClient] onChunk error:', e);
+            }
+
+            // Parse for phase changes, tool calls, and clarifications
+            this.parseAutonomousResponse(text, phaseChanges, toolCalls, clarificationRequests);
+          }
+        }
+      }
+
+      return {
+        response: fullResponse,
+        phaseChanges: phaseChanges.length ? phaseChanges : undefined,
+        toolCalls: toolCalls.length ? toolCalls : undefined,
+        clarificationRequests: clarificationRequests.length ? clarificationRequests : undefined,
+      };
     });
   }
+
+  private buildContextString(context: {
+    conversationHistory: Array<{ role: string; parts: any[] }>;
+    files?: FileMetadata[];
+    urlList?: string[];
+  }): string {
+    const parts: string[] = [];
+
+    if (context.files && context.files.length > 0) {
+      parts.push(`${context.files.length} files available: ${context.files.map(f => f.name).join(', ')}`);
+    }
+
+    if (context.urlList && context.urlList.length > 0) {
+      parts.push(`${context.urlList.length} URLs for context`);
+    }
+
+    if (context.conversationHistory && context.conversationHistory.length > 0) {
+      parts.push(`Conversation history: ${context.conversationHistory.length} messages`);
+    }
+
+    return parts.join('; ') || 'No additional context';
+  }
+
+  private parseAutonomousResponse(
+    text: string,
+    phaseChanges: AgentPhase[],
+    toolCalls: Array<{ tool: string; params: Record<string, any>; result: any }>,
+    clarificationRequests: string[]
+  ): void {
+    // Simple parsing for phase changes
+    const phaseKeywords = {
+      [AgentPhase.ASSESSMENT]: ['assessing', 'analyzing', 'let me analyze'],
+      [AgentPhase.PLANNING]: ['plan', 'planning', 'steps', 'approach'],
+      [AgentPhase.EXECUTION]: ['executing', 'now i will', 'let me', 'searching', 'analyzing'],
+      [AgentPhase.CLARIFICATION]: ['?', 'what', 'how', 'which', 'can you clarify'],
+      [AgentPhase.COMPLETION]: ['complete', 'done', 'result', 'answer', 'summary']
+    };
+
+    for (const [phase, keywords] of Object.entries(phaseKeywords)) {
+      if (keywords.some(keyword => text.toLowerCase().includes(keyword))) {
+        if (!phaseChanges.includes(phase as AgentPhase)) {
+          phaseChanges.push(phase as AgentPhase);
+        }
+      }
+    }
+
+    // Simple parsing for clarification questions
+    if (text.includes('?') && (text.toLowerCase().includes('what') ||
+        text.toLowerCase().includes('how') ||
+        text.toLowerCase().includes('which') ||
+        text.toLowerCase().includes('clarify'))) {
+      clarificationRequests.push(text.trim());
+    }
+  }
+
+  // ===== Legacy methods removed - unified approach uses executeUnifiedAutonomous =====
 
   getCircuitBreakerStatus() {
     return this.circuitBreaker.getStatus();

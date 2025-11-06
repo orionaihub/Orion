@@ -120,91 +120,142 @@ export class AutonomousAgent extends DurableObject<Env> {
       });
   }
 
-  // ===== Enhanced Complexity Analysis =====
+  // ===== Unified Autonomous Agent Methods =====
 
-  private async analyzeComplexityEnhanced(
-    query: string,
-    hasFiles: boolean
-  ): Promise<TaskComplexity> {
-    // Fast heuristics before calling LLM
-    const lowerQuery = query.toLowerCase();
-    
-    // Simple query indicators
-    const simpleIndicators = [
-      /^(hi|hello|hey|greetings)/i,
-      /^what is /i,
-      /^who is /i,
-      /^when /i,
-      /^where /i,
-      /^define /i,
-      /^explain /i,
-      /^tell me about /i,
-    ];
+  private buildUnifiedContext(state: AgentState): {
+    conversationHistory: Array<{ role: string; parts: any[] }>;
+    availableTools: string[];
+    files: FileMetadata[];
+    urlList: string[];
+  } {
+    const conversationHistory = this.buildHistory();
+    const availableTools = this.determineAvailableTools(state);
+    const files = state.context?.files ?? [];
+    const urlList = state.context?.searchResults?.map(r => r.url).filter(Boolean) ?? [];
 
-    // Complex query indicators
-    const complexIndicators = [
-      /\b(analyze|compare|calculate|process|generate|create|build)\b/i,
-      /\b(step by step|detailed|comprehensive|in-depth)\b/i,
-      /\b(multiple|several|various)\b/i,
-      hasFiles,
-      lowerQuery.includes(' and ') && lowerQuery.split(' and ').length > 2,
-    ];
+    return {
+      conversationHistory,
+      availableTools,
+      files,
+      urlList,
+    };
+  }
 
-    // Count word tokens as complexity proxy
-    const wordCount = query.split(/\s+/).length;
+  private determineAvailableTools(state: AgentState): string[] {
+    const tools: string[] = [];
 
-    // Fast path: very simple queries
-    if (simpleIndicators.some(pattern => pattern.test(query)) && wordCount < 10 && !hasFiles) {
-      this.metrics.complexityDistribution.simple++;
-      return {
-        type: 'simple',
-        requiredTools: [],
-        estimatedSteps: 1,
-        reasoning: 'Quick heuristic: simple greeting or basic question',
-        requiresFiles: false,
-        requiresCode: false,
-        requiresVision: false,
-      };
+    // Always available native tools
+    tools.push('thinking', 'search_grounding', 'url_context', 'code_execution');
+
+    // Add external tools based on context
+    if (state.context?.files && state.context.files.length > 0) {
+      tools.push('file_analysis');
+
+      // Add vision if any files are images
+      if (state.context.files.some(f => f.mimeType.startsWith('image/'))) {
+        tools.push('vision');
+      }
     }
 
-    // Fast path: obviously complex
-    const complexCount = complexIndicators.filter(ind => {
-      if (typeof ind === 'boolean') return ind;
-      return ind.test(query);
-    }).length;
-
-    if (complexCount >= 3 || wordCount > 50) {
-      this.metrics.complexityDistribution.complex++;
-      return {
-        type: 'complex',
-        requiredTools: hasFiles ? ['file_analysis', 'search'] : ['search'],
-        estimatedSteps: Math.min(Math.ceil(wordCount / 20), 8), // Cap at 8 steps
-        reasoning: 'Quick heuristic: multiple complexity indicators detected',
-        requiresFiles: hasFiles,
-        requiresCode: /\b(code|calculate|compute|run)\b/i.test(query),
-        requiresVision: /\b(image|picture|photo|visual)\b/i.test(query),
-      };
+    if (state.context?.searchResults && state.context.searchResults.length > 0) {
+      tools.push('url_context');
     }
 
-    // Use LLM for ambiguous cases
-    try {
-      const result = await this.gemini.analyzeComplexity(query, hasFiles);
-      this.metrics.complexityDistribution[result.type]++;
-      return result;
-    } catch (e) {
-      console.error('LLM complexity analysis failed:', e);
-      // Conservative fallback
-      this.metrics.complexityDistribution.simple++;
-      return {
-        type: 'simple',
-        requiredTools: [],
-        estimatedSteps: 1,
-        reasoning: 'fallback due to analysis error',
-        requiresFiles: hasFiles,
-        requiresCode: false,
-        requiresVision: false,
-      };
-    }
+    return tools;
+  }
+
+  private async processAutonomous(
+    userMsg: string,
+    ws: WebSocket | null,
+    state: AgentState
+  ): Promise<void> {
+    return this.withErrorContext('processAutonomous', async () => {
+      // Reset phase for new request
+      state.currentPhase = AgentPhase.ASSESSMENT;
+
+      const context = this.buildUnifiedContext(state);
+
+      // Execute unified autonomous process
+      const result = await this.gemini.executeUnifiedAutonomous(
+        {
+          userRequest: userMsg,
+          currentPhase: state.currentPhase,
+          conversationHistory: context.conversationHistory,
+          availableTools: context.availableTools,
+          files: context.files,
+          urlList: context.urlList,
+        },
+        (chunk) => {
+          // Stream chunks to WebSocket
+          if (ws) {
+            const batcher = this.createChunkBatcher(ws, 'chunk');
+            batcher.add(chunk);
+            batcher.flush();
+          }
+        }
+      );
+
+      // Handle phase changes
+      if (result.phaseChanges) {
+        for (const phase of result.phaseChanges) {
+          state.currentPhase = phase;
+          if (ws) {
+            this.send(ws, {
+              type: 'phase_change',
+              phase,
+              message: `Transitioning to ${phase} phase`,
+            });
+          }
+        }
+      }
+
+      // Handle clarification requests
+      if (result.clarificationRequests && result.clarificationRequests.length > 0) {
+        state.currentPhase = AgentPhase.CLARIFICATION;
+        state.clarificationContext = result.clarificationRequests[0];
+
+        if (ws) {
+          this.send(ws, {
+            type: 'clarification_request',
+            clarificationQuestion: result.clarificationRequests[0],
+          });
+        }
+      }
+
+      // Handle tool calls
+      if (result.toolCalls) {
+        for (const toolCall of result.toolCalls) {
+          if (ws) {
+            this.send(ws, {
+              type: 'tool_call',
+              toolCall,
+            });
+          }
+        }
+      }
+
+      // Save the autonomous response
+      try {
+        this.sql.exec(
+          `INSERT INTO messages (role, parts, timestamp) VALUES (?, ?, ?)`,
+          'model',
+          this.stringify([{ text: result.response }]),
+          Date.now()
+        );
+      } catch (e) {
+        console.error('Failed to save autonomous response:', e);
+      }
+
+      // Set completion phase and send final response
+      state.currentPhase = AgentPhase.COMPLETION;
+      if (ws) {
+        this.send(ws, {
+          type: 'final_response',
+          content: result.response,
+        });
+        this.send(ws, { type: 'done' });
+      }
+    });
   }
 
   // ===== State Management =====

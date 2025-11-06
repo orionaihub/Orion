@@ -32,7 +32,6 @@ interface Metrics {
   avgResponseTime: number;
   activeConnections: number;
   totalResponseTime: number;
-  complexityDistribution: { simple: number; complex: number };
 }
 
 export class AutonomousAgent extends DurableObject<Env> {

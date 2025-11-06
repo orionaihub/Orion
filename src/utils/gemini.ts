@@ -1,4 +1,4 @@
-// src/utils/gemini.ts
+// src/utils/gemini.ts - Performance Optimized
 import { GoogleGenAI } from '@google/genai';
 import type { TaskComplexity, ExecutionPlan, FileMetadata } from '../types';
 
@@ -24,14 +24,11 @@ interface ToolConfig {
   requiresUrls?: boolean;
 }
 
-/**
- * Circuit Breaker for API resilience
- */
 class CircuitBreaker {
   private failures = 0;
   private lastFailureTime = 0;
   private readonly threshold = 5;
-  private readonly resetTimeout = 60000; // 1 minute
+  private readonly resetTimeout = 60000;
 
   async execute<T>(fn: () => Promise<T>): Promise<T> {
     if (this.isOpen()) {
@@ -80,13 +77,6 @@ class CircuitBreaker {
   }
 }
 
-/**
- * GeminiClient - Enhanced GenAI wrapper with:
- * - Circuit breaker for resilience
- * - Improved streaming handling
- * - Extensible action-to-tools mapping
- * - Better error handling and context
- */
 export class GeminiClient {
   private ai: ReturnType<typeof GoogleGenAI>;
   private maxRetries = 3;
@@ -94,7 +84,6 @@ export class GeminiClient {
   private defaultTimeoutMs = 60_000;
   private circuitBreaker = new CircuitBreaker();
 
-  // Extensible action-to-tools mapping
   private readonly ACTION_TOOL_MAP: Record<string, ToolConfig> = {
     search: { tools: [{ googleSearch: {} }] },
     research: { tools: [{ googleSearch: {} }] },
@@ -128,8 +117,6 @@ export class GeminiClient {
   constructor(opts?: { apiKey?: string }) {
     this.ai = new GoogleGenAI({ apiKey: opts?.apiKey });
   }
-
-  // ===== Utilities =====
 
   private parse<T>(text: string): T | null {
     try {
@@ -210,8 +197,6 @@ export class GeminiClient {
     }
   }
 
-  // ===== Action to Tools Mapping =====
-
   private mapActionToTools(
     action: string | undefined,
     context: { hasFiles: boolean; hasUrls: boolean }
@@ -226,7 +211,6 @@ export class GeminiClient {
       return [];
     }
 
-    // Validate context requirements
     if (config.requiresFiles && !context.hasFiles) {
       console.warn(`[GeminiClient] Action ${action} requires files but none available`);
       return [];
@@ -240,8 +224,6 @@ export class GeminiClient {
     return config.tools;
   }
 
-  // ===== Content Building =====
-
   private buildContents(
     prompt: string,
     history?: Array<{ role: string; parts: any[] }>,
@@ -250,14 +232,12 @@ export class GeminiClient {
   ): any[] {
     const contents: any[] = [];
 
-    // Include history messages
     if (history && history.length) {
       for (const msg of history) {
         contents.push({ role: msg.role, parts: msg.parts });
       }
     }
 
-    // Include file parts
     if (files && files.length) {
       const fileParts = files
         .filter((f) => f && f.state === 'ACTIVE' && f.fileUri)
@@ -269,19 +249,15 @@ export class GeminiClient {
       }
     }
 
-    // Include URL context parts
     if (urlList && urlList.length) {
       const urlParts = urlList.map((u) => ({ url: u }));
       contents.push({ parts: urlParts });
     }
 
-    // Add user prompt
     contents.push({ parts: [{ text: prompt }] });
 
     return contents;
   }
-
-  // ===== Streaming Handler =====
 
   private extractTextFromChunk(chunk: any): string {
     return chunk?.text ?? chunk?.delta ?? chunk?.content?.text ?? '';
@@ -327,7 +303,6 @@ export class GeminiClient {
     let full = '';
 
     try {
-      // Primary: async iterator
       if (streamResp && Symbol.asyncIterator in streamResp) {
         for await (const chunk of streamResp) {
           const text = this.extractTextFromChunk(chunk);
@@ -343,12 +318,10 @@ export class GeminiClient {
         return full;
       }
 
-      // Secondary: ReadableStream
       if (streamResp?.reader) {
         return await this.readFromStream(streamResp.reader, onChunk);
       }
 
-      // Fallback: non-streaming response
       const result = await Promise.resolve(streamResp);
       const text = await this.extractTextFromResponse(result);
       if (text) {
@@ -367,50 +340,45 @@ export class GeminiClient {
     }
   }
 
-  // ===== Complexity Analysis =====
-
   async analyzeComplexity(query: string, hasFiles = false): Promise<TaskComplexity> {
     return this.withRetry(async () => {
-      const prompt = `Analyze this request and return JSON only:
+      const prompt = `Analyze request complexity - respond with JSON only:
 {
   "type": "simple" | "complex",
   "requiredTools": string[],
   "estimatedSteps": number,
-  "reasoning": "brief explanation",
+  "reasoning": "brief",
   "requiresFiles": boolean,
   "requiresCode": boolean,
   "requiresVision": boolean
 }
 
-Available tools: search, code_execution, file_analysis, vision, data_analysis
-
 Rules:
-- "simple": Single-step queries, direct questions, basic requests without files
-- "complex": Multi-step tasks, research, analysis, file processing, code execution
+- simple: greetings, basic questions, single-step tasks
+- complex: research, multi-step analysis, file processing
 
-Context: User ${hasFiles ? 'HAS uploaded files' : 'has NOT uploaded files'}
-
-Request: ${query}`;
+Files: ${hasFiles ? 'YES' : 'NO'}
+Query: ${query}`;
 
       const resp = await this.withTimeout(
         this.ai.models.generateContent({
           model: 'gemini-2.5-flash',
           contents: prompt,
-          config: { thinkingConfig: { thinkingBudget: 1024 } },
+          config: { thinkingConfig: { thinkingBudget: 512 } }, // Reduced budget
         }),
-        'analyzeComplexity timed out'
+        'analyzeComplexity timed out',
+        30_000 // 30s timeout
       );
 
       const text = (resp?.text ?? '') as string;
       const parsed = this.parse<TaskComplexity>(text);
       if (parsed) return parsed;
 
-      // Fallback
       return {
         type: 'simple',
         requiredTools: [],
         estimatedSteps: 1,
-        reasoning: 'fallback - could not parse model response',
+        reasoning: 'fallback',
         requiresFiles: hasFiles,
         requiresCode: false,
         requiresVision: false,
@@ -418,62 +386,56 @@ Request: ${query}`;
     });
   }
 
-  // ===== Plan Generation =====
-
-  async generatePlan(query: string, complexity: TaskComplexity, hasFiles: boolean): Promise<ExecutionPlan> {
+  // NEW: Optimized plan generation with step limit
+  async generatePlanOptimized(
+    query: string,
+    complexity: TaskComplexity,
+    hasFiles: boolean,
+    maxSteps: number = 5
+  ): Promise<ExecutionPlan> {
     return this.withRetry(async () => {
-      const prompt = `Create a detailed execution plan with sections as JSON:
+      const prompt = `Create execution plan (MAX ${maxSteps} steps) - JSON only:
 {
-  "sections": [
+  "steps": [
     {
-      "name": "Research & Setup" | "Planning" | "Implementation" | "Analysis" | "Verification",
-      "description": "Brief description",
-      "steps": [
-        {
-          "id": "step_1",
-          "description": "Specific action to take",
-          "action": "search|research|code_execute|file_analysis|vision_analysis|data_analysis|analyze|synthesize"
-        }
-      ]
+      "id": "s1",
+      "description": "concise action",
+      "action": "search|code_execute|file_analysis|analyze|synthesize"
     }
   ]
 }
 
-Context:
-- User ${hasFiles ? 'HAS uploaded files' : 'has NOT uploaded files'}
-- Complexity: ${JSON.stringify(complexity)}
+Rules:
+- Keep steps minimal and focused
+- Combine related actions
+- Use "search" for research, "analyze" for thinking, "synthesize" for final answer
+- MAX ${maxSteps} steps total
 
-Create sections in logical order: Research → Planning → Implementation → Analysis → Verification
+Context: ${hasFiles ? 'Has files' : 'No files'}
+Tools needed: ${complexity.requiredTools.join(', ') || 'none'}
 
-Request: ${query}`;
+Query: ${query}`;
 
       const resp = await this.withTimeout(
         this.ai.models.generateContent({
           model: 'gemini-2.5-flash',
           contents: prompt,
-          config: { thinkingConfig: { thinkingBudget: 2048 } },
+          config: { thinkingConfig: { thinkingBudget: 1024 } }, // Reduced budget
         }),
-        'generatePlan timed out'
+        'generatePlan timed out',
+        30_000 // 30s timeout
       );
 
       const text = (resp?.text ?? '') as string;
-      const parsed = this.parse<{ sections: any[] }>(text);
+      const parsed = this.parse<{ steps: any[] }>(text);
 
-      if (!parsed || !parsed.sections) {
+      if (!parsed || !parsed.steps) {
         return {
           steps: [
             {
-              id: 'step_1',
-              description: 'Answer the query directly',
+              id: 's1',
+              description: 'Provide direct answer',
               action: 'synthesize',
-              status: 'pending',
-            },
-          ],
-          sections: [
-            {
-              name: 'Execution',
-              description: 'Direct response',
-              steps: [],
               status: 'pending',
             },
           ],
@@ -483,31 +445,16 @@ Request: ${query}`;
         } as ExecutionPlan;
       }
 
-      // Flatten steps across sections
-      const allSteps: any[] = [];
-      const sections = parsed.sections.map((section: any) => {
-        const ssteps = (section.steps || []).map((s: any) => {
-          const step = {
-            id: s.id ?? `step_${allSteps.length + 1}`,
-            description: s.description ?? 'Step',
-            action: s.action ?? 'analyze',
-            status: 'pending' as const,
-            section: section.name,
-          };
-          allSteps.push(step);
-          return step;
-        });
-        return {
-          name: section.name,
-          description: section.description ?? '',
-          steps: ssteps,
-          status: 'pending' as const,
-        };
-      });
+      // Limit steps to maxSteps
+      const limitedSteps = parsed.steps.slice(0, maxSteps).map((s: any, i: number) => ({
+        id: s.id ?? `s${i + 1}`,
+        description: s.description ?? 'Step',
+        action: s.action ?? 'analyze',
+        status: 'pending' as const,
+      }));
 
       return {
-        steps: allSteps,
-        sections,
+        steps: limitedSteps,
         currentStepIndex: 0,
         status: 'executing',
         createdAt: Date.now(),
@@ -515,7 +462,10 @@ Request: ${query}`;
     });
   }
 
-  // ===== Simple Streaming Response =====
+  // Keep original for backward compatibility
+  async generatePlan(query: string, complexity: TaskComplexity, hasFiles: boolean): Promise<ExecutionPlan> {
+    return this.generatePlanOptimized(query, complexity, hasFiles, 8); // Default 8 steps
+  }
 
   async streamResponse(
     query: string,
@@ -530,15 +480,13 @@ Request: ${query}`;
       model: modelName,
       contents,
       config: {
-        thinkingConfig: opts?.thinkingConfig ?? { thinkingBudget: 1024 },
+        thinkingConfig: opts?.thinkingConfig ?? { thinkingBudget: 512 }, // Reduced default
         stream: true,
       },
     } as any);
 
     return await this.handleStreamedResponse(streamCall, onChunk);
   }
-
-  // ===== Execute with Configuration =====
 
   async executeWithConfig(
     prompt: string,
@@ -552,11 +500,9 @@ Request: ${query}`;
       const hasFiles = (config.files ?? []).length > 0;
       const hasUrls = (config.urlList ?? []).length > 0;
 
-      // Prefer action-based tool mapping
       if (config.stepAction) {
         tools = this.mapActionToTools(config.stepAction, { hasFiles, hasUrls });
       } else {
-        // Fallback to boolean flags
         if (config.useSearch) tools.push({ googleSearch: {} });
         if (config.useCodeExecution) tools.push({ codeExecution: {} });
         if (config.useMapsGrounding) tools.push({ googleMaps: {} });
@@ -572,25 +518,21 @@ Request: ${query}`;
         model: config.model ?? 'gemini-2.5-flash',
         contents,
         config: {
-          thinkingConfig: config.thinkingConfig ?? { thinkingBudget: 1024 },
+          thinkingConfig: config.thinkingConfig ?? { thinkingBudget: 512 }, // Reduced default
           tools: tools.length ? tools : undefined,
           stream: config.stream === true,
         },
       } as any);
 
-      // Handle streaming if requested
       if (config.stream === true) {
         return await this.handleStreamedResponse(call, onChunk);
       }
 
-      // Non-streaming
       const resp = await this.withTimeout(call, 'executeWithConfig timed out', config.timeoutMs);
       const text = (resp?.text ?? '') as string;
       return text || '[no-result]';
     });
   }
-
-  // ===== Synthesis =====
 
   async synthesize(
     originalQuery: string,
@@ -598,28 +540,27 @@ Request: ${query}`;
     history: Array<{ role: string; parts: any[] }>
   ): Promise<string> {
     return this.withRetry(async () => {
-      const prompt = `Original Request: ${originalQuery}
+      const prompt = `Request: ${originalQuery}
 
-Step Results:
-${stepResults.map((s, i) => `Step ${i + 1} - ${s.description}:\n${s.result}`).join('\n\n')}
+Results:
+${stepResults.map((s, i) => `${i + 1}. ${s.description}: ${s.result.substring(0, 300)}`).join('\n')}
 
-Task: Synthesize these results into a comprehensive, well-structured answer. Be clear, detailed, and directly address the original request.`;
+Provide comprehensive answer:`;
 
       const resp = await this.withTimeout(
         this.ai.models.generateContent({
           model: 'gemini-2.5-flash',
           contents: prompt,
-          config: { thinkingConfig: { thinkingBudget: 2048 } },
+          config: { thinkingConfig: { thinkingBudget: 1024 } },
         }),
-        'synthesize timed out'
+        'synthesize timed out',
+        45_000 // 45s timeout
       );
 
       const text = (resp?.text ?? '') as string;
       return text || '[no-answer]';
     });
   }
-
-  // ===== Status =====
 
   getCircuitBreakerStatus() {
     return this.circuitBreaker.getStatus();

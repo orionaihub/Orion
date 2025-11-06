@@ -1,4 +1,4 @@
-// src/autonomous-agent.ts - Performance Optimized
+// src/autonomous-agent.ts - Unified Autonomous Agent
 import { DurableObject } from 'cloudflare:workers';
 import type { DurableObjectState } from '@cloudflare/workers-types';
 import GeminiClient from './utils/gemini';
@@ -6,10 +6,10 @@ import type {
   Env,
   AgentState,
   Message,
-  ExecutionPlan,
-  PlanStep,
-  TaskComplexity,
   FileMetadata,
+  AutonomousMode,
+  AgentPhase,
+  WebSocketMessage,
 } from './types';
 
 interface SqlStorage {

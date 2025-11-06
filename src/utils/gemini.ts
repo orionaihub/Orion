@@ -1,31 +1,140 @@
 // src/utils/gemini.ts
 import { GoogleGenAI } from '@google/genai';
 import type { TaskComplexity, ExecutionPlan, FileMetadata } from '../types';
-import type { ExecutionConfig } from '../tools';
+
+export interface ExecutionConfig {
+  model?: string;
+  stream?: boolean;
+  timeoutMs?: number;
+  thinkingConfig?: { thinkingBudget: number };
+  files?: FileMetadata[];
+  urlList?: string[];
+  useSearch?: boolean;
+  useCodeExecution?: boolean;
+  useMapsGrounding?: boolean;
+  useUrlContext?: boolean;
+  allowComputerUse?: boolean;
+  useVision?: boolean;
+  stepAction?: string;
+}
+
+interface ToolConfig {
+  tools: Array<Record<string, unknown>>;
+  requiresFiles?: boolean;
+  requiresUrls?: boolean;
+}
 
 /**
- * GeminiClient - GenAI wrapper (genai@0.28.0) with:
- * - files upload/get/delete
- * - streaming support (async iterator / reader / fallback)
- * - dynamic tools mapping per action
- * - thinkingConfig budgets
- * - executeWithConfig supports streaming via onChunk callback
+ * Circuit Breaker for API resilience
+ */
+class CircuitBreaker {
+  private failures = 0;
+  private lastFailureTime = 0;
+  private readonly threshold = 5;
+  private readonly resetTimeout = 60000; // 1 minute
+
+  async execute<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.isOpen()) {
+      throw new Error('Circuit breaker open - too many recent failures');
+    }
+
+    try {
+      const result = await fn();
+      this.onSuccess();
+      return result;
+    } catch (e) {
+      this.onFailure();
+      throw e;
+    }
+  }
+
+  private isOpen(): boolean {
+    if (this.failures >= this.threshold) {
+      if (Date.now() - this.lastFailureTime > this.resetTimeout) {
+        this.reset();
+        return false;
+      }
+      return true;
+    }
+    return false;
+  }
+
+  private onSuccess(): void {
+    this.failures = 0;
+  }
+
+  private onFailure(): void {
+    this.failures++;
+    this.lastFailureTime = Date.now();
+  }
+
+  private reset(): void {
+    this.failures = 0;
+  }
+
+  getStatus(): { failures: number; isOpen: boolean } {
+    return {
+      failures: this.failures,
+      isOpen: this.isOpen(),
+    };
+  }
+}
+
+/**
+ * GeminiClient - Enhanced GenAI wrapper with:
+ * - Circuit breaker for resilience
+ * - Improved streaming handling
+ * - Extensible action-to-tools mapping
+ * - Better error handling and context
  */
 export class GeminiClient {
   private ai: ReturnType<typeof GoogleGenAI>;
   private maxRetries = 3;
   private baseBackoff = 1000;
   private defaultTimeoutMs = 60_000;
+  private circuitBreaker = new CircuitBreaker();
+
+  // Extensible action-to-tools mapping
+  private readonly ACTION_TOOL_MAP: Record<string, ToolConfig> = {
+    search: { tools: [{ googleSearch: {} }] },
+    research: { tools: [{ googleSearch: {} }] },
+    code_execute: { tools: [{ codeExecution: {} }] },
+    code: { tools: [{ codeExecution: {} }] },
+    file_analysis: {
+      tools: [{ fileAnalysis: {} }],
+      requiresFiles: true,
+    },
+    file: {
+      tools: [{ fileAnalysis: {} }],
+      requiresFiles: true,
+    },
+    vision_analysis: { tools: [{ vision: {} }] },
+    vision: { tools: [{ vision: {} }] },
+    maps: { tools: [{ googleMaps: {} }] },
+    url_context: {
+      tools: [{ urlContext: {} }],
+      requiresUrls: true,
+    },
+    url_analysis: {
+      tools: [{ urlContext: {} }],
+      requiresUrls: true,
+    },
+    computer: { tools: [{ computerUse: {} }] },
+    data_analysis: { tools: [{ codeExecution: {} }] },
+    synthesize: { tools: [] },
+    analyze: { tools: [] },
+  };
 
   constructor(opts?: { apiKey?: string }) {
     this.ai = new GoogleGenAI({ apiKey: opts?.apiKey });
   }
 
-  // ----- Utilities -----
+  // ===== Utilities =====
+
   private parse<T>(text: string): T | null {
     try {
       if (!text) return null;
-      const trimmed = (text as string).trim().replace(/^```json\s*/, '').replace(/```$/, '');
+      const trimmed = text.trim().replace(/^```json\s*/, '').replace(/```$/, '');
       if (!trimmed) return null;
       return JSON.parse(trimmed) as T;
     } catch (e) {
@@ -38,11 +147,11 @@ export class GeminiClient {
     let lastErr: any;
     for (let i = 0; i < this.maxRetries; i++) {
       try {
-        return await fn();
+        return await this.circuitBreaker.execute(fn);
       } catch (err) {
         lastErr = err;
         if (i < this.maxRetries - 1) {
-          const delay = this.baseBackoff * (2 ** i);
+          const delay = this.baseBackoff * 2 ** i;
           await new Promise((r) => setTimeout(r, delay));
         }
       }
@@ -55,10 +164,11 @@ export class GeminiClient {
     return Promise.race([
       promise,
       new Promise<T>((_, reject) => setTimeout(() => reject(new Error(errorMsg)), tm)),
-    ]) as Promise<T>;
+    ]);
   }
 
-  // ----- Files API -----
+  // ===== Files API =====
+
   async uploadFile(fileDataBase64: string, mimeType: string, displayName: string): Promise<FileMetadata> {
     return this.withRetry(async () => {
       const buffer = Buffer.from(fileDataBase64, 'base64');
@@ -74,7 +184,7 @@ export class GeminiClient {
         name: meta.displayName ?? displayName,
         sizeBytes: meta.sizeBytes ?? buffer.length,
         uploadedAt: Date.now(),
-        state: meta.state as any,
+        state: (meta.state as any) ?? 'ACTIVE',
         expiresAt: meta.expirationTime ? new Date(meta.expirationTime).getTime() : undefined,
       } as FileMetadata;
     });
@@ -100,136 +210,165 @@ export class GeminiClient {
     }
   }
 
-  // ----- Action -> Tools mapping -----
-  // Map a plan step action to the tools that should be enabled for that step.
-  private mapActionToTools(action: string | undefined): Array<Record<string, unknown>> {
-    // default mappings - extend as needed
-    const mapping: Record<string, Array<Record<string, unknown>>> = {
-      search: [{ googleSearch: {} }],
-      code_execute: [{ codeExecution: {} }],
-      code: [{ codeExecution: {} }],
-      file_analysis: [{ fileAnalysis: {} }],
-      file: [{ fileAnalysis: {} }],
-      vision_analysis: [{ vision: {} }],
-      vision: [{ vision: {} }],
-      maps: [{ googleMaps: {} }],
-      url_context: [{ urlContext: {} }],
-      computer: [{ computerUse: {} }],
-      synthesize: [], // no tools required
-      analyze: [], // pure reasoning
-    };
+  // ===== Action to Tools Mapping =====
 
+  private mapActionToTools(
+    action: string | undefined,
+    context: { hasFiles: boolean; hasUrls: boolean }
+  ): Array<Record<string, unknown>> {
     if (!action) return [];
+
     const key = action.toLowerCase().trim();
-    return mapping[key] ?? [];
+    const config = this.ACTION_TOOL_MAP[key];
+
+    if (!config) {
+      console.warn(`[GeminiClient] Unknown action: ${action}`);
+      return [];
+    }
+
+    // Validate context requirements
+    if (config.requiresFiles && !context.hasFiles) {
+      console.warn(`[GeminiClient] Action ${action} requires files but none available`);
+      return [];
+    }
+
+    if (config.requiresUrls && !context.hasUrls) {
+      console.warn(`[GeminiClient] Action ${action} requires URLs but none available`);
+      return [];
+    }
+
+    return config.tools;
   }
 
-  // ----- Build contents (history, files, urls, prompt) -----
+  // ===== Content Building =====
+
   private buildContents(
     prompt: string,
     history?: Array<{ role: string; parts: any[] }>,
     files?: FileMetadata[],
     urlList?: string[]
-  ) {
+  ): any[] {
     const contents: any[] = [];
 
-    // include history messages as content entries (if provided)
+    // Include history messages
     if (history && history.length) {
       for (const msg of history) {
         contents.push({ role: msg.role, parts: msg.parts });
       }
     }
 
-    // include file parts (if present)
+    // Include file parts
     if (files && files.length) {
       const fileParts = files
         .filter((f) => f && f.state === 'ACTIVE' && f.fileUri)
-        .map((f) => ({ file_data: { mime_type: f.mimeType, file_uri: f.fileUri } }));
-      if (fileParts.length) contents.push({ parts: fileParts });
+        .map((f) => ({
+          file_data: { mime_type: f.mimeType, file_uri: f.fileUri },
+        }));
+      if (fileParts.length) {
+        contents.push({ parts: fileParts });
+      }
     }
 
-    // include URL context parts
+    // Include URL context parts
     if (urlList && urlList.length) {
       const urlParts = urlList.map((u) => ({ url: u }));
       contents.push({ parts: urlParts });
     }
 
-    // finally add the user prompt text
+    // Add user prompt
     contents.push({ parts: [{ text: prompt }] });
 
     return contents;
   }
 
-  // ----- Streaming helper -----
-  /**
-   * Handles streaming responses from genai models:
-   * - async iterator (chunked object stream)
-   * - .reader() ReadableStream (Cloudflare Worker style)
-   * - fallback to single response
-   *
-   * Calls onChunk for each text chunk and returns the concatenated text.
-   */
-  private async handleStreamedResponse(
-    streamResp: any,
+  // ===== Streaming Handler =====
+
+  private extractTextFromChunk(chunk: any): string {
+    return chunk?.text ?? chunk?.delta ?? chunk?.content?.text ?? '';
+  }
+
+  private async extractTextFromResponse(response: any): Promise<string> {
+    if (typeof response?.text === 'string') return response.text;
+    if (typeof response?.text === 'function') return await response.text();
+    if (response?.response?.text) {
+      return typeof response.response.text === 'function'
+        ? await response.response.text()
+        : response.response.text;
+    }
+    return '';
+  }
+
+  private async readFromStream(
+    reader: ReadableStreamDefaultReader<Uint8Array>,
     onChunk?: (text: string) => void
   ): Promise<string> {
     let full = '';
+    const decoder = new TextDecoder();
 
-    // If the SDK returned an async iterable (generator)
-    if (streamResp && typeof streamResp[Symbol.asyncIterator] === 'function') {
-      for await (const evt of streamResp as AsyncIterable<any>) {
-        // many SDK chunks include .text or .delta or .candidates
-        const txt = (evt?.text ?? evt?.delta ?? '') as string;
-        if (txt) {
-          full += txt;
-          try { if (onChunk) onChunk(txt); } catch (e) { /* swallow onChunk errors */ }
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      const text = decoder.decode(value, { stream: true });
+      if (text) {
+        full += text;
+        try {
+          if (onChunk) onChunk(text);
+        } catch (e) {
+          console.warn('[GeminiClient] onChunk error:', e);
         }
       }
-      return full;
-    }
-
-    // If the SDK returned an object with a reader (ReadableStream from Worker)
-    if (streamResp && typeof streamResp.reader === 'object') {
-      const reader = streamResp.reader;
-      const dec = new TextDecoder();
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        const txt = dec.decode(value, { stream: true });
-        if (txt) {
-          full += txt;
-          try { if (onChunk) onChunk(txt); } catch (e) { /* swallow */ }
-        }
-      }
-      return full;
-    }
-
-    // If the SDK returned a promise-like response (non-stream)
-    try {
-      const res = await streamResp;
-      // response objects sometimes expose .text or .response.text()
-      const text = (res?.text ?? (res?.response && typeof res.response.text === 'function' ? await res.response.text() : undefined)) as string | undefined;
-      const txt = text ?? '';
-      if (txt) {
-        full += txt;
-        try { if (onChunk) onChunk(txt); } catch (e) { /* swallow */ }
-      }
-      return full;
-    } catch (e) {
-      // Last resort: try to read .response candidates
-      try {
-        const maybeText = (streamResp?.response?.text && await streamResp.response.text()) ?? '';
-        if (maybeText) {
-          full += maybeText;
-          if (onChunk) onChunk(maybeText);
-        }
-      } catch (_) { /* noop */ }
     }
 
     return full;
   }
 
-  // ----- Complexity analysis -----
+  private async handleStreamedResponse(streamResp: any, onChunk?: (text: string) => void): Promise<string> {
+    let full = '';
+
+    try {
+      // Primary: async iterator
+      if (streamResp && Symbol.asyncIterator in streamResp) {
+        for await (const chunk of streamResp) {
+          const text = this.extractTextFromChunk(chunk);
+          if (text) {
+            full += text;
+            try {
+              if (onChunk) onChunk(text);
+            } catch (e) {
+              console.warn('[GeminiClient] onChunk error:', e);
+            }
+          }
+        }
+        return full;
+      }
+
+      // Secondary: ReadableStream
+      if (streamResp?.reader) {
+        return await this.readFromStream(streamResp.reader, onChunk);
+      }
+
+      // Fallback: non-streaming response
+      const result = await Promise.resolve(streamResp);
+      const text = await this.extractTextFromResponse(result);
+      if (text) {
+        full = text;
+        try {
+          if (onChunk) onChunk(text);
+        } catch (e) {
+          console.warn('[GeminiClient] onChunk error:', e);
+        }
+      }
+
+      return full;
+    } catch (e) {
+      console.error('[GeminiClient] Stream handling failed:', e);
+      throw e;
+    }
+  }
+
+  // ===== Complexity Analysis =====
+
   async analyzeComplexity(query: string, hasFiles = false): Promise<TaskComplexity> {
     return this.withRetry(async () => {
       const prompt = `Analyze this request and return JSON only:
@@ -257,22 +396,21 @@ Request: ${query}`;
         this.ai.models.generateContent({
           model: 'gemini-2.5-flash',
           contents: prompt,
-          config: { thinkingConfig: { thinkingBudget: 1024 } }, // moderate budget
+          config: { thinkingConfig: { thinkingBudget: 1024 } },
         }),
         'analyzeComplexity timed out'
       );
 
-      // attempt to extract text
       const text = (resp?.text ?? '') as string;
       const parsed = this.parse<TaskComplexity>(text);
       if (parsed) return parsed;
 
-      // fallback
+      // Fallback
       return {
         type: 'simple',
         requiredTools: [],
         estimatedSteps: 1,
-        reasoning: 'fallback - could not parse model JSON',
+        reasoning: 'fallback - could not parse model response',
         requiresFiles: hasFiles,
         requiresCode: false,
         requiresVision: false,
@@ -280,7 +418,8 @@ Request: ${query}`;
     });
   }
 
-  // ----- Plan generation -----
+  // ===== Plan Generation =====
+
   async generatePlan(query: string, complexity: TaskComplexity, hasFiles: boolean): Promise<ExecutionPlan> {
     return this.withRetry(async () => {
       const prompt = `Create a detailed execution plan with sections as JSON:
@@ -312,24 +451,39 @@ Request: ${query}`;
         this.ai.models.generateContent({
           model: 'gemini-2.5-flash',
           contents: prompt,
-          config: { thinkingConfig: { thinkingBudget: 2048 } }, // larger budget for planning
+          config: { thinkingConfig: { thinkingBudget: 2048 } },
         }),
         'generatePlan timed out'
       );
 
       const text = (resp?.text ?? '') as string;
       const parsed = this.parse<{ sections: any[] }>(text);
+
       if (!parsed || !parsed.sections) {
         return {
-          steps: [{ id: 'step_1', description: 'Answer the query directly', action: 'synthesize', status: 'pending' }],
-          sections: [{ name: 'Execution', description: 'Direct response', steps: [], status: 'pending' }],
+          steps: [
+            {
+              id: 'step_1',
+              description: 'Answer the query directly',
+              action: 'synthesize',
+              status: 'pending',
+            },
+          ],
+          sections: [
+            {
+              name: 'Execution',
+              description: 'Direct response',
+              steps: [],
+              status: 'pending',
+            },
+          ],
           currentStepIndex: 0,
           status: 'executing',
           createdAt: Date.now(),
         } as ExecutionPlan;
       }
 
-      // flatten steps across sections
+      // Flatten steps across sections
       const allSteps: any[] = [];
       const sections = parsed.sections.map((section: any) => {
         const ssteps = (section.steps || []).map((s: any) => {
@@ -343,7 +497,12 @@ Request: ${query}`;
           allSteps.push(step);
           return step;
         });
-        return { name: section.name, description: section.description ?? '', steps: ssteps, status: 'pending' as const };
+        return {
+          name: section.name,
+          description: section.description ?? '',
+          steps: ssteps,
+          status: 'pending' as const,
+        };
       });
 
       return {
@@ -356,11 +515,8 @@ Request: ${query}`;
     });
   }
 
-  // ----- Streamed response (simple chat or streaming-enabled calls) -----
-  /**
-   * streamResponse: convenience wrapper to stream a plain query + history
-   * Calls onChunk for each text fragment and returns concatenated text.
-   */
+  // ===== Simple Streaming Response =====
+
   async streamResponse(
     query: string,
     history: Array<{ role: string; parts: any[] }>,
@@ -379,32 +535,11 @@ Request: ${query}`;
       },
     } as any);
 
-    // The SDK can return an async iterable or a stream object - handle both
-    const full = await this.handleStreamedResponse(streamCall, onChunk);
-    return full;
+    return await this.handleStreamedResponse(streamCall, onChunk);
   }
 
-  // ----- executeWithConfig (dynamic tools, supports streaming via onChunk) -----
-  /**
-   * executeWithConfig:
-   * - prompt: the prompt text
-   * - history: prior messages
-   * - config: ExecutionConfig - expected fields:
-   *     files?: FileMetadata[]
-   *     urlList?: string[]
-   *     useSearch?: boolean
-   *     useCodeExecution?: boolean
-   *     useMapsGrounding?: boolean
-   *     useUrlContext?: boolean
-   *     allowComputerUse?: boolean
-   *     thinkingConfig?: object
-   *     model?: string
-   *     stream?: boolean
-   *     timeoutMs?: number
-   * - onChunk?: callback invoked per streamed chunk
-   *
-   * Returns concatenated text result.
-   */
+  // ===== Execute with Configuration =====
+
   async executeWithConfig(
     prompt: string,
     history: Array<{ role: string; parts: any[] }>,
@@ -412,22 +547,23 @@ Request: ${query}`;
     onChunk?: (text: string) => void
   ): Promise<string> {
     return this.withRetry(async () => {
-      // Build tools list:
       let tools: Array<Record<string, unknown>> = [];
 
-      // Prefer dynamic mapping per planned action: if config.stepAction specified, map accordingly.
-      // Otherwise, fall back to booleans.
-      if ((config as any).stepAction) {
-        tools = this.mapActionToTools((config as any).stepAction);
+      const hasFiles = (config.files ?? []).length > 0;
+      const hasUrls = (config.urlList ?? []).length > 0;
+
+      // Prefer action-based tool mapping
+      if (config.stepAction) {
+        tools = this.mapActionToTools(config.stepAction, { hasFiles, hasUrls });
       } else {
+        // Fallback to boolean flags
         if (config.useSearch) tools.push({ googleSearch: {} });
         if (config.useCodeExecution) tools.push({ codeExecution: {} });
         if (config.useMapsGrounding) tools.push({ googleMaps: {} });
-        if (config.useUrlContext && config.urlList && config.urlList.length) tools.push({ urlContext: {} });
+        if (config.useUrlContext && hasUrls) tools.push({ urlContext: {} });
         if (config.allowComputerUse) tools.push({ computerUse: {} });
-        if (config.files && config.files.length) tools.push({ fileAnalysis: {} }); // allow file analysis if files supplied
-        // vision not automatically added - only enable if stepAction or caller sets it in config
-        if ((config as any).useVision) tools.push({ vision: {} });
+        if (hasFiles) tools.push({ fileAnalysis: {} });
+        if (config.useVision) tools.push({ vision: {} });
       }
 
       const contents = this.buildContents(prompt, history, config.files ?? [], config.urlList ?? []);
@@ -442,20 +578,20 @@ Request: ${query}`;
         },
       } as any);
 
-      // If streaming requested, use streaming handler
+      // Handle streaming if requested
       if (config.stream === true) {
-        const streamed = await this.handleStreamedResponse(call, onChunk);
-        return streamed;
+        return await this.handleStreamedResponse(call, onChunk);
       }
 
-      // Non-streaming: await final response
+      // Non-streaming
       const resp = await this.withTimeout(call, 'executeWithConfig timed out', config.timeoutMs);
       const text = (resp?.text ?? '') as string;
-      return text ?? '[no-result]';
+      return text || '[no-result]';
     });
   }
 
-  // ----- Synthesis -----
+  // ===== Synthesis =====
+
   async synthesize(
     originalQuery: string,
     stepResults: Array<{ description: string; result: string }>,
@@ -479,8 +615,14 @@ Task: Synthesize these results into a comprehensive, well-structured answer. Be 
       );
 
       const text = (resp?.text ?? '') as string;
-      return text ?? '[no-answer]';
+      return text || '[no-answer]';
     });
+  }
+
+  // ===== Status =====
+
+  getCircuitBreakerStatus() {
+    return this.circuitBreaker.getStatus();
   }
 }
 

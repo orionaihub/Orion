@@ -12,20 +12,51 @@ import type {
   FileMetadata,
 } from './types';
 
-// NOTE: SqlStorage type is provided by Workers' Durable Object sqlite integration in your repo.
-// If the name differs, adapt accordingly.
-type SqlStorage = any;
+// SQLite storage interface
+interface SqlStorage {
+  exec(query: string, ...params: any[]): {
+    one(): any;
+    toArray(): any[];
+    [Symbol.iterator](): Iterator<any>;
+  };
+  prepare?(query: string): {
+    run(...params: any[]): void;
+    one(...params: any[]): any;
+    all(...params: any[]): any[];
+  };
+}
+
+interface StepExecutionOptions {
+  continueOnFailure?: boolean;
+  maxRetries?: number;
+}
+
+interface Metrics {
+  requestCount: number;
+  errorCount: number;
+  avgResponseTime: number;
+  activeConnections: number;
+  totalResponseTime: number;
+}
 
 export class AutonomousAgent extends DurableObject<Env> {
   private sql: SqlStorage;
   private gemini: GeminiClient;
-  private maxHistoryMessages = 200; // keep history manageable for Workers (tweak as needed)
+  private maxHistoryMessages = 200;
+  private readonly MAX_MESSAGE_SIZE = 100_000; // chars
+  private readonly MAX_TOTAL_HISTORY_SIZE = 500_000; // chars
+  private activeWebSockets = new Set<WebSocket>();
+  private metrics: Metrics = {
+    requestCount: 0,
+    errorCount: 0,
+    avgResponseTime: 0,
+    activeConnections: 0,
+    totalResponseTime: 0,
+  };
 
   constructor(state: DurableObjectState, env: Env) {
     super(state, env);
-    // Durable Object helpers available off this.ctx in your codebase (preserved behavior)
-    // state.storage.sql used for SQLite
-    this.sql = state.storage.sql;
+    this.sql = state.storage.sql as SqlStorage;
     this.gemini = new GeminiClient({ apiKey: env.GEMINI_API_KEY });
 
     // Initialize SQLite tables if not present
@@ -48,14 +79,15 @@ export class AutonomousAgent extends DurableObject<Env> {
     }
   }
 
-  // JSON helpers
+  // ===== Utility Methods =====
+
   private parse<T>(text: string): T | null {
     try {
       const trimmed = String(text || '').trim().replace(/^```json\s*/, '').replace(/```$/, '');
       if (!trimmed) return null;
       return JSON.parse(trimmed) as T;
     } catch (e) {
-      console.error('JSON parse failed:', e, 'Raw:', text);
+      console.error('JSON parse failed:', e);
       return null;
     }
   }
@@ -64,7 +96,35 @@ export class AutonomousAgent extends DurableObject<Env> {
     return JSON.stringify(obj);
   }
 
-  // Load state (from kv table)
+  private async withErrorContext<T>(operation: string, fn: () => Promise<T>): Promise<T> {
+    try {
+      return await fn();
+    } catch (e) {
+      const error = e instanceof Error ? e : new Error(String(e));
+      error.message = `[${operation}] ${error.message}`;
+      throw error;
+    }
+  }
+
+  private trackRequest<T>(fn: () => Promise<T>): Promise<T> {
+    const start = Date.now();
+    this.metrics.requestCount++;
+
+    return fn()
+      .then((result) => {
+        const duration = Date.now() - start;
+        this.metrics.totalResponseTime += duration;
+        this.metrics.avgResponseTime = this.metrics.totalResponseTime / this.metrics.requestCount;
+        return result;
+      })
+      .catch((e) => {
+        this.metrics.errorCount++;
+        throw e;
+      });
+  }
+
+  // ===== State Management with Transaction Support =====
+
   private async loadState(): Promise<AgentState> {
     let state: AgentState | null = null;
     try {
@@ -77,43 +137,131 @@ export class AutonomousAgent extends DurableObject<Env> {
     }
 
     if (!state || !state.sessionId) {
-      // create default state
       state = {
         conversationHistory: [],
         context: { files: [], searchResults: [] },
-        sessionId: (this.ctx?.id?.toString ? this.ctx.id.toString() : Date.now().toString()),
+        sessionId: this.ctx?.id?.toString ? this.ctx.id.toString() : Date.now().toString(),
         lastActivityAt: Date.now(),
         currentPlan: undefined,
       } as AgentState;
     }
+
+    // Check memory pressure
+    await this.checkMemoryPressure();
+
     return state;
   }
 
-  // Save state (use blockConcurrencyWhile to avoid races)
   private async saveState(state: AgentState): Promise<void> {
     try {
-      await this.ctx.blockConcurrencyWhile(async () => {
-        this.sql.exec(
-          `INSERT INTO kv (key, value) VALUES ('state', ?) 
-           ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
-          this.stringify(state)
-        );
-      });
+      const stateStr = this.stringify(state);
+      this.sql.exec(
+        `INSERT INTO kv (key, value) VALUES ('state', ?) 
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+        stateStr
+      );
     } catch (e) {
       console.error('saveState failed:', e);
     }
   }
 
-  // HTTP fetch handler
+  private async withStateTransaction<T>(fn: (state: AgentState) => Promise<T>): Promise<T> {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      const state = await this.loadState();
+      const result = await fn(state);
+      await this.saveState(state);
+      return result;
+    });
+  }
+
+  // ===== Memory Management =====
+
+  private estimateHistorySize(): number {
+    try {
+      const result = this.sql.exec(`SELECT SUM(LENGTH(parts)) as total FROM messages`).one();
+      return result?.total ?? 0;
+    } catch (e) {
+      console.warn('Failed to estimate history size:', e);
+      return 0;
+    }
+  }
+
+  private async checkMemoryPressure(): Promise<void> {
+    const historySize = this.estimateHistorySize();
+    if (historySize > this.MAX_TOTAL_HISTORY_SIZE) {
+      console.warn(`History size ${historySize} exceeds limit, trimming`);
+      await this.trimHistoryIfNeeded();
+    }
+  }
+
+  private async trimHistoryIfNeeded(): Promise<void> {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      try {
+        const count = this.sql.exec(`SELECT COUNT(1) as c FROM messages`).one()?.c ?? 0;
+        if (count > this.maxHistoryMessages) {
+          const toKeep = this.maxHistoryMessages;
+          this.sql.exec(
+            `DELETE FROM messages 
+             WHERE id NOT IN (
+               SELECT id FROM messages 
+               ORDER BY timestamp DESC 
+               LIMIT ?
+             )`,
+            toKeep
+          );
+          console.log(`Trimmed history: kept ${toKeep} messages`);
+        }
+      } catch (e) {
+        console.error('History truncation failed:', e);
+      }
+    });
+  }
+
+  // ===== WebSocket Management =====
+
+  private send(ws: WebSocket | null, data: unknown): void {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    try {
+      ws.send(this.stringify(data));
+    } catch (e) {
+      console.error('WebSocket send failed:', e);
+    }
+  }
+
+  private createChunkBatcher(ws: WebSocket | null, type: string, flushInterval = 50) {
+    let buffer = '';
+    let timer: ReturnType<typeof setTimeout> | null = null;
+
+    const flush = () => {
+      if (buffer && ws) {
+        this.send(ws, { type, content: buffer });
+        buffer = '';
+      }
+      timer = null;
+    };
+
+    return {
+      add: (chunk: string) => {
+        buffer += chunk;
+        if (!timer) {
+          timer = setTimeout(flush, flushInterval);
+        }
+      },
+      flush,
+    };
+  }
+
+  // ===== HTTP Fetch Handler =====
+
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
 
     if (url.pathname === '/api/ws' && request.headers.get('Upgrade')?.toLowerCase() === 'websocket') {
-      // WebSocket upgrade for realtime streaming
       const pair = new WebSocketPair();
       const [client, server] = Object.values(pair);
-      // Accept on server side
       this.ctx.acceptWebSocket(server);
+      this.activeWebSockets.add(server);
+      this.metrics.activeConnections = this.activeWebSockets.size;
       return new Response(null, { status: 101, webSocket: client });
     }
 
@@ -121,13 +269,19 @@ export class AutonomousAgent extends DurableObject<Env> {
     if (url.pathname === '/api/history' && request.method === 'GET') return this.getHistory();
     if (url.pathname === '/api/clear' && request.method === 'POST') return this.clearHistory();
     if (url.pathname === '/api/status' && request.method === 'GET') return this.getStatus();
+    if (url.pathname === '/api/metrics' && request.method === 'GET') return this.getMetrics();
 
     return new Response('Not found', { status: 404 });
   }
 
-  // WebSocket message handler (Cloudflare DO auto-calls webSocketMessage)
-  async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer) {
+  // ===== WebSocket Handlers =====
+
+  async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
     if (typeof message !== 'string') return;
+    if (ws.readyState !== WebSocket.OPEN) {
+      console.warn('WebSocket not open, discarding message');
+      return;
+    }
 
     let payload: any;
     try {
@@ -138,9 +292,8 @@ export class AutonomousAgent extends DurableObject<Env> {
     }
 
     if (payload.type === 'user_message' && typeof payload.content === 'string') {
-      // Process in background, notify on failures
       this.ctx.waitUntil(
-        this.process(payload.content, ws).catch((err) => {
+        this.trackRequest(() => this.process(payload.content, ws)).catch((err) => {
           console.error('WebSocket process failed:', err);
           this.send(ws, { type: 'error', error: 'Processing failed' });
         })
@@ -150,102 +303,105 @@ export class AutonomousAgent extends DurableObject<Env> {
     }
   }
 
-  private send(ws: WebSocket, data: unknown) {
-    try {
-      ws.send(this.stringify(data));
-    } catch (e) {
-      console.error('WebSocket send failed:', e);
-    }
+  async webSocketClose(ws: WebSocket, code: number, reason: string): Promise<void> {
+    console.log(`WebSocket closed: ${code} - ${reason}`);
+    this.activeWebSockets.delete(ws);
+    this.metrics.activeConnections = this.activeWebSockets.size;
   }
 
-  // Top-level process: save user, analyze complexity, branch simple vs complex
-  private async process(userMsg: string, ws: WebSocket | null) {
-    // Load and update state
-    let state = await this.loadState();
-    state.lastActivityAt = Date.now();
+  async webSocketError(ws: WebSocket, error: unknown): Promise<void> {
+    console.error('WebSocket error:', error);
+    this.activeWebSockets.delete(ws);
+    this.metrics.activeConnections = this.activeWebSockets.size;
+  }
 
-    // Save user message to DB
-    try {
-      this.sql.exec(
-        `INSERT INTO messages (role, parts, timestamp) VALUES (?, ?, ?)`,
-        'user',
-        this.stringify([{ text: userMsg }]),
-        Date.now()
-      );
-    } catch (e) {
-      console.error('Failed to save user message:', e);
-      if (ws) this.send(ws, { type: 'error', error: 'Save failed' });
-      return;
-    }
+  // ===== Core Processing Logic =====
 
-    // Trim history if too large (simple truncation)
-    try {
-      const count = this.sql.exec(`SELECT COUNT(1) as c FROM messages`).one()?.c ?? 0;
-      if (count > this.maxHistoryMessages) {
-        // delete oldest messages to keep last maxHistoryMessages
-        const toDrop = count - this.maxHistoryMessages;
-        try {
-          this.sql.exec(
-            `DELETE FROM messages WHERE id IN (SELECT id FROM messages ORDER BY timestamp ASC LIMIT ?)`,
-            toDrop
-          );
-        } catch (e) {
-          console.warn('History truncation failed:', e);
-        }
+  private async process(userMsg: string, ws: WebSocket | null): Promise<void> {
+    return this.withStateTransaction(async (state) => {
+      state.lastActivityAt = Date.now();
+
+      // Validate message size
+      if (userMsg.length > this.MAX_MESSAGE_SIZE) {
+        if (ws) this.send(ws, { type: 'error', error: 'Message too large' });
+        throw new Error('Message exceeds maximum size');
       }
-    } catch (e) {
-      // ignore
-    }
 
-    // Analyze complexity using Gemini client
-    let complexity: TaskComplexity;
-    try {
-      complexity = await this.gemini.analyzeComplexity(userMsg, (state.context?.files ?? []).length > 0);
-    } catch (e) {
-      console.error('Complexity analysis failed:', e);
-      complexity = { type: 'simple', requiredTools: [], estimatedSteps: 1, reasoning: 'error' };
-    }
-
-    try {
-      if (complexity.type === 'simple') {
-        await this.handleSimple(userMsg, ws, state);
-      } else {
-        await this.handleComplex(userMsg, complexity, ws, state);
-      }
-    } catch (e) {
-      console.error('Process error:', e);
-      if (ws) this.send(ws, { type: 'error', error: 'Processing failed' });
-    } finally {
-      // persist state safely
+      // Save user message
       try {
-        await this.saveState(state);
+        this.sql.exec(
+          `INSERT INTO messages (role, parts, timestamp) VALUES (?, ?, ?)`,
+          'user',
+          this.stringify([{ text: userMsg }]),
+          Date.now()
+        );
       } catch (e) {
-        console.error('Final saveState failed:', e);
+        console.error('Failed to save user message:', e);
+        if (ws) this.send(ws, { type: 'error', error: 'Save failed' });
+        throw e;
       }
-    }
+
+      // Analyze complexity
+      let complexity: TaskComplexity;
+      try {
+        complexity = await this.gemini.analyzeComplexity(
+          userMsg,
+          (state.context?.files ?? []).length > 0
+        );
+      } catch (e) {
+        console.error('Complexity analysis failed:', e);
+        complexity = {
+          type: 'simple',
+          requiredTools: [],
+          estimatedSteps: 1,
+          reasoning: 'fallback due to analysis error',
+          requiresFiles: false,
+          requiresCode: false,
+          requiresVision: false,
+        };
+      }
+
+      // Route based on complexity
+      try {
+        if (complexity.type === 'simple') {
+          await this.handleSimple(userMsg, ws, state);
+        } else {
+          await this.handleComplex(userMsg, complexity, ws, state, {
+            continueOnFailure: false,
+            maxRetries: 2,
+          });
+        }
+      } catch (e) {
+        console.error('Process error:', e);
+        if (ws) this.send(ws, { type: 'error', error: 'Processing failed' });
+        throw e;
+      }
+    });
   }
 
-  // Simple streaming path (no tools) — stable streaming
-  private async handleSimple(query: string, ws: WebSocket | null, state: AgentState) {
-    if (ws) this.send(ws, { type: 'status', message: 'Thinking…' });
+  // ===== Simple Path =====
 
-    try {
-      // Build history for the model
+  private async handleSimple(query: string, ws: WebSocket | null, state: AgentState): Promise<void> {
+    return this.withErrorContext('handleSimple', async () => {
+      if (ws) this.send(ws, { type: 'status', message: 'Thinking…' });
+
       const history = this.buildHistory();
+      const batcher = this.createChunkBatcher(ws, 'chunk');
 
-      // streamResponse will call onChunk for each text fragment
       let full = '';
       await this.gemini.streamResponse(
         query,
         history,
         (chunk) => {
           full += chunk;
-          if (ws) this.send(ws, { type: 'chunk', content: chunk });
+          batcher.add(chunk);
         },
         { model: 'gemini-2.5-flash', thinkingConfig: { thinkingBudget: 512 } }
       );
 
-      // Save model response to DB
+      batcher.flush();
+
+      // Save model response
       try {
         this.sql.exec(
           `INSERT INTO messages (role, parts, timestamp) VALUES (?, ?, ?)`,
@@ -257,196 +413,209 @@ export class AutonomousAgent extends DurableObject<Env> {
         console.error('Failed to save model response:', e);
       }
 
-      if (ws) {
-        this.send(ws, { type: 'done' });
-      }
-    } catch (e) {
-      console.error('handleSimple streaming failed:', e);
-      if (ws) this.send(ws, { type: 'error', error: 'Streaming failed' });
-    }
+      if (ws) this.send(ws, { type: 'done' });
+    });
   }
 
-  // Complex path: planning, per-step execution (streaming per step), synthesis
-  private async handleComplex(query: string, complexity: TaskComplexity, ws: WebSocket | null, state: AgentState) {
-    if (ws) this.send(ws, { type: 'status', message: 'Planning…' });
+  // ===== Complex Path =====
 
-    // Generate plan using Gemini client (with thinking budget)
-    let plan: ExecutionPlan;
-    try {
-      plan = await this.gemini.generatePlan(query, complexity, (state.context?.files ?? []).length > 0);
-    } catch (e) {
-      console.error('generatePlan failed:', e);
-      plan = {
-        steps: [{ id: 's1', description: 'Answer directly', action: 'synthesize', status: 'pending' }],
-        currentStepIndex: 0,
-        status: 'executing',
-        createdAt: Date.now(),
-      } as ExecutionPlan;
-    }
+  private async handleComplex(
+    query: string,
+    complexity: TaskComplexity,
+    ws: WebSocket | null,
+    state: AgentState,
+    opts: StepExecutionOptions = { continueOnFailure: false, maxRetries: 1 }
+  ): Promise<void> {
+    return this.withErrorContext('handleComplex', async () => {
+      if (ws) this.send(ws, { type: 'status', message: 'Planning…' });
 
-    // attach to state and persist
-    state.currentPlan = plan;
-    try {
-      await this.saveState(state);
-    } catch (e) {
-      console.error('saveState after plan failed:', e);
-    }
-
-    if (ws) this.send(ws, { type: 'plan', plan });
-
-    // Execute steps sequentially
-    for (let i = 0; i < plan.steps.length; i++) {
-      const step = plan.steps[i] as PlanStep;
-      plan.currentStepIndex = i;
-
-      if (ws) this.send(ws, { type: 'step_start', step: i + 1, description: step.description });
-
+      // Generate plan
+      let plan: ExecutionPlan;
       try {
-        step.status = 'executing';
-        step.startedAt = Date.now();
+        plan = await this.gemini.generatePlan(
+          query,
+          complexity,
+          (state.context?.files ?? []).length > 0
+        );
+      } catch (e) {
+        console.error('generatePlan failed:', e);
+        plan = {
+          steps: [{ id: 's1', description: 'Answer directly', action: 'synthesize', status: 'pending' }],
+          currentStepIndex: 0,
+          status: 'executing',
+          createdAt: Date.now(),
+        } as ExecutionPlan;
+      }
 
-        // Execute the step with streaming enabled so the user sees progress
-        const result = await this.executeStep(step, state, (chunk) => {
-          // forward each chunk to WS as step_chunk
-          if (ws) this.send(ws, { type: 'step_chunk', step: i + 1, content: chunk });
-        });
+      state.currentPlan = plan;
+      if (ws) this.send(ws, { type: 'plan', plan });
 
-        step.result = result;
-        step.status = 'completed';
-        step.completedAt = Date.now();
-        step.durationMs = (step.completedAt ?? Date.now()) - (step.startedAt ?? Date.now());
+      // Execute steps with retry logic
+      for (let i = 0; i < plan.steps.length; i++) {
+        const step = plan.steps[i] as PlanStep;
+        plan.currentStepIndex = i;
 
-        // Persist step result to DB and state
-        try {
-          // Save model chunk as model message (append)
-          this.sql.exec(
-            `INSERT INTO messages (role, parts, timestamp) VALUES (?, ?, ?)`,
-            'model',
-            this.stringify([{ text: `Step ${i + 1} result: ${result}` }]),
-            Date.now()
-          );
-        } catch (e) {
-          console.error('Failed to save step model result:', e);
+        if (ws) this.send(ws, { type: 'step_start', step: i + 1, description: step.description });
+
+        let attempts = 0;
+        let lastError: Error | null = null;
+        let success = false;
+
+        while (attempts < opts.maxRetries && !success) {
+          try {
+            step.status = 'executing';
+            step.startedAt = Date.now();
+
+            const batcher = this.createChunkBatcher(ws, 'step_chunk');
+            const result = await this.executeStep(step, state, (chunk) => {
+              batcher.add(chunk);
+            });
+            batcher.flush();
+
+            step.result = result;
+            step.status = 'completed';
+            step.completedAt = Date.now();
+            step.durationMs = (step.completedAt ?? Date.now()) - (step.startedAt ?? Date.now());
+
+            // Save step result
+            try {
+              this.sql.exec(
+                `INSERT INTO messages (role, parts, timestamp) VALUES (?, ?, ?)`,
+                'model',
+                this.stringify([{ text: `Step ${i + 1}: ${result}` }]),
+                Date.now()
+              );
+            } catch (e) {
+              console.error('Failed to save step result:', e);
+            }
+
+            if (ws) this.send(ws, { type: 'step_complete', step: i + 1, result });
+            success = true;
+          } catch (e) {
+            lastError = e as Error;
+            attempts++;
+            console.error(`Step ${i + 1} attempt ${attempts} failed:`, e);
+
+            if (attempts < opts.maxRetries) {
+              const backoffMs = 1000 * attempts;
+              await new Promise((r) => setTimeout(r, backoffMs));
+            }
+          }
         }
 
-        if (ws) this.send(ws, { type: 'step_complete', step: i + 1, result });
-        await this.saveState(state);
-      } catch (e) {
-        console.error('Step execution failed:', e);
-        step.status = 'failed';
-        step.error = e instanceof Error ? e.message : String(e);
-        if (ws) this.send(ws, { type: 'step_error', step: i + 1, error: step.error });
-        await this.saveState(state);
-        // Stop executing remaining steps after failure (you may adjust to continue)
-        break;
+        if (!success && lastError) {
+          step.status = 'failed';
+          step.error = lastError.message;
+          if (ws) this.send(ws, { type: 'step_error', step: i + 1, error: step.error });
+
+          if (!opts.continueOnFailure) {
+            break;
+          }
+        }
       }
-    }
 
-    // After steps: synthesize final answer and stream to WS
-    await this.synthesize(ws, state);
+      // Synthesize final answer
+      await this.synthesize(ws, state);
 
-    // finalize plan
-    plan.status = 'completed';
-    plan.completedAt = Date.now();
-    state.currentPlan = plan;
-
-    try {
-      await this.saveState(state);
-    } catch (e) {
-      console.error('saveState after completion failed:', e);
-    }
-  }
-
-  // Execute individual plan step (streams progress via onChunk)
-  private async executeStep(step: PlanStep, state: AgentState, onChunk?: (text: string) => void): Promise<string> {
-    // Build a focused prompt using the step and previous completed results
-    const prompt = this.buildPrompt(step, state);
-
-    // Build history to provide to model (recent conversation)
-    const history = this.buildHistory();
-
-    // Setup execution config for action -> tools mapping
-    const execConfig: ExecutionConfig = {
-      model: 'gemini-2.5-flash',
-      stream: true,
-      timeoutMs: 120_000, // 2 minutes per step (tweak as appropriate)
-      thinkingConfig: { thinkingBudget: 1024 },
-      files: state.context?.files ?? [],
-      urlList: state.context?.searchResults ? state.context.searchResults.map((r: any) => r.url).filter(Boolean) : [],
-      // stepAction will tell GeminiClient to enable the correct tools
-      // we store action name for automatic mapping
-      // @ts-expect-error stepAction is dynamic extension to ExecutionConfig
-      stepAction: step.action,
-    } as unknown as ExecutionConfig;
-
-    // Use gemini.executeWithConfig with streaming onChunk
-    const result = await this.gemini.executeWithConfig(prompt, history, execConfig, (chunk) => {
-      if (onChunk) onChunk(chunk);
+      plan.status = 'completed';
+      plan.completedAt = Date.now();
+      state.currentPlan = plan;
     });
-
-    return result;
   }
 
-  // Build a prompt for a given step and completed steps in the plan
-  private buildPrompt(step: PlanStep, state: AgentState): string {
-    const plan = state.currentPlan!;
-    const done = plan.steps
-      .filter((s) => s.status === 'completed')
-      .map((s) => `${s.description}: ${s.result ?? ''}`)
-      .join('\n') || 'None';
+  // ===== Step Execution =====
 
-    const prompt = `PLAN:
-${plan.steps.map((s) => s.description).join(' -> ')}
+  private async executeStep(
+    step: PlanStep,
+    state: AgentState,
+    onChunk?: (text: string) => void
+  ): Promise<string> {
+    return this.withErrorContext(`executeStep(${step.id})`, async () => {
+      const prompt = this.buildPrompt(step, state);
+      const history = this.buildHistory();
 
-DONE:
-${done}
+      const hasFiles = (state.context?.files ?? []).length > 0;
+      const hasUrls = (state.context?.searchResults ?? []).length > 0;
 
-STEP:
-${step.description}
-
-ACTION:
-${step.action}
-
-Provide result only (concise):`;
-
-    return prompt;
-  }
-
-  // Synthesize final answer after plan execution (streaming to ws)
-  private async synthesize(ws: WebSocket | null, state: AgentState) {
-    if (ws) this.send(ws, { type: 'status', message: 'Summarizing…' });
-
-    const plan = state.currentPlan!;
-    const lastUserRow = this.sql.exec(`SELECT parts FROM messages WHERE role='user' ORDER BY timestamp DESC LIMIT 1`).one();
-    const lastUserPartsStr = lastUserRow?.parts as string | undefined;
-    const original = lastUserPartsStr ? this.parse<any[]>(lastUserPartsStr)?.[0]?.text || '' : '';
-
-    const prompt = `Request: ${original}
-
-Results:
-${plan.steps.map((s, i) => `Step ${i + 1}: ${s.result ?? ''}`).join('\n\n')}
-
-Concise answer:`;
-
-    try {
-      // Use streaming to send synthesis in chunks to WS
-      let full = '';
-      await this.gemini.executeWithConfig(
+      const result = await this.gemini.executeWithConfig(
         prompt,
-        this.buildHistory(),
+        history,
         {
           model: 'gemini-2.5-flash',
           stream: true,
           timeoutMs: 120_000,
-          thinkingConfig: { thinkingBudget: 1536 },
-        } as unknown as ExecutionConfig,
-        (chunk) => {
-          full += chunk;
-          if (ws) this.send(ws, { type: 'final_chunk', content: chunk });
-        }
+          thinkingConfig: { thinkingBudget: 1024 },
+          files: state.context?.files ?? [],
+          urlList: hasUrls
+            ? state.context.searchResults.map((r: any) => r.url).filter(Boolean)
+            : [],
+          stepAction: step.action,
+        },
+        onChunk
       );
 
-      // Save final answer to messages table
+      return result;
+    });
+  }
+
+  private buildPrompt(step: PlanStep, state: AgentState): string {
+    const plan = state.currentPlan!;
+    const done = plan.steps
+      .filter((s) => s.status === 'completed')
+      .map((s) => `${s.description}: ${s.result ?? 'completed'}`)
+      .join('\n');
+
+    return `EXECUTION PLAN:
+${plan.steps.map((s, i) => `${i + 1}. ${s.description}`).join('\n')}
+
+COMPLETED STEPS:
+${done || 'None yet'}
+
+CURRENT STEP:
+${step.description}
+
+ACTION TYPE:
+${step.action}
+
+Provide a concise result for this step only:`;
+  }
+
+  // ===== Synthesis =====
+
+  private async synthesize(ws: WebSocket | null, state: AgentState): Promise<void> {
+    return this.withErrorContext('synthesize', async () => {
+      if (ws) this.send(ws, { type: 'status', message: 'Summarizing…' });
+
+      const plan = state.currentPlan!;
+      const lastUserRow = this.sql
+        .exec(`SELECT parts FROM messages WHERE role='user' ORDER BY timestamp DESC LIMIT 1`)
+        .one();
+      const lastUserPartsStr = lastUserRow?.parts as string | undefined;
+      const original = lastUserPartsStr ? this.parse<any[]>(lastUserPartsStr)?.[0]?.text || '' : '';
+
+      const prompt = `Original Request: ${original}
+
+Execution Results:
+${plan.steps.map((s, i) => `Step ${i + 1} (${s.description}): ${s.result ?? 'no result'}`).join('\n\n')}
+
+Task: Provide a comprehensive, well-structured answer that directly addresses the original request based on the execution results above.`;
+
+      const batcher = this.createChunkBatcher(ws, 'final_chunk');
+      let full = '';
+
+      await this.gemini.streamResponse(
+        prompt,
+        this.buildHistory(),
+        (chunk) => {
+          full += chunk;
+          batcher.add(chunk);
+        },
+        { model: 'gemini-2.5-flash', thinkingConfig: { thinkingBudget: 1536 } }
+      );
+
+      batcher.flush();
+
+      // Save final answer
       try {
         this.sql.exec(
           `INSERT INTO messages (role, parts, timestamp) VALUES (?, ?, ?)`,
@@ -455,25 +624,30 @@ Concise answer:`;
           Date.now()
         );
       } catch (e) {
-        console.error('Failed to save final model response:', e);
+        console.error('Failed to save final response:', e);
       }
 
       if (ws) {
         this.send(ws, { type: 'final_response', content: full });
         this.send(ws, { type: 'done' });
       }
-    } catch (e) {
-      console.error('Synthesis failed:', e);
-      if (ws) this.send(ws, { type: 'error', error: 'Synthesis failed' });
-    }
+    });
   }
 
-  // Build history from messages table - returns array of { role, parts }
+  // ===== History Building =====
+
   private buildHistory(): Array<{ role: string; parts: Array<{ text: string }> }> {
-    const rows = this.sql.exec(`SELECT role, parts FROM messages ORDER BY timestamp ASC`);
-    const hist: Array<{ role: string; parts: Array<{ text: string }> }> = [];
-    try {
-      for (const r of rows) {
+    return this.ctx.blockConcurrencyWhile(() => {
+      const rows = this.sql
+        .exec(
+          `SELECT role, parts FROM messages ORDER BY timestamp DESC LIMIT ?`,
+          this.maxHistoryMessages
+        )
+        .toArray();
+
+      const hist: Array<{ role: string; parts: Array<{ text: string }> }> = [];
+
+      for (const r of rows.reverse()) {
         const parts = this.parse<any[]>(r.parts as string);
         if (parts) {
           hist.push({
@@ -482,40 +656,43 @@ Concise answer:`;
           });
         }
       }
-    } catch (e) {
-      console.error('buildHistory parse error:', e);
-    }
 
-    // Avoid consecutive duplicate user entries
-    while (hist.length > 1 && hist[hist.length - 1].role === 'user' && hist[hist.length - 2].role === 'user') {
-      hist.pop();
-    }
+      // Remove consecutive duplicate user entries
+      let i = hist.length - 1;
+      while (i > 0) {
+        if (hist[i].role === 'user' && hist[i - 1].role === 'user') {
+          hist.splice(i, 1);
+        }
+        i--;
+      }
 
-    return hist;
+      return hist;
+    });
   }
 
-  // HTTP handler: enqueue message (background processing)
+  // ===== HTTP Handlers =====
+
   private async handleChat(req: Request): Promise<Response> {
     let message: string;
     try {
-      const body = await req.json<{ message: string }>();
+      const body = (await req.json()) as { message: string };
       message = body.message;
       if (!message) throw new Error('Missing message');
     } catch {
-      return new Response(JSON.stringify({ error: 'Invalid JSON' }), { status: 400 });
+      return new Response(JSON.stringify({ error: 'Invalid request' }), { status: 400 });
     }
 
-    // Process asynchronously (Durable Object will keep running)
     this.ctx.waitUntil(
-      this.process(message, null).catch((err) => {
+      this.trackRequest(() => this.process(message, null)).catch((err) => {
         console.error('Background process failed:', err);
       })
     );
 
-    return new Response(JSON.stringify({ status: 'queued' }), { headers: { 'Content-Type': 'application/json' } });
+    return new Response(JSON.stringify({ status: 'queued' }), {
+      headers: { 'Content-Type': 'application/json' },
+    });
   }
 
-  // Return conversation history (simple JSON)
   private getHistory(): Response {
     const rows = this.sql.exec(`SELECT role, parts, timestamp FROM messages ORDER BY timestamp ASC`);
     const msgs: Message[] = [];
@@ -534,19 +711,21 @@ Concise answer:`;
     });
   }
 
-  // Clear DB tables and state
   private async clearHistory(): Promise<Response> {
-    try {
-      this.sql.exec('DELETE FROM messages');
-      this.sql.exec('DELETE FROM kv');
-      this.sql.exec('DELETE FROM sqlite_sequence WHERE name IN ("messages")');
-    } catch (e) {
-      console.error('Clear failed:', e);
-    }
-    return new Response(this.stringify({ ok: true }), { headers: { 'Content-Type': 'application/json' } });
+    return this.ctx.blockConcurrencyWhile(async () => {
+      try {
+        this.sql.exec('DELETE FROM messages');
+        this.sql.exec('DELETE FROM kv');
+        this.sql.exec('DELETE FROM sqlite_sequence WHERE name IN ("messages")');
+      } catch (e) {
+        console.error('Clear failed:', e);
+      }
+      return new Response(this.stringify({ ok: true }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    });
   }
 
-  // Return status: current plan and last activity
   private getStatus(): Response {
     let state: AgentState | null = null;
     try {
@@ -556,10 +735,20 @@ Concise answer:`;
       console.error('getStatus read failed:', e);
     }
 
-    return new Response(this.stringify({
-      plan: state?.currentPlan,
-      lastActivity: state?.lastActivityAt,
-    }), { headers: { 'Content-Type': 'application/json' } });
+    return new Response(
+      this.stringify({
+        plan: state?.currentPlan,
+        lastActivity: state?.lastActivityAt,
+        sessionId: state?.sessionId,
+      }),
+      { headers: { 'Content-Type': 'application/json' } }
+    );
+  }
+
+  private getMetrics(): Response {
+    return new Response(this.stringify(this.metrics), {
+      headers: { 'Content-Type': 'application/json' },
+    });
   }
 }
 

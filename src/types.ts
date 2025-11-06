@@ -1,4 +1,4 @@
-// Add these to your types.ts file if they're missing
+// src/types.ts - Complete Type Definitions
 
 export enum AutonomousMode {
   CHAT = 'chat',
@@ -21,7 +21,7 @@ export interface WebSocketMessage {
   content?: string;
   error?: string;
   details?: string;
-  phase?: AgentPhase;
+  phase?: AgentPhase | string;
   message?: string;
   clarificationQuestion?: string;
   toolCall?: {
@@ -85,5 +85,5 @@ export interface ExecutionPlan {
 
 export interface Env {
   GEMINI_API_KEY: string;
-  // Add other environment variables here
+  AUTONOMOUS_AGENT: DurableObjectNamespace;
 }

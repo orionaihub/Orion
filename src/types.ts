@@ -1,9 +1,53 @@
-// src/types.ts
+// Add these to your types.ts file if they're missing
 
-export interface Env {
-  GEMINI_API_KEY: string;
-  AUTONOMOUS_AGENT: DurableObjectNamespace;
-  // Add other environment variables as needed
+export enum AutonomousMode {
+  CHAT = 'chat',
+  AUTONOMOUS = 'autonomous',
+  PLANNING = 'planning',
+}
+
+export enum AgentPhase {
+  ASSESSMENT = 'assessment',
+  PLANNING = 'planning',
+  RESEARCH = 'research',
+  ANALYSIS = 'analysis',
+  EXECUTION = 'execution',
+  CLARIFICATION = 'clarification',
+  COMPLETION = 'completion',
+}
+
+export interface WebSocketMessage {
+  type: 'user_message' | 'chunk' | 'error' | 'done' | 'phase_change' | 'clarification_request' | 'tool_call' | 'final_response';
+  content?: string;
+  error?: string;
+  details?: string;
+  phase?: AgentPhase;
+  message?: string;
+  clarificationQuestion?: string;
+  toolCall?: {
+    tool: string;
+    params: any;
+  };
+}
+
+export interface AgentState {
+  conversationHistory: Message[];
+  context?: {
+    files?: FileMetadata[];
+    searchResults?: Array<{ url: string; title?: string }>;
+  };
+  sessionId: string;
+  lastActivityAt: number;
+  currentMode: AutonomousMode;
+  currentPhase: AgentPhase;
+  clarificationContext?: any;
+  executionContext?: any;
+}
+
+export interface Message {
+  role: 'user' | 'model';
+  parts: Array<{ text: string }>;
+  timestamp: number;
 }
 
 export interface FileMetadata {
@@ -12,124 +56,34 @@ export interface FileMetadata {
   name: string;
   sizeBytes: number;
   uploadedAt: number;
-  state: 'PROCESSING' | 'ACTIVE' | 'FAILED' | 'UNKNOWN';
+  state: string;
   expiresAt?: number;
 }
 
-export interface SearchResult {
-  url: string;
-  title: string;
-  snippet: string;
-  timestamp?: number;
+export interface TaskComplexity {
+  type: 'simple' | 'complex';
+  requiredTools: string[];
+  estimatedSteps: number;
+  reasoning: string;
+  requiresFiles: boolean;
+  requiresCode: boolean;
+  requiresVision: boolean;
 }
 
-export interface AgentContext {
-  files: FileMetadata[];
-  searchResults: SearchResult[];
-  metadata?: Record<string, any>;
+export interface ExecutionPlan {
+  steps: Array<{
+    id: string;
+    description: string;
+    action: string;
+    status: 'pending' | 'executing' | 'completed' | 'failed';
+    result?: string;
+  }>;
+  currentStepIndex: number;
+  status: 'executing' | 'completed' | 'failed';
+  createdAt: number;
 }
 
-export interface Message {
-  role: 'user' | 'model' | 'system';
-  parts: Array<{ text: string } | { file_data?: any } | { url?: string }>;
-  timestamp: number;
+export interface Env {
+  GEMINI_API_KEY: string;
+  // Add other environment variables here
 }
-
-// Autonomous Agent Modes
-export enum AutonomousMode {
-  CHAT = "chat",           // Single-step native tools
-  EXECUTION = "execution"  // Multi-step with external tools via function calling
-}
-
-// Autonomous Agent Phases
-export enum AgentPhase {
-  ASSESSMENT = "assessment",     // Initial analysis and clarification
-  PLANNING = "planning",         // Plan generation and user confirmation
-  EXECUTION = "execution",       // Adaptive execution with tool calling
-  COMPLETION = "completion",     // Final response delivery
-  CLARIFICATION = "clarification" // User engagement for better understanding
-}
-
-export interface AgentState {
-  sessionId: string;
-  conversationHistory: Message[];
-  context: AgentContext;
-  lastActivityAt: number;
-  metadata?: Record<string, any>;
-  // New autonomous behavior fields
-  currentMode: AutonomousMode;
-  currentPhase: AgentPhase;
-  clarificationContext?: string;
-  executionContext?: { currentTask: string; progress: string[] };
-}
-
-export interface WebSocketMessage {
-  type:
-    | 'user_message'
-    | 'status'
-    | 'chunk'
-    | 'final_chunk'
-    | 'phase_change'
-    | 'clarification_request'
-    | 'progress_update'
-    | 'tool_call'
-    | 'final_response'
-    | 'done'
-    | 'error';
-  content?: string;
-  message?: string;
-  error?: string;
-  phase?: AgentPhase;
-  clarificationQuestion?: string;
-  progress?: { currentTask: string; completed: string[] };
-  toolCall?: { tool: string; params: Record<string, any>; result?: any };
-  result?: string;
-}
-
-export interface ChatRequest {
-  message: string;
-  sessionId?: string;
-  files?: FileMetadata[];
-  metadata?: Record<string, any>;
-}
-
-export interface ChatResponse {
-  status: 'queued' | 'processing' | 'completed' | 'error';
-  sessionId?: string;
-  message?: string;
-  error?: string;
-}
-
-export interface HistoryResponse {
-  messages: Message[];
-  sessionId: string;
-  totalMessages: number;
-}
-
-export interface StatusResponse {
-  currentMode?: AutonomousMode;
-  currentPhase?: AgentPhase;
-  lastActivity?: number;
-  sessionId?: string;
-  executionContext?: { currentTask: string; progress: string[] };
-  metrics?: {
-    requestCount: number;
-    errorCount: number;
-    avgResponseTime: number;
-    activeConnections: number;
-  };
-}
-
-export interface MetricsResponse {
-  requestCount: number;
-  errorCount: number;
-  avgResponseTime: number;
-  activeConnections: number;
-  circuitBreaker?: {
-    failures: number;
-    isOpen: boolean;
-  };
-}
-
-// Re-export for convenience
-export type { ExecutionConfig } from './utils/gemini';

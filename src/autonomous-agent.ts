@@ -890,9 +890,12 @@ Provide a comprehensive answer:`;
 
     return new Response(
       this.stringify({
-        plan: state?.currentPlan,
+        currentMode: state?.currentMode,
+        currentPhase: state?.currentPhase,
         lastActivity: state?.lastActivityAt,
         sessionId: state?.sessionId,
+        executionContext: state?.executionContext,
+        clarificationContext: state?.clarificationContext,
       }),
       { headers: { 'Content-Type': 'application/json' } }
     );

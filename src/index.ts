@@ -4,16 +4,15 @@ import type { Env } from './types';
 export { AutonomousAgent };
 
 export default {
-  async fetch(request: Request, env: Env, ctx: ExecutionContext) {
+  async fetch(request: Request, env: any, ctx: ExecutionContext) {
     const url = new URL(request.url);
     const path = url.pathname;
 
     // Route API calls under /api/*
     if (path.startsWith('/api/')) {
       try {
-        // Fix: use AUTONOMOUS_AGENT instead of AGENT
-        const id = env.AUTONOMOUS_AGENT.idFromName('default');
-        const stub = env.AUTONOMOUS_AGENT.get(id);
+        const id = env.AGENT.idFromName('default'); // Consider idFromName(sessionId) for multiple DOs
+        const stub = env.AGENT.get(id);
         return await stub.fetch(request);
       } catch (err: any) {
         console.error('[Worker] DO fetch error:', err);

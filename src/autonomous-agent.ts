@@ -1,25 +1,16 @@
 // src/autonomous-agent.ts
-// Fully completed, production-ready (conceptual) Autonomous Agent Durable Object
-// Prompt-driven architecture with tool declarations, agentic loop, streaming, and tool execution.
-// NOTE: Replace mock implementations for search, sandboxed code execution, and visualization
-// with real integrations in your production environment.
+// Unified Production-Ready Prompt-Driven Agent
+// Combines: Stable WebSocket system + Adaptive Agentic Loop
+// Compatible with chat.js frontend and Cloudflare Workers Durable Objects
 
 import { DurableObject } from 'cloudflare:workers';
 import type { DurableObjectState } from '@cloudflare/workers-types';
-import GeminiClientV2 from './utils/gemini';
-import type {
-  Env,
-  AgentState,
-  Tool,
-  ToolCall,
-  ToolResult,
-  MessageRow
-} from './types';
+import GeminiClient from './utils/gemini';
+import type { Env, AgentState, Tool, ToolCall, ToolResult, Message } from './types';
 
-/**
- * Lightweight SQLite-like storage interface wrapper for Durable Object SQL storage.
- * (Matches pattern used in user's repo.)
- */
+// -------------------------------------------
+// SQLite Storage Interface
+// -------------------------------------------
 interface SqlStorage {
   exec(query: string, ...params: any[]): {
     one(): any;
@@ -28,70 +19,39 @@ interface SqlStorage {
   };
 }
 
-/**
- * ChunkBatcher — accumulates streaming chunks and periodically flushes to a websocket
- * or callback to avoid excessive network operations.
- */
-class ChunkBatcher {
-  private buffer = '';
-  private timer: any = null;
-  private readonly flushIntervalMs: number;
-  private readonly onFlush: (chunk: string) => void;
-
-  constructor(onFlush: (chunk: string) => void, flushIntervalMs = 120) {
-    this.onFlush = onFlush;
-    this.flushIntervalMs = flushIntervalMs;
-  }
-
-  add(chunk: string) {
-    this.buffer += chunk;
-    if (!this.timer) {
-      this.timer = setTimeout(() => this.flush(), this.flushIntervalMs);
-    }
-  }
-
-  flush() {
-    if (this.timer) {
-      clearTimeout(this.timer);
-      this.timer = null;
-    }
-    if (this.buffer.length > 0) {
-      try {
-        this.onFlush(this.buffer);
-      } catch (e) {
-        // swallow - sending errors should not break agent loop
-        console.warn('ChunkBatcher.onFlush error:', e);
-      }
-      this.buffer = '';
-    }
-  }
+// -------------------------------------------
+// Metrics Interface
+// -------------------------------------------
+interface Metrics {
+  requestCount: number;
+  errorCount: number;
+  avgResponseTime: number;
+  totalResponseTime: number;
+  activeConnections: number;
 }
 
-/**
- * AutonomousAgent - Durable Object that runs the prompt-driven agentic loop,
- * exposes tool definitions, executes tool calls, streams progress via WS, and persists state.
- */
+// -------------------------------------------
+// Autonomous Agent Durable Object
+// -------------------------------------------
 export class AutonomousAgent extends DurableObject<Env> {
   private sql: SqlStorage;
-  private gemini: GeminiClientV2;
-  private readonly MAX_TURNS = 12;
-  private readonly MAX_MESSAGE_SIZE = 200_000;
+  private gemini: GeminiClient;
+  private readonly MAX_MESSAGE_SIZE = 120_000;
+  private readonly MAX_TURNS = 10;
   private activeWebSockets = new Set<WebSocket>();
+  private metrics: Metrics = {
+    requestCount: 0,
+    errorCount: 0,
+    avgResponseTime: 0,
+    totalResponseTime: 0,
+    activeConnections: 0,
+  };
 
   constructor(state: DurableObjectState, env: Env) {
     super(state, env);
-    // Durable Object provided SQL wrapper (state.storage.sql) in this user's infra
-    this.sql = (state.storage as unknown as { sql: SqlStorage }).sql;
-    this.gemini = new GeminiClientV2({ apiKey: env.GEMINI_API_KEY });
-    // Initialize DB tables if missing
-    this.initDatabase();
-  }
+    this.sql = state.storage.sql as SqlStorage;
+    this.gemini = new GeminiClient({ apiKey: env.GEMINI_API_KEY });
 
-  // ---------------------------
-  // Initialization & Utilities
-  // ---------------------------
-
-  private initDatabase(): void {
     try {
       this.sql.exec(`
         CREATE TABLE IF NOT EXISTS messages (
@@ -104,278 +64,192 @@ export class AutonomousAgent extends DurableObject<Env> {
           key TEXT PRIMARY KEY,
           value TEXT NOT NULL
         );
-        CREATE INDEX IF NOT EXISTS idx_msg_ts ON messages(timestamp);
       `);
     } catch (e) {
-      console.error('SQLite init failed:', e);
+      console.error('DB init failed:', e);
     }
   }
 
-  private stringify(parts: any): string {
-    try {
-      return JSON.stringify(parts);
-    } catch (e) {
-      return JSON.stringify({ text: String(parts) });
-    }
+  // -------------------------------------------
+  // Utility Helpers
+  // -------------------------------------------
+  private stringify(obj: any): string {
+    try { return JSON.stringify(obj); } catch { return String(obj); }
   }
 
-  // ---------------------------
-  // System Prompt & Toolset
-  // ---------------------------
+  private parse<T>(s: string): T | null {
+    try { return JSON.parse(s); } catch { return null; }
+  }
 
+  private send(ws: WebSocket | null, data: unknown): void {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    try { ws.send(JSON.stringify(data)); } catch {}
+  }
+
+  private createChunkBatcher(ws: WebSocket | null, type: string, interval = 80) {
+    let buffer = ''; let timer: any = null;
+    const flush = () => {
+      if (buffer && ws) this.send(ws, { type, content: buffer });
+      buffer = ''; timer = null;
+    };
+    return {
+      add: (chunk: string) => {
+        buffer += chunk;
+        if (!timer) timer = setTimeout(flush, interval);
+      },
+      flush,
+    };
+  }
+
+  // -------------------------------------------
+  // System Prompt & Tool Definitions
+  // -------------------------------------------
   private buildSystemPrompt(state: AgentState): string {
     const tools = this.getAvailableTools(state);
-    const hasFiles = (state.context?.files ?? []).length > 0;
-
-    return `You are an autonomous AI agent helping users accomplish tasks efficiently.
+    return `You are an autonomous AI agent helping users accomplish goals efficiently.
 
 # Core Principles
-- Answer simply when possible; don't over-plan.
-- Use tools progressively and minimally.
-- After each tool use, reflect: is more needed?
-- Provide brief narrative progress updates when doing multi-step work.
-- Explain sources when using web search.
+- Be concise; only use tools when necessary.
+- Think step-by-step and reflect briefly after each action.
+- For simple queries, answer directly.
+- For complex ones, use tools progressively.
+- Provide progress updates (e.g., "Searching...", "Analyzing...").
 
 # Available Tools
 ${tools.map(t => `- ${t.name}: ${t.description}`).join('\n')}
 
-${hasFiles ? `\n# Uploaded Files\nThere are ${state.context.files.length} uploaded file(s). Use analyze_file to inspect them.\n` : ''}
+After each tool call:
+- Evaluate if enough info is gathered.
+- If yes → finalize answer.
+- If no → use another tool.
 
-# Decision Process
-1. Assess: Direct answer vs. tool-required.
-2. Act: Use one tool at a time; evaluate results.
-3. Reflect: Have I enough? Next step?
-4. Respond: Provide final structured answer and citations (if web used).
-
-# Style
-- Be concise and helpful.
-- Use sections for long responses.
-- If searching the web, include short citations/URLs.
-
-# Important Rules
-- NEVER create a full plan upfront; adapt as you learn.
-- Use the minimum required tools.
-- If uncertain, ask the user a single clarifying question.
-- Avoid hallucination; say "I don't know" when appropriate.
-
-Begin by assessing the user's request and decide whether to answer directly or use tools.`;
+User's current request follows below.`;
   }
 
   private getAvailableTools(state: AgentState): Tool[] {
-    const hasFiles = (state.context?.files ?? []).length > 0;
-
-    const tools: Tool[] = [
+    return [
       {
         name: 'web_search',
-        description: 'Search the web for up-to-date information, news, or facts. Returns up to N results with titles, snippets, and URLs.',
+        description: 'Search the web for up-to-date information.',
         parameters: {
           type: 'object',
           properties: {
-            query: { type: 'string', description: 'Search query' },
-            limit: { type: 'number', description: 'Max results (default 5)' }
+            query: { type: 'string' },
+            limit: { type: 'number' },
           },
-          required: ['query']
-        }
+          required: ['query'],
+        },
       },
-      {
-        name: 'analyze_file',
-        description: 'Read and analyze an uploaded file (text, pdf, csv). Use for summarization or extraction.',
-        parameters: {
-          type: 'object',
-          properties: {
-            fileIndex: { type: 'number', description: '0-based index of uploaded file' },
-            operation: { 
-              type: 'string',
-              enum: ['summarize', 'extract_data', 'get_metadata', 'answer_question'],
-              description: 'Operation to perform'
-            },
-            question: { type: 'string', description: 'Optional: specific question about file' }
-          },
-          required: ['fileIndex', 'operation']
-        }
-      },
-      {
-        name: 'code_execute',
-        description: 'Execute Python code in a sandbox for data analysis, math, or generating artifacts (returns stdout/result).',
-        parameters: {
-          type: 'object',
-          properties: {
-            code: { type: 'string', description: 'Python code to run' },
-            explanation: { type: 'string', description: 'Short explanation of what code does' }
-          },
-          required: ['code', 'explanation']
-        }
-      },
-      {
-        name: 'create_visualization',
-        description: 'Generate a visualization image from provided data and return an image URL.',
-        parameters: {
-          type: 'object',
-          properties: {
-            data: { type: 'object', description: 'JSON-serializable data' },
-            chartType: { type: 'string', enum: ['bar','line','pie','scatter'] },
-            title: { type: 'string' }
-          },
-          required: ['data','chartType']
-        }
-      }
     ];
-
-    if (hasFiles) {
-      // analyze_file already present; keep tools flexible.
-    }
-
-    return tools;
   }
 
-  // ---------------------------
-  // Tool Execution Implementations
-  // ---------------------------
-  // NOTE: The following implementations are intentionally modular so you can replace mocks
-  // with production integrations (search provider, sandboxed executor, file storage).
+  // -------------------------------------------
+  // Main Agentic Loop
+  // -------------------------------------------
+  private async processWithAgent(userMsg: string, ws: WebSocket | null, state: AgentState) {
+    const systemPrompt = this.buildSystemPrompt(state);
+    const history = this.buildHistory();
 
-  private async executeTools(toolCalls: ToolCall[], state: AgentState): Promise<ToolResult[]> {
-    const results: ToolResult[] = [];
+    let conversation: any[] = [
+      { role: 'system', parts: [{ text: systemPrompt }] },
+      ...history,
+      { role: 'user', parts: [{ text: userMsg }] },
+    ];
 
-    // Execute sequentially (agent chooses tools progressively). Later we can parallelize when safe.
-    for (const call of toolCalls) {
-      try {
-        let result: any;
-        switch (call.name) {
-          case 'web_search':
-            result = await this.toolWebSearch(call.args.query, call.args.limit ?? 5);
-            break;
+    const batcher = this.createChunkBatcher(ws, 'chunk');
+    let finalText = '';
 
-          case 'analyze_file':
-            result = await this.toolAnalyzeFile(
-              call.args.fileIndex,
-              call.args.operation,
-              call.args.question,
-              state
-            );
-            break;
+    for (let turn = 0; turn < this.MAX_TURNS; turn++) {
+      const response = await this.gemini.generateWithTools(
+        conversation,
+        this.getAvailableTools(state),
+        {
+          model: 'gemini-2.5-flash',
+          stream: true,
+          thinkingConfig: { thinkingBudget: 1024 },
+        },
+        (chunk) => { batcher.add(chunk); finalText += chunk; }
+      );
 
-          case 'code_execute':
-            result = await this.toolCodeExecute(call.args.code, call.args.explanation);
-            break;
+      batcher.flush();
 
-          case 'create_visualization':
-            result = await this.toolCreateVisualization(call.args.data, call.args.chartType, call.args.title);
-            break;
-
-          default:
-            result = { error: `Unknown tool: ${call.name}` };
-            break;
-        }
-
-        results.push({
-          name: call.name,
-          result: typeof result === 'string' ? result : this.stringify(result),
-          success: !(result && (result as any).error)
+      if (response.toolCalls && response.toolCalls.length > 0) {
+        const toolResults = await this.executeTools(response.toolCalls);
+        conversation.push({ role: 'model', parts: response.parts });
+        conversation.push({
+          role: 'user',
+          parts: toolResults.map(r => ({
+            functionResponse: { name: r.name, response: r.result },
+          })),
         });
-      } catch (e) {
-        results.push({
-          name: call.name,
-          result: this.stringify({ error: String(e) }),
-          success: false
-        });
+        continue;
       }
+
+      // If no more tool calls, final answer
+      break;
     }
 
+    // Save model message
+    this.sql.exec(
+      `INSERT INTO messages (role, parts, timestamp) VALUES (?, ?, ?)`,
+      'model',
+      this.stringify([{ text: finalText }]),
+      Date.now()
+    );
+
+    this.send(ws, { type: 'final_response', content: finalText });
+    this.send(ws, { type: 'done' });
+  }
+
+  // -------------------------------------------
+  // Tool Execution
+  // -------------------------------------------
+  private async executeTools(toolCalls: ToolCall[]): Promise<ToolResult[]> {
+    const results: ToolResult[] = [];
+
+    for (const call of toolCalls) {
+      try {
+        switch (call.name) {
+          case 'web_search':
+            results.push({
+              name: call.name,
+              success: true,
+              result: this.stringify(await this.toolWebSearch(call.args.query, call.args.limit ?? 3)),
+            });
+            break;
+          default:
+            results.push({
+              name: call.name,
+              success: false,
+              result: this.stringify({ error: 'Unknown tool' }),
+            });
+        }
+      } catch (e) {
+        results.push({ name: call.name, success: false, result: this.stringify({ error: String(e) }) });
+      }
+    }
     return results;
   }
 
-  // --- web_search (mock / pluggable)
-  // Replace this with a real search provider (Bing, Google custom search, or your own index).
-  private async toolWebSearch(query: string, limit = 5): Promise<any> {
-    // This is a placeholder so the agent works offline in test environments.
-    // In production, call an external search API and return structured results:
-    // [{ title, url, snippet, publishedAt }]
+  private async toolWebSearch(query: string, limit = 3): Promise<any> {
+    // Replace this with your real search integration
     return {
       query,
       timestamp: Date.now(),
       results: [
-        {
-          title: 'Placeholder result for: ' + query,
-          url: 'https://example.com/search?q=' + encodeURIComponent(query),
-          snippet: 'This is a placeholder snippet. Replace toolWebSearch with a real search API.',
-          publishedAt: new Date().toISOString()
-        }
-      ].slice(0, limit)
+        { title: `Result for "${query}"`, url: 'https://example.com', snippet: 'Mocked result snippet.' },
+      ].slice(0, limit),
     };
   }
 
-  // --- analyze_file (reads uploaded files stored in state)
-  private async toolAnalyzeFile(
-    fileIndex: number,
-    operation: string,
-    question: string | undefined,
-    state: AgentState
-  ): Promise<any> {
-    const files = state.context?.files ?? [];
-    if (fileIndex < 0 || fileIndex >= files.length) {
-      return { error: 'fileIndex out of range' };
-    }
-
-    const fileMeta = files[fileIndex];
-    // For production: fetch file by fileMeta.fileUri from your file hosting / Gemini files API.
-    // Here we return a mock response describing what would happen.
-    return {
-      fileName: fileMeta.name ?? 'unnamed',
-      operation,
-      question: question ?? null,
-      metadata: fileMeta,
-      result: `Mocked ${operation} result for file "${fileMeta.name ?? 'unnamed'}". Replace with real analysis.`
-    };
-  }
-
-  // --- code_execute (sandboxed execution)
-  private async toolCodeExecute(code: string, explanation: string): Promise<any> {
-    // In production, forward code to a secure sandbox (e.g., a Python microservice, or Gemini code execution)
-    // For safety this mock will not execute arbitrary code.
-    return {
-      explanation,
-      output: 'Mock execution: code received but not executed in this environment.',
-      stdout: '',
-      stderr: '',
-      executedAt: Date.now()
-    };
-  }
-
-  // --- create_visualization (returns hosted image URL)
-  private async toolCreateVisualization(data: any, chartType: string, title?: string): Promise<any> {
-    // In production generate an image (matplotlib or charting lib) and upload to storage, returning URL.
-    return {
-      chartUrl: 'https://example.com/mock-chart.png',
-      chartType,
-      title: title ?? null,
-      pointCount: Array.isArray(data) ? data.length : Object.keys(data || {}).length
-    };
-  }
-
-  // ---------------------------
-  // Main Agentic Loop (processing)
-  // ---------------------------
-
-  /**
-   * Public entry point for requests that drive the agent (e.g., from an HTTP handler or WebSocket message)
-   * `userMsg` is the user's request text.
-   * `ws` is optional WebSocket for streaming progress to UI.
-   */
-  public async handleUserMessage(userMsg: string, ws: WebSocket | null): Promise<void> {
-    // Wrap state operations in a transaction-like flow to ensure consistency
+  // -------------------------------------------
+  // Main Processing Entry
+  // -------------------------------------------
+  private async process(userMsg: string, ws: WebSocket | null): Promise<void> {
     return this.withStateTransaction(async (state) => {
-      // Guardrails
-      if (!userMsg || userMsg.length === 0) {
-        if (ws) this.send(ws, { type: 'error', error: 'Empty message' });
-        return;
-      }
-      if (userMsg.length > this.MAX_MESSAGE_SIZE) {
-        if (ws) this.send(ws, { type: 'error', error: 'Message too large' });
-        return;
-      }
+      if (userMsg.length > this.MAX_MESSAGE_SIZE)
+        return this.send(ws, { type: 'error', error: 'Message too large' });
 
-      // Persist user message
       this.sql.exec(
         `INSERT INTO messages (role, parts, timestamp) VALUES (?, ?, ?)`,
         'user',
@@ -383,215 +257,116 @@ Begin by assessing the user's request and decide whether to answer directly or u
         Date.now()
       );
 
-      // Build conversation and system prompt
-      const systemPrompt = this.buildSystemPrompt(state);
-      const history = this.buildHistoryFromDB();
-      let conversationHistory: any[] = [
-        { role: 'system', content: systemPrompt },
-        ...history,
-        { role: 'user', content: userMsg }
-      ];
-
-      let turn = 0;
-      let accumulatedText = '';
-      const batcher = new ChunkBatcher((chunk: string) => {
-        if (ws) {
-          this.send(ws, { type: 'chunk', content: chunk });
-        }
-      }, 100);
-
-      if (ws) {
-        this.send(ws, { type: 'status', message: 'Agent starting...' });
-      }
-
-      // Agentic loop: let model decide whether to call tools and when to finish.
-      while (turn < this.MAX_TURNS) {
-        turn++;
-        if (ws) {
-          this.send(ws, { type: 'status', message: turn === 1 ? 'Thinking...' : `Processing (step ${turn})...` });
-        }
-
-        // Ask Gemini to generate with tool-declares
-        const response = await this.gemini.generateWithTools(
-          conversationHistory,
-          this.getAvailableTools(state),
-          {
-            model: 'gemini-2.5-flash',
-            thinkingConfig: { thinkingBudget: 1024 },
-            stream: true
-          },
-          (chunk: string) => {
-            accumulatedText += chunk;
-            batcher.add(chunk);
-          }
-        );
-
-        // flush any buffered chunks to websocket
-        batcher.flush();
-
-        // If model asked to call tools, execute them and append results to conversation history
-        if (response.toolCalls && response.toolCalls.length > 0) {
-          if (ws) {
-            this.send(ws, {
-              type: 'tool_call',
-              tools: response.toolCalls.map(tc => ({ name: tc.name, args: tc.args }))
-            });
-          }
-
-          // Execute declared tool calls
-          const toolResults = await this.executeTools(response.toolCalls, state);
-
-          // Append assistant message (model output) that included the tool call
-          conversationHistory.push({
-            role: 'assistant',
-            content: response.text ?? ''
-          });
-
-          // Append tool results (as user content so the model can see them as data)
-          conversationHistory.push({
-            role: 'user',
-            content: `Tool Results:\n${toolResults.map(r => `${r.name}: ${r.success ? 'Success' : 'Failed'}\n${r.result}`).join('\n\n')}`
-          });
-
-          // Persist tool result summary for audit
-          this.sql.exec(
-            `INSERT INTO messages (role, parts, timestamp) VALUES (?, ?, ?)`,
-            'tool',
-            this.stringify(toolResults),
-            Date.now()
-          );
-
-          // Reset accumulated text for the next turn (we expect new reasoning on top)
-          accumulatedText = '';
-          continue; // Loop again so model can reflect on tool results
-        }
-
-        // No tool calls — model likely produced a final answer
-        // If response.text is empty but parts exist, try to surface parts
-        const finalText = response.text ?? accumulatedText ?? '';
-
-        // Persist assistant final message
-        if (finalText && finalText.length > 0) {
-          this.sql.exec(
-            `INSERT INTO messages (role, parts, timestamp) VALUES (?, ?, ?)`,
-            'model',
-            this.stringify([{ text: finalText }]),
-            Date.now()
-          );
-        }
-
-        if (ws) {
-          this.send(ws, { type: 'final_response', content: finalText });
-          this.send(ws, { type: 'done', turns: turn });
-        }
-
-        break; // exit loop as agent signaled completion
-      } // end loop
-
-      // If we hit MAX_TURNS without a final response, send best-effort result
-      if (turn >= this.MAX_TURNS) {
-        const fallback = accumulatedText || 'Agent stopped after reaching maximum internal steps.';
-        if (ws) this.send(ws, { type: 'final_response', content: fallback });
-        this.sql.exec(
-          `INSERT INTO messages (role, parts, timestamp) VALUES (?, ?, ?)`,
-          'model',
-          this.stringify([{ text: fallback }]),
-          Date.now()
-        );
-      }
-
-      // Update last activity timestamp on state
-      state.lastActivityAt = Date.now();
+      await this.processWithAgent(userMsg, ws, state);
     });
   }
 
-  // ---------------------------
-  // Persistence & State Helpers
-  // ---------------------------
-
-  private async withStateTransaction<T>(fn: (state: AgentState) => Promise<T>): Promise<T> {
-    // Use Durable Object concurrency controller to ensure only one transaction
-    return this.ctx.blockConcurrencyWhile(async () => {
-      const state = await this.loadState();
-      const result = await fn(state);
-      await this.saveState(state);
-      return result;
-    });
-  }
-
+  // -------------------------------------------
+  // State Management
+  // -------------------------------------------
   private async loadState(): Promise<AgentState> {
     try {
-      const row = this.sql.exec(`SELECT value FROM kv WHERE key = 'state'`).one();
-      if (row?.value) {
-        return JSON.parse(row.value as string) as AgentState;
-      }
-    } catch (e) {
-      console.warn('Failed to load state (will create new):', e);
-    }
-
-    const initial: AgentState = {
+      const row = this.sql.exec(`SELECT value FROM kv WHERE key='state'`).one();
+      if (row?.value) return JSON.parse(row.value as string);
+    } catch {}
+    return {
       conversationHistory: [],
       context: { files: [], searchResults: [] },
       sessionId: this.ctx.id.toString(),
-      lastActivityAt: Date.now()
-    };
-    return initial;
+      lastActivityAt: Date.now(),
+    } as AgentState;
   }
 
   private async saveState(state: AgentState): Promise<void> {
-    try {
-      this.sql.exec(
-        `INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)`,
-        'state',
-        JSON.stringify(state)
-      );
-    } catch (e) {
-      console.warn('Failed to save state:', e);
-    }
+    this.sql.exec(
+      `INSERT OR REPLACE INTO kv (key, value) VALUES ('state', ?)`,
+      JSON.stringify(state)
+    );
   }
 
-  private buildHistoryFromDB(limit = 40): any[] {
+  private async withStateTransaction<T>(fn: (state: AgentState) => Promise<T>): Promise<T> {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      const s = await this.loadState();
+      const r = await fn(s);
+      await this.saveState(s);
+      return r;
+    });
+  }
+
+  private buildHistory(): any[] {
     try {
-      const rows = Array.from(this.sql.exec(`SELECT role, parts, timestamp FROM messages ORDER BY timestamp DESC LIMIT ?`, limit).toArray()).reverse();
+      const rows = this.sql.exec(`SELECT role, parts FROM messages ORDER BY timestamp ASC LIMIT 50`).toArray();
       return rows.map((r: any) => {
-        const parts = (() => {
-          try { return JSON.parse(r.parts); } catch { return [{ text: String(r.parts) }]; }
-        })();
-        return { role: r.role === 'model' ? 'assistant' : r.role, content: parts };
+        const parts = this.parse<any[]>(r.parts);
+        return { role: r.role === 'model' ? 'model' : 'user', parts: parts || [] };
       });
-    } catch (e) {
-      return [];
+    } catch { return []; }
+  }
+
+  // -------------------------------------------
+  // WebSocket + HTTP Handlers
+  // -------------------------------------------
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+
+    // ---- WebSocket Endpoint ----
+    if (url.pathname === '/api/ws' &&
+        request.headers.get('Upgrade')?.toLowerCase() === 'websocket') {
+      const pair = new WebSocketPair();
+      const [client, server] = Object.values(pair);
+      this.ctx.acceptWebSocket(server);
+      this.activeWebSockets.add(server);
+      this.metrics.activeConnections = this.activeWebSockets.size;
+      return new Response(null, { status: 101, webSocket: client });
+    }
+
+    // ---- REST: /api/chat ----
+    if (url.pathname === '/api/chat' && request.method === 'POST') {
+      const body = await request.json().catch(() => ({}));
+      const msg = body.message;
+      this.ctx.waitUntil(this.process(msg, null));
+      return new Response(JSON.stringify({ status: 'queued' }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+
+    // ---- REST: /api/history ----
+    if (url.pathname === '/api/history' && request.method === 'GET') {
+      const rows = this.sql.exec(`SELECT role, parts, timestamp FROM messages ORDER BY timestamp ASC`);
+      const messages = Array.from(rows).map((r: any) => ({
+        role: r.role,
+        parts: this.parse<any[]>(r.parts),
+        timestamp: r.timestamp,
+      }));
+      return new Response(JSON.stringify({ messages }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+
+    return new Response('Not found', { status: 404 });
+  }
+
+  async webSocketMessage(ws: WebSocket, msg: string | ArrayBuffer): Promise<void> {
+    if (typeof msg !== 'string') return;
+    let payload;
+    try { payload = JSON.parse(msg); } catch { return; }
+
+    if (payload.type === 'user_message' && typeof payload.content === 'string') {
+      await this.process(payload.content, ws);
     }
   }
 
-  // ---------------------------
-  // WebSocket / UI helpers
-  // ---------------------------
-
-  private send(ws: WebSocket, payload: any): void {
-    try {
-      if (ws.readyState === ws.OPEN) {
-        ws.send(JSON.stringify(payload));
-      }
-    } catch (e) {
-      console.warn('WebSocket send failed:', e);
-    }
+  async webSocketClose(ws: WebSocket, code: number, reason: string): Promise<void> {
+    console.log(`WebSocket closed: ${code} ${reason}`);
+    this.activeWebSockets.delete(ws);
+    this.metrics.activeConnections = this.activeWebSockets.size;
   }
 
-  // ---------------------------
-  // Optional: HTTP / WS handlers helpers
-  // ---------------------------
-  // You can hook these into your Durable Object fetch() endpoint handlers.
-
-  public async onWebSocketConnected(ws: WebSocket) {
-    this.activeWebSockets.add(ws);
-    ws.addEventListener('close', () => this.activeWebSockets.delete(ws));
-    ws.addEventListener('error', () => this.activeWebSockets.delete(ws));
+  async webSocketError(ws: WebSocket, err: unknown): Promise<void> {
+    console.error('WebSocket error:', err);
+    this.activeWebSockets.delete(ws);
+    this.metrics.activeConnections = this.activeWebSockets.size;
   }
-
-  // ---------------------------
-  // End of class
-  // ---------------------------
 }
 
 export default AutonomousAgent;

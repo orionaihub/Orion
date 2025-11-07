@@ -24,6 +24,7 @@ export class GeminiClient {
   private defaultTimeoutMs = 60_000;
 
   constructor(opts?: { apiKey?: string }) {
+    // NOTE: Assumes GoogleGenAI is imported and configured correctly
     this.ai = new GoogleGenAI({ apiKey: opts?.apiKey });
   }
 
@@ -109,12 +110,20 @@ export class GeminiClient {
       
       if (streamCall && Symbol.asyncIterator in streamCall) {
         for await (const chunk of streamCall) {
-          // --- FIX: Apply same logic from streamSimple to handleStreamedResponse ---
+          
           let text = '';
-          if (typeof chunk?.text === 'function') {
+          // --- FIX: Robust extraction logic applied here as well ---
+          if (typeof chunk?.text === 'string') {
+            text = chunk.text;
+          } else if (typeof chunk?.text === 'function') {
             text = chunk.text();
+          } else if (chunk?.content?.parts) {
+            text = chunk.content.parts
+              .map((part: any) => part.text)
+              .filter((t: string) => t)
+              .join('');
           } else {
-            text = chunk?.delta ?? ''; // Fallback
+            text = chunk?.delta ?? '';
           }
           // --- END FIX ---
 
@@ -174,16 +183,30 @@ export class GeminiClient {
       if (streamResp && Symbol.asyncIterator in streamResp) {
         for await (const chunk of streamResp) {
           
-          // --- FIX: Correctly extract text from stream ---
-          // This is the primary bug fix
           let text = '';
-          if (typeof chunk?.text === 'function') {
+          
+          // --- FIX: Robust multi-case text extraction from stream chunk (CRITICAL) ---
+          if (typeof chunk?.text === 'string') {
+            // Case 1: Text is a string property (e.g., modern @google/genai SDK)
+            text = chunk.text;
+          } else if (typeof chunk?.text === 'function') {
+            // Case 2: Text is a function (e.g., older SDK or specific wrappers)
             text = chunk.text();
+          } else if (chunk?.content?.parts) {
+            // Case 3: Manual deep dive into content parts for raw text
+            const partsText = chunk.content.parts
+              .map((part: any) => part.text)
+              .filter((t: string) => t)
+              .join('');
+            if (partsText) {
+              text = partsText;
+            }
           } else {
-            // Fallback for different stream formats or deltas
-            text = chunk?.delta ?? '';
+            // Case 4: Fallback for delta property
+            text = chunk?.delta ?? ''; 
           }
-
+          // --- END FIX ---
+          
           if (text) {
             fullText += text;
             if (onChunk) {
@@ -194,7 +217,6 @@ export class GeminiClient {
               }
             }
           }
-          // --- END FIX ---
           
           // Extract function calls
           if (chunk?.functionCalls) {
@@ -303,7 +325,6 @@ export class GeminiClient {
   }
 
   // ===== File Management =====
-  // (No changes needed in this section)
 
   async uploadFile(
     fileDataBase64: string, 

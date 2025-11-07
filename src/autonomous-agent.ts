@@ -356,7 +356,7 @@ Begin by assessing the user's request and deciding your approach.`;
           {
             model: 'gemini-2.5-flash',
             thinkingConfig: { thinkingBudget: 1024 },
-            stream: false
+            stream: true
           },
           (chunk: string) => {
             accumulatedResponse += chunk;

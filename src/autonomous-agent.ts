@@ -23,7 +23,6 @@ export class AutonomousAgentV2 extends DurableObject<Env> {
     super(state, env);
     this.sql = state.storage.sql as SqlStorage;
     this.gemini = new GeminiClient({ apiKey: env.GEMINI_API_KEY });
-
     this.initDatabase();
   }
 
@@ -201,11 +200,9 @@ Begin by assessing the user's request and deciding your approach.`;
           case 'web_search':
             result = await this.toolWebSearch(call.args.query);
             break;
-            
           case 'code_execute':
             result = await this.toolCodeExecute(call.args.code);
             break;
-            
           case 'analyze_file':
             result = await this.toolAnalyzeFile(
               call.args.fileIndex, 
@@ -214,7 +211,6 @@ Begin by assessing the user's request and deciding your approach.`;
               state
             );
             break;
-            
           case 'create_visualization':
             result = await this.toolCreateVisualization(
               call.args.data,
@@ -222,7 +218,6 @@ Begin by assessing the user's request and deciding your approach.`;
               call.args.title
             );
             break;
-            
           default:
             result = { error: `Unknown tool: ${call.name}` };
         }
@@ -245,7 +240,6 @@ Begin by assessing the user's request and deciding your approach.`;
   }
 
   private async toolWebSearch(query: string): Promise<any> {
-    // Mock implementation - replace with actual search API
     return {
       results: [
         {
@@ -260,8 +254,6 @@ Begin by assessing the user's request and deciding your approach.`;
   }
 
   private async toolCodeExecute(code: string): Promise<any> {
-    // Mock implementation - replace with actual code execution
-    // In production, use Gemini's code execution tool or a sandboxed Python environment
     return {
       output: 'Code execution result would appear here',
       stdout: '',
@@ -280,9 +272,7 @@ Begin by assessing the user's request and deciding your approach.`;
     if (fileIndex >= files.length) {
       return { error: 'File index out of range' };
     }
-    
     const file = files[fileIndex];
-    // Use Gemini's file analysis capabilities
     return {
       fileName: file.name,
       operation,
@@ -296,7 +286,6 @@ Begin by assessing the user's request and deciding your approach.`;
     chartType: string,
     title: string
   ): Promise<any> {
-    // Mock implementation - in production, generate actual chart
     return {
       chartUrl: 'https://example.com/chart.png',
       chartType,
@@ -316,7 +305,6 @@ Begin by assessing the user's request and deciding your approach.`;
         throw new Error('Message exceeds maximum size');
       }
 
-      // Save user message
       this.sql.exec(
         `INSERT INTO messages (role, parts, timestamp) VALUES (?, ?, ?)`,
         'user',
@@ -324,32 +312,29 @@ Begin by assessing the user's request and deciding your approach.`;
         Date.now()
       );
 
-      // Build conversation history with system prompt
       const systemPrompt = this.buildSystemPrompt(state);
       const history = this.buildHistory();
-      
+
       let conversationHistory: any[] = [
         { role: 'system', content: systemPrompt },
         ...history,
         { role: 'user', content: userMsg }
       ];
-      
+
       let turn = 0;
       let accumulatedResponse = '';
       const batcher = this.createChunkBatcher(ws, 'chunk');
-      
-      // Agentic loop - let model decide when to stop
+
       while (turn < this.MAX_TURNS) {
         turn++;
-        
+
         if (ws) {
           this.send(ws, { 
             type: 'status', 
             message: turn === 1 ? 'Thinking...' : `Processing (step ${turn})...` 
           });
         }
-        
-        // Generate response with tool use capability
+
         const response = await this.gemini.generateWithTools(
           conversationHistory,
           this.getAvailableTools(state),
@@ -363,46 +348,39 @@ Begin by assessing the user's request and deciding your approach.`;
             batcher.add(chunk);
           }
         );
-        
+
         batcher.flush();
-        
-        // Check if model used tools
+
         if (response.toolCalls && response.toolCalls.length > 0) {
-          // Execute tools
           if (ws) {
             this.send(ws, { 
               type: 'tool_use', 
               tools: response.toolCalls.map((t: any) => t.name) 
             });
           }
-          
+
           const toolResults = await this.executeTools(response.toolCalls, state);
-          
-          // Add model's response with tool calls to history
+
           conversationHistory.push({
             role: 'assistant',
             content: response.text,
             toolCalls: response.toolCalls
           });
-          
-          // Add tool results to history
+
           conversationHistory.push({
             role: 'user',
             content: `Tool Results:\n${toolResults.map(r => 
               `${r.name}: ${r.success ? 'Success' : 'Failed'}\n${r.result}`
             ).join('\n\n')}`
           });
-          
-          // Continue to next turn - model will process results
+
           accumulatedResponse = '';
           continue;
         }
-        
-        // No tool calls - model has provided final answer
+
         break;
       }
-      
-      // Save final response
+
       if (accumulatedResponse) {
         this.sql.exec(
           `INSERT INTO messages (role, parts, timestamp) VALUES (?, ?, ?)`,
@@ -411,7 +389,7 @@ Begin by assessing the user's request and deciding your approach.`;
           Date.now()
         );
       }
-      
+
       if (ws) {
         this.send(ws, { type: 'done', turns: turn });
       }
@@ -446,3 +424,52 @@ Begin by assessing the user's request and deciding your approach.`;
       lastActivityAt: Date.now()
     } as AgentState;
   }
+
+  private async saveState(state: AgentState): Promise<void> {
+    try {
+      this.sql.exec(
+        `INSERT OR REPLACE INTO kv (key, value) VALUES ('state', ?)`,
+        JSON.stringify(state)
+      );
+    } catch (e) {
+      console.error('Failed to save state:', e);
+    }
+  }
+
+  private send(ws: WebSocket, message: any): void {
+    if (ws.readyState === ws.OPEN) {
+      ws.send(JSON.stringify(message));
+    }
+  }
+
+  private createChunkBatcher(ws: WebSocket | null, type: string) {
+    let buffer = '';
+    let timeout: any = null;
+
+    const flush = () => {
+      if (!buffer) return;
+      if (ws) this.send(ws, { type, content: buffer });
+      buffer = '';
+    };
+
+    const add = (chunk: string) => {
+      buffer += chunk;
+      clearTimeout(timeout);
+      timeout = setTimeout(flush, 200);
+    };
+
+    return { add, flush };
+  }
+
+  private buildHistory(): any[] {
+    try {
+      const rows = this.sql.exec(`SELECT * FROM messages ORDER BY timestamp ASC`).toArray();
+      return rows.map((r: any) => ({
+        role: r.role,
+        content: JSON.parse(r.parts).map((p: any) => p.text).join('')
+      }));
+    } catch {
+      return [];
+    }
+  }
+}

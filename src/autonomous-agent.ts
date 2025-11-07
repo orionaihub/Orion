@@ -12,7 +12,7 @@ interface SqlStorage {
   };
 }
 
-export class AutonomousAgent extends DurableObject<Env> {
+export class AutonomousAgentV2 extends DurableObject<Env> {
   private sql: SqlStorage;
   private gemini: GeminiClient;
   private readonly MAX_TURNS = 10;
@@ -364,7 +364,6 @@ Begin by assessing the user's request and deciding your approach.`;
           }
         );
         
-        // ensure buffered chunks are sent
         batcher.flush();
         
         // Check if model used tools
@@ -382,7 +381,7 @@ Begin by assessing the user's request and deciding your approach.`;
           // Add model's response with tool calls to history
           conversationHistory.push({
             role: 'assistant',
-            content: response.text ?? '',
+            content: response.text,
             toolCalls: response.toolCalls
           });
           
@@ -414,8 +413,6 @@ Begin by assessing the user's request and deciding your approach.`;
       }
       
       if (ws) {
-        // Provide the final response payload and done indicator
-        this.send(ws, { type: 'final_response', content: accumulatedResponse || '' });
         this.send(ws, { type: 'done', turns: turn });
       }
     });
@@ -453,8 +450,8 @@ Begin by assessing the user's request and deciding your approach.`;
   private async saveState(state: AgentState): Promise<void> {
     try {
       this.sql.exec(
-        `INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)`,
-        'state',
+        `INSERT INTO kv (key, value) VALUES ('state', ?) 
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
         JSON.stringify(state)
       );
     } catch (e) {
@@ -462,112 +459,121 @@ Begin by assessing the user's request and deciding your approach.`;
     }
   }
 
-  // ===== Helpers: history, batching, send =====
+  private buildHistory(): Array<{ role: string; parts: Array<{ text: string }> }> {
+    return this.ctx.blockConcurrencyWhile(() => {
+      const rows = this.sql
+        .exec(`SELECT role, parts FROM messages ORDER BY timestamp DESC LIMIT 50`)
+        .toArray();
 
-  private buildHistory(limit = 50): any[] {
+      const hist: Array<{ role: string; parts: Array<{ text: string }> }> = [];
+
+      for (const r of rows.reverse()) {
+        try {
+          const parts = JSON.parse(r.parts as string);
+          if (parts) {
+            hist.push({
+              role: r.role === 'model' ? 'model' : 'user',
+              parts
+            });
+          }
+        } catch (e) {
+          console.warn('Failed to parse message parts:', e);
+        }
+      }
+
+      return hist;
+    });
+  }
+
+  // ===== WebSocket Management =====
+
+  private send(ws: WebSocket | null, data: unknown): void {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
     try {
-      const rows = Array.from(this.sql.exec(`SELECT role, parts, timestamp FROM messages ORDER BY timestamp DESC LIMIT ?`, limit).toArray()).reverse();
-      return rows.map((r: any) => {
-        let parts;
-        try { parts = JSON.parse(r.parts); } catch { parts = [{ text: String(r.parts) }]; }
-        return { role: r.role === 'model' ? 'assistant' : r.role, content: parts.map((p: any) => p.text || String(p)) };
-      });
+      ws.send(JSON.stringify(data));
     } catch (e) {
-      console.warn('buildHistory failed:', e);
-      return [];
+      console.error('WebSocket send failed:', e);
     }
   }
 
-  private createChunkBatcher(ws: WebSocket | null, type = 'chunk', interval = 80) {
+  private createChunkBatcher(ws: WebSocket | null, type: string, flushInterval = 50) {
     let buffer = '';
-    let timer: any = null;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+
     const flush = () => {
       if (buffer && ws) {
         this.send(ws, { type, content: buffer });
         buffer = '';
       }
-      if (timer) { clearTimeout(timer); timer = null; }
+      timer = null;
     };
+
     return {
       add: (chunk: string) => {
         buffer += chunk;
-        if (!timer) timer = setTimeout(flush, interval);
+        if (!timer) {
+          timer = setTimeout(flush, flushInterval);
+        }
       },
-      flush,
+      flush
     };
   }
 
-  private send(ws: WebSocket | null, payload: unknown): void {
-    if (!ws) return;
-    try {
-      if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(payload));
-    } catch (e) {
-      console.warn('WebSocket send failed:', e);
-    }
-  }
-
-  // ===== WebSocket + HTTP handlers =====
+  // ===== HTTP Fetch Handler =====
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
 
-    // WebSocket upgrade endpoint
     if (url.pathname === '/api/ws' && request.headers.get('Upgrade')?.toLowerCase() === 'websocket') {
       const pair = new WebSocketPair();
       const [client, server] = Object.values(pair);
-      // Accept on DO's side
       this.ctx.acceptWebSocket(server);
-      // track
       this.activeWebSockets.add(server);
-      // attach event handlers on server side via global gateway (Cloudflare will call webSocketMessage etc.)
       return new Response(null, { status: 101, webSocket: client });
     }
 
-    // REST: send message (fallback)
     if (url.pathname === '/api/chat' && request.method === 'POST') {
-      const body = await request.json().catch(() => ({}));
-      const msg = body.message;
-      // process in background
-      this.ctx.waitUntil(this.process(msg, null));
-      return new Response(JSON.stringify({ status: 'queued' }), { headers: { 'Content-Type': 'application/json' } });
+      return this.handleChat(request);
     }
-
-    // REST: history
     if (url.pathname === '/api/history' && request.method === 'GET') {
-      try {
-        const rows = this.sql.exec(`SELECT role, parts, timestamp FROM messages ORDER BY timestamp ASC`);
-        const messages = [];
-        for (const r of rows) {
-          const parts = (() => {
-            try { return JSON.parse(r.parts); } catch { return [{ text: r.parts }]; }
-          })();
-          messages.push({ role: r.role, parts, timestamp: r.timestamp });
-        }
-        return new Response(JSON.stringify({ messages }), { headers: { 'Content-Type': 'application/json' } });
-      } catch (e) {
-        return new Response(JSON.stringify({ error: 'failed to read history' }), { status: 500 });
-      }
+      return this.getHistory();
+    }
+    if (url.pathname === '/api/clear' && request.method === 'POST') {
+      return this.clearHistory();
+    }
+    if (url.pathname === '/api/status' && request.method === 'GET') {
+      return this.getStatus();
     }
 
     return new Response('Not found', { status: 404 });
   }
 
-  // Cloudflare will call these lifecycle handlers on the server WebSocket endpoint
+  // ===== WebSocket Handlers =====
+
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
     if (typeof message !== 'string') return;
-    let payload: any;
-    try { payload = JSON.parse(message); } catch { return; }
+    if (ws.readyState !== WebSocket.OPEN) {
+      console.warn('WebSocket not open, discarding message');
+      return;
+    }
 
-    if (payload?.type === 'user_message' && typeof payload.content === 'string') {
-      // run processing in background so CF doesn't timeout the handshake
+    let payload: any;
+    try {
+      payload = JSON.parse(message);
+    } catch {
+      this.send(ws, { type: 'error', error: 'Invalid JSON' });
+      return;
+    }
+
+    if (payload.type === 'user_message' && typeof payload.content === 'string') {
       this.ctx.waitUntil(
         this.process(payload.content, ws).catch((err) => {
-          console.error('process failed:', err);
+          console.error('WebSocket process failed:', err);
           this.send(ws, { type: 'error', error: 'Processing failed' });
         })
       );
     } else {
-      // ignore / optionally handle other control messages
+      this.send(ws, { type: 'error', error: 'Invalid payload' });
     }
   }
 
@@ -576,10 +582,91 @@ Begin by assessing the user's request and deciding your approach.`;
     this.activeWebSockets.delete(ws);
   }
 
-  async webSocketError(ws: WebSocket, err: unknown): Promise<void> {
-    console.error('WebSocket error:', err);
+  async webSocketError(ws: WebSocket, error: unknown): Promise<void> {
+    console.error('WebSocket error:', error);
     this.activeWebSockets.delete(ws);
+  }
+
+  // ===== HTTP Handlers =====
+
+  private async handleChat(req: Request): Promise<Response> {
+    let message: string;
+    try {
+      const body = (await req.json()) as { message: string };
+      message = body.message;
+      if (!message) throw new Error('Missing message');
+    } catch {
+      return new Response(JSON.stringify({ error: 'Invalid request' }), { status: 400 });
+    }
+
+    this.ctx.waitUntil(
+      this.process(message, null).catch((err) => {
+        console.error('Background process failed:', err);
+      })
+    );
+
+    return new Response(JSON.stringify({ status: 'queued' }), {
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+
+  private getHistory(): Response {
+    const rows = this.sql.exec(`SELECT role, parts, timestamp FROM messages ORDER BY timestamp ASC`);
+    const msgs: any[] = [];
+    
+    for (const r of rows) {
+      try {
+        const parts = JSON.parse(r.parts as string);
+        if (parts) {
+          msgs.push({
+            role: r.role,
+            parts,
+            timestamp: r.timestamp
+          });
+        }
+      } catch (e) {
+        console.warn('Failed to parse message:', e);
+      }
+    }
+    
+    return new Response(JSON.stringify({ messages: msgs }), {
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+
+  private async clearHistory(): Promise<Response> {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      try {
+        this.sql.exec('DELETE FROM messages');
+        this.sql.exec('DELETE FROM kv');
+        this.sql.exec('DELETE FROM sqlite_sequence WHERE name IN ("messages")');
+      } catch (e) {
+        console.error('Clear failed:', e);
+      }
+      return new Response(JSON.stringify({ ok: true }), {
+        headers: { 'Content-Type': 'application/json' }
+      });
+    });
+  }
+
+  private getStatus(): Response {
+    let state: AgentState | null = null;
+    try {
+      const row = this.sql.exec(`SELECT value FROM kv WHERE key='state'`).one();
+      state = row ? JSON.parse(row.value as string) : null;
+    } catch (e) {
+      console.error('getStatus read failed:', e);
+    }
+
+    return new Response(
+      JSON.stringify({
+        lastActivity: state?.lastActivityAt,
+        sessionId: state?.sessionId,
+        filesCount: state?.context?.files?.length ?? 0
+      }),
+      { headers: { 'Content-Type': 'application/json' } }
+    );
   }
 }
 
-export default AutonomousAgent;
+export default AutonomousAgentV2;

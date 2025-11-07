@@ -17,7 +17,7 @@ export interface GenerateResponse {
   finishReason?: string;
 }
 
-export class GeminiClientV2 {
+export class GeminiClient {
   private ai: ReturnType<typeof GoogleGenAI>;
   private maxRetries = 3;
   private baseBackoff = 1000;

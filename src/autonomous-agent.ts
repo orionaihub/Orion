@@ -53,10 +53,11 @@ export class AutonomousAgent extends DurableObject<Env> {
     const hasFiles = (state.context?.files ?? []).length > 0;
     const tools = this.getAvailableTools(state);
     
+    // --- FIX: Updated System Prompt ---
     return `You are an autonomous AI agent helping users accomplish tasks efficiently.
 
 # Core Principles
-- Respond directly for simple questions - don't overthink
+- **CRITICAL RULE:** You MUST respond directly to simple greetings (like 'hello', 'hi') and simple, non-factual questions without using any tools. Assess this first.
 - Use tools progressively as needed, not all at once
 - Adapt your approach based on what you learn
 - Provide brief narrative updates as you work
@@ -65,10 +66,11 @@ export class AutonomousAgent extends DurableObject<Env> {
 # Available Tools
 ${tools.map(t => `- ${t.name}: ${t.description}`).join('\n')}
 
-${hasFiles ? `\n# Uploaded Files\nThe user has uploaded ${state.context.files.length} file(s). You can analyze them using the read_file tool.\n` : ''}
+${hasFiles ?
+`\n# Uploaded Files\nThe user has uploaded ${state.context.files.length} file(s). You can analyze them using the read_file tool.\n` : ''}
 
 # Decision Process
-1. **Assess**: Is this a simple query I can answer directly, or does it need tools?
+1. **Assess**: Is this a simple greeting or question I can answer directly? **If yes, provide the response and stop.** If no, proceed to tool use.
 2. **Act**: For simple queries, respond immediately. For complex tasks:
    - Use ONE tool at a time
    - Wait for results before deciding next step
@@ -94,13 +96,14 @@ ${hasFiles ? `\n# Uploaded Files\nThe user has uploaded ${state.context.files.le
 - Stop and respond once you have sufficient information
 
 Begin by assessing the user's request and deciding your approach.`;
+    // --- END FIX ---
   }
 
   // ===== Tool Definitions =====
+  // (No changes needed in this section)
 
   private getAvailableTools(state: AgentState): Tool[] {
     const hasFiles = (state.context?.files ?? []).length > 0;
-    
     const tools: Tool[] = [
       {
         name: 'web_search',
@@ -189,14 +192,13 @@ Begin by assessing the user's request and deciding your approach.`;
   }
 
   // ===== Tool Execution =====
+  // (No changes needed in this section)
 
   private async executeTools(toolCalls: ToolCall[], state: AgentState): Promise<ToolResult[]> {
     const results: ToolResult[] = [];
-    
     for (const call of toolCalls) {
       try {
         let result: any;
-        
         switch (call.name) {
           case 'web_search':
             result = await this.toolWebSearch(call.args.query);
@@ -261,7 +263,6 @@ Begin by assessing the user's request and deciding your approach.`;
 
   private async toolCodeExecute(code: string): Promise<any> {
     // Mock implementation - replace with actual code execution
-    // In production, use Gemini's code execution tool or a sandboxed Python environment
     return {
       output: 'Code execution result would appear here',
       stdout: '',
@@ -335,12 +336,22 @@ Begin by assessing the user's request and deciding your approach.`;
       ];
       
       let turn = 0;
-      let accumulatedResponse = '';
-      const batcher = this.createChunkBatcher(ws, 'chunk');
+      
+      // --- FIX: Aggregation logic ---
+      // This holds the text for ALL turns, for the final response
+      let completeFinalResponse = '';
+      // --- END FIX ---
       
       // Agentic loop - let model decide when to stop
       while (turn < this.MAX_TURNS) {
         turn++;
+        
+        // --- FIX: Aggregation logic ---
+        // 'currentTurnText' holds text for only this turn's stream
+        let currentTurnText = '';
+        // 'batcher' is now created inside the loop
+        const batcher = this.createChunkBatcher(ws, 'chunk');
+        // --- END FIX ---
         
         if (ws) {
           this.send(ws, { 
@@ -356,16 +367,29 @@ Begin by assessing the user's request and deciding your approach.`;
           {
             model: 'gemini-2.5-flash',
             thinkingConfig: { thinkingBudget: 1024 },
+            
+            // --- FIX: Ensure streaming is enabled ---
             stream: true
+            // --- END FIX ---
           },
           (chunk: string) => {
-            accumulatedResponse += chunk;
+            // --- FIX: Aggregation logic ---
+            currentTurnText += chunk;
             batcher.add(chunk);
+            // --- END FIX ---
           }
         );
         
         // ensure buffered chunks are sent
         batcher.flush();
+        
+        // --- FIX: Aggregation logic ---
+        // Add this turn's text to the complete response
+        if (completeFinalResponse.length > 0 && currentTurnText.length > 0) {
+          completeFinalResponse += '\n\n'; // Add separator
+        }
+        completeFinalResponse += currentTurnText;
+        // --- END FIX ---
         
         // Check if model used tools
         if (response.toolCalls && response.toolCalls.length > 0) {
@@ -382,7 +406,9 @@ Begin by assessing the user's request and deciding your approach.`;
           // Add model's response with tool calls to history
           conversationHistory.push({
             role: 'assistant',
-            content: response.text ?? '',
+            // --- FIX: Use text from this turn ---
+            content: currentTurnText || (response.text ?? ''),
+            // --- END FIX ---
             toolCalls: response.toolCalls
           });
           
@@ -394,8 +420,12 @@ Begin by assessing the user's request and deciding your approach.`;
             ).join('\n\n')}`
           });
           
+          // --- FIX: Aggregation logic ---
+          // DO NOT reset the accumulated response here.
+          [span_0](start_span)// The old line `accumulatedResponse = '';`[span_0](end_span) is removed.
+          // --- END FIX ---
+          
           // Continue to next turn - model will process results
-          accumulatedResponse = '';
           continue;
         }
         
@@ -404,24 +434,27 @@ Begin by assessing the user's request and deciding your approach.`;
       }
       
       // Save final response
-      if (accumulatedResponse) {
+      // --- FIX: Aggregation logic ---
+      if (completeFinalResponse) {
         this.sql.exec(
           `INSERT INTO messages (role, parts, timestamp) VALUES (?, ?, ?)`,
           'model',
-          JSON.stringify([{ text: accumulatedResponse }]),
+          JSON.stringify([{ text: completeFinalResponse }]),
           Date.now()
         );
       }
       
       if (ws) {
         // Provide the final response payload and done indicator
-        this.send(ws, { type: 'final_response', content: accumulatedResponse || '' });
+        this.send(ws, { type: 'final_response', content: completeFinalResponse || '' });
+        // --- END FIX ---
         this.send(ws, { type: 'done', turns: turn });
       }
     });
   }
 
   // ===== State Management =====
+  // (No changes needed in this section)
 
   private async withStateTransaction<T>(fn: (state: AgentState) => Promise<T>): Promise<T> {
     return this.ctx.blockConcurrencyWhile(async () => {
@@ -463,6 +496,7 @@ Begin by assessing the user's request and deciding your approach.`;
   }
 
   // ===== Helpers: history, batching, send =====
+  // (No changes needed in this section)
 
   private buildHistory(limit = 50): any[] {
     try {
@@ -507,10 +541,11 @@ Begin by assessing the user's request and deciding your approach.`;
   }
 
   // ===== WebSocket + HTTP handlers =====
+  // (No changes needed in this section)
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
-
+    
     // WebSocket upgrade endpoint
     if (url.pathname === '/api/ws' && request.headers.get('Upgrade')?.toLowerCase() === 'websocket') {
       const pair = new WebSocketPair();

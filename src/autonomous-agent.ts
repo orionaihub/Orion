@@ -6,7 +6,7 @@
 
 import { DurableObject } from 'cloudflare:workers';
 import type { DurableObjectState } from '@cloudflare/workers-types';
-import GeminiClientV2 from './utils/gemini-v2';
+import GeminiClientV2 from './utils/gemini';
 import type {
   Env,
   AgentState,

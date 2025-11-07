@@ -6,6 +6,19 @@ export interface Env {
   // Add other environment variables as needed
 }
 
+// NEW: Add AgentPhase enum for the Unified Autonomous agent
+[cite_start]// This is derived from your original gemini.ts.txt file [cite: 1, 20-22]
+export enum AgentPhase {
+  ASSESSMENT = 'ASSESSMENT',
+  PLANNING = 'PLANNING',
+  EXECUTION = 'EXECUTION',
+  CLARIFICATION = 'CLARIFICATION',
+  COMPLETION = 'COMPLETION',
+}
+
+// NEW: Add AutonomousMode for the agent router
+export type AutonomousMode = 'orchestrated' | 'unified';
+
 export interface FileMetadata {
   fileUri: string;
   mimeType: string;
@@ -79,6 +92,7 @@ export interface ExecutionPlan {
   metadata?: Record<string, any>;
 }
 
+// UPDATED: AgentState now includes routing and phase info
 export interface AgentState {
   sessionId: string;
   conversationHistory: Message[];
@@ -86,6 +100,10 @@ export interface AgentState {
   currentPlan?: ExecutionPlan;
   lastActivityAt: number;
   metadata?: Record<string, any>;
+
+  // NEW properties for the hybrid agent
+  autonomousMode: AutonomousMode;
+  currentPhase: AgentPhase;
 }
 
 export interface WebSocketMessage {

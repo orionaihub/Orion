@@ -342,4 +342,4 @@ export class GeminiClientV2 {
   }
 }
 
-export default GeminiClientV2;
+export default GeminiClient;

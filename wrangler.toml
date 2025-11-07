@@ -9,7 +9,7 @@ directory = "public"
 # Durable Object binding (required!)
 # -------------------------------------------------
 [[durable_objects.bindings]]
-name = "AUTONOMOUS_AGENT"               # <-- this name appears as env.AGENT in the worker
+name = "AGENT"               # <-- this name appears as env.AGENT in the worker
 class_name = "AutonomousAgent"
 
 # -------------------------------------------------

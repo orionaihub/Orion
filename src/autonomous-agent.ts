@@ -12,7 +12,7 @@ interface SqlStorage {
   };
 }
 
-export class AutonomousAgentV2 extends DurableObject<Env> {
+export class AutonomousAgent extends DurableObject<Env> {
   private sql: SqlStorage;
   private gemini: GeminiClient;
   private readonly MAX_TURNS = 10;

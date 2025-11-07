@@ -24,8 +24,13 @@ export class GeminiClient {
   private defaultTimeoutMs = 60_000;
 
   constructor(opts?: { apiKey?: string }) {
-    // NOTE: Assumes GoogleGenAI is imported and configured correctly
-    this.ai = new GoogleGenAI({ apiKey: opts?.apiKey });
+    // --- FIX: Explicitly pass fetch to resolve Cloudflare Worker streaming issues ---
+    // This often resolves deep-seated stream compatibility issues in Worker/DO environments.
+    this.ai = new GoogleGenAI({ 
+      apiKey: opts?.apiKey,
+      fetch: globalThis.fetch as any 
+    });
+    // --- END FIX ---
   }
 
   /**
@@ -55,6 +60,7 @@ export class GeminiClient {
       };
       
       if (functionDeclarations) {
+        // Use the new, correct structure for tools array
         config.tools = [{ functionDeclarations }];
       }
       
@@ -111,20 +117,8 @@ export class GeminiClient {
       if (streamCall && Symbol.asyncIterator in streamCall) {
         for await (const chunk of streamCall) {
           
-          let text = '';
-          // --- FIX: Robust extraction logic applied here as well ---
-          if (typeof chunk?.text === 'string') {
-            text = chunk.text;
-          } else if (typeof chunk?.text === 'function') {
-            text = chunk.text();
-          } else if (chunk?.content?.parts) {
-            text = chunk.content.parts
-              .map((part: any) => part.text)
-              .filter((t: string) => t)
-              .join('');
-          } else {
-            text = chunk?.delta ?? '';
-          }
+          // --- FIX: Use the reliable extraction helper ---
+          const text = this.extractTextFromChunk(chunk);
           // --- END FIX ---
 
           if (text) {
@@ -170,6 +164,30 @@ export class GeminiClient {
     }));
   }
 
+  // --- FIX: Re-implement the successful text extraction helper ---
+  private extractTextFromChunk(chunk: any): string {
+    // Priority 1: Check if the text property is a string (most common for modern streamed chunks)
+    if (typeof chunk?.text === 'string') return chunk.text;
+    
+    // Priority 2: Check if text is a function (common in older SDK or wrapper environments)
+    if (typeof chunk?.text === 'function') return chunk.text();
+    
+    // Priority 3: Fallback to the delta property (used in some stream implementations)
+    if (typeof chunk?.delta === 'string') return chunk.delta;
+    
+    // Priority 4: Deep dive into parts (used when text is nested)
+    if (chunk?.content?.parts) {
+        return chunk.content.parts
+            .map((part: any) => part.text)
+            .filter((t: string) => t)
+            .join('');
+    }
+    
+    // Final Fallback: Return empty string
+    return '';
+  }
+  // --- END FIX ---
+
   private async handleStreamedResponse(
     streamResp: any,
     onChunk?: (text: string) => void
@@ -183,28 +201,8 @@ export class GeminiClient {
       if (streamResp && Symbol.asyncIterator in streamResp) {
         for await (const chunk of streamResp) {
           
-          let text = '';
-          
-          // --- FIX: Robust multi-case text extraction from stream chunk (CRITICAL) ---
-          if (typeof chunk?.text === 'string') {
-            // Case 1: Text is a string property (e.g., modern @google/genai SDK)
-            text = chunk.text;
-          } else if (typeof chunk?.text === 'function') {
-            // Case 2: Text is a function (e.g., older SDK or specific wrappers)
-            text = chunk.text();
-          } else if (chunk?.content?.parts) {
-            // Case 3: Manual deep dive into content parts for raw text
-            const partsText = chunk.content.parts
-              .map((part: any) => part.text)
-              .filter((t: string) => t)
-              .join('');
-            if (partsText) {
-              text = partsText;
-            }
-          } else {
-            // Case 4: Fallback for delta property
-            text = chunk?.delta ?? ''; 
-          }
+          // --- FIX: Use the reliable extraction helper ---
+          const text = this.extractTextFromChunk(chunk);
           // --- END FIX ---
           
           if (text) {
@@ -218,7 +216,7 @@ export class GeminiClient {
             }
           }
           
-          // Extract function calls
+          // Extract function calls (required for new tool-calling architecture)
           if (chunk?.functionCalls) {
             for (const fc of chunk.functionCalls) {
               toolCalls.push({
@@ -289,7 +287,7 @@ export class GeminiClient {
     };
   }
 
-  // ===== Utility Methods =====
+  // ===== Utility Methods (Retained for completeness) =====
 
   private async withRetry<T>(fn: () => Promise<T>): Promise<T> {
     let lastErr: any;
@@ -324,7 +322,7 @@ export class GeminiClient {
     ]);
   }
 
-  // ===== File Management =====
+  // ===== File Management (Retained for completeness) =====
 
   async uploadFile(
     fileDataBase64: string, 

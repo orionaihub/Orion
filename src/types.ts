@@ -1,9 +1,15 @@
-// src/types.ts
+// src/types.ts - Complete type definitions
 
 export interface Env {
   GEMINI_API_KEY: string;
-  AUTONOMOUS_AGENT: DurableObjectNamespace;
+  AGENT: DurableObjectNamespace;
   // Add other environment variables as needed
+}
+
+export interface Message {
+  role: 'user' | 'model';
+  parts: Array<{ text: string } | { file_data?: any } | { url?: string }>;
+  timestamp: number;
 }
 
 export interface FileMetadata {
@@ -12,28 +18,33 @@ export interface FileMetadata {
   name: string;
   sizeBytes: number;
   uploadedAt: number;
-  state: 'PROCESSING' | 'ACTIVE' | 'FAILED' | 'UNKNOWN';
+  state: 'ACTIVE' | 'PROCESSING' | 'FAILED';
   expiresAt?: number;
 }
 
 export interface SearchResult {
-  url: string;
   title: string;
+  url: string;
   snippet: string;
-  timestamp?: number;
+  relevance?: number;
 }
 
 export interface AgentContext {
   files: FileMetadata[];
   searchResults: SearchResult[];
+  variables?: Record<string, any>;
+}
+
+export interface AgentState {
+  conversationHistory: Message[];
+  context: AgentContext;
+  sessionId: string;
+  lastActivityAt: number;
+  currentPlan?: ExecutionPlan;
   metadata?: Record<string, any>;
 }
 
-export interface Message {
-  role: 'user' | 'model' | 'system';
-  parts: Array<{ text: string } | { file_data?: any } | { url?: string }>;
-  timestamp: number;
-}
+// ===== Plan-based Types (for old implementation) =====
 
 export interface TaskComplexity {
   type: 'simple' | 'complex';
@@ -55,92 +66,95 @@ export interface PlanStep {
   startedAt?: number;
   completedAt?: number;
   durationMs?: number;
-  section?: string;
-  dependencies?: string[];
-  metadata?: Record<string, any>;
-}
-
-export interface PlanSection {
-  name: string;
-  description: string;
-  steps: PlanStep[];
-  status: 'pending' | 'executing' | 'completed' | 'failed';
 }
 
 export interface ExecutionPlan {
   steps: PlanStep[];
-  sections?: PlanSection[];
   currentStepIndex: number;
   status: 'planning' | 'executing' | 'completed' | 'failed';
   createdAt: number;
-  startedAt?: number;
   completedAt?: number;
-  totalDurationMs?: number;
-  metadata?: Record<string, any>;
+  error?: string;
 }
 
-export interface AgentState {
-  sessionId: string;
-  conversationHistory: Message[];
-  context: AgentContext;
-  currentPlan?: ExecutionPlan;
-  lastActivityAt: number;
-  metadata?: Record<string, any>;
+// ===== Tool-based Types (for new implementation) =====
+
+export interface Tool {
+  name: string;
+  description: string;
+  parameters: {
+    type: 'object';
+    properties: Record<string, ToolParameter>;
+    required?: string[];
+  };
 }
 
-export interface WebSocketMessage {
-  type:
-    | 'user_message'
-    | 'status'
-    | 'chunk'
-    | 'step_chunk'
-    | 'final_chunk'
-    | 'plan'
-    | 'step_start'
-    | 'step_complete'
-    | 'step_error'
-    | 'final_response'
-    | 'done'
-    | 'error';
+export interface ToolParameter {
+  type: 'string' | 'number' | 'boolean' | 'object' | 'array';
+  description: string;
+  enum?: string[];
+  items?: { type: string };
+}
+
+export interface ToolCall {
+  name: string;
+  args: Record<string, any>;
+}
+
+export interface ToolResult {
+  name: string;
+  result: string;
+  success: boolean;
+  error?: string;
+}
+
+// ===== WebSocket Message Types =====
+
+export type WSMessageType =
+  | 'user_message'
+  | 'chunk'
+  | 'step_chunk'
+  | 'final_chunk'
+  | 'status'
+  | 'plan'
+  | 'step_start'
+  | 'step_complete'
+  | 'step_error'
+  | 'tool_use'
+  | 'final_response'
+  | 'done'
+  | 'error';
+
+export interface WSMessage {
+  type: WSMessageType;
   content?: string;
   message?: string;
-  error?: string;
   plan?: ExecutionPlan;
   step?: number;
   description?: string;
   result?: string;
+  tools?: string[];
+  error?: string;
+  turns?: number;
 }
 
-export interface ChatRequest {
-  message: string;
-  sessionId?: string;
-  files?: FileMetadata[];
-  metadata?: Record<string, any>;
-}
+// ===== API Response Types =====
 
 export interface ChatResponse {
   status: 'queued' | 'processing' | 'completed' | 'error';
-  sessionId?: string;
   message?: string;
   error?: string;
 }
 
 export interface HistoryResponse {
   messages: Message[];
-  sessionId: string;
-  totalMessages: number;
 }
 
 export interface StatusResponse {
   plan?: ExecutionPlan;
   lastActivity?: number;
   sessionId?: string;
-  metrics?: {
-    requestCount: number;
-    errorCount: number;
-    avgResponseTime: number;
-    activeConnections: number;
-  };
+  filesCount?: number;
 }
 
 export interface MetricsResponse {
@@ -148,11 +162,86 @@ export interface MetricsResponse {
   errorCount: number;
   avgResponseTime: number;
   activeConnections: number;
+  totalResponseTime: number;
+  complexityDistribution?: {
+    simple: number;
+    complex: number;
+  };
   circuitBreaker?: {
     failures: number;
     isOpen: boolean;
   };
 }
 
-// Re-export for convenience
-export type { ExecutionConfig } from './utils/gemini';
+// ===== Durable Object Types =====
+
+export interface DurableObjectNamespace {
+  idFromName(name: string): DurableObjectId;
+  idFromString(id: string): DurableObjectId;
+  newUniqueId(): DurableObjectId;
+  get(id: DurableObjectId): DurableObjectStub;
+}
+
+export interface DurableObjectId {
+  toString(): string;
+  equals(other: DurableObjectId): boolean;
+}
+
+export interface DurableObjectStub {
+  fetch(request: Request): Promise<Response>;
+  id: DurableObjectId;
+}
+
+// ===== Configuration Types =====
+
+export interface AgentConfig {
+  maxHistoryMessages?: number;
+  maxMessageSize?: number;
+  maxTotalHistorySize?: number;
+  complexityCacheTTL?: number;
+  maxTurns?: number;
+  defaultModel?: string;
+  thinkingBudget?: number;
+}
+
+export interface StepExecutionOptions {
+  continueOnFailure?: boolean;
+  maxRetries?: number;
+  parallelExecution?: boolean;
+  timeoutMs?: number;
+}
+
+// ===== Error Types =====
+
+export class AgentError extends Error {
+  constructor(
+    message: string,
+    public code: string,
+    public statusCode: number = 500,
+    public details?: any
+  ) {
+    super(message);
+    this.name = 'AgentError';
+  }
+}
+
+export class ToolExecutionError extends AgentError {
+  constructor(message: string, public toolName: string, details?: any) {
+    super(message, 'TOOL_EXECUTION_ERROR', 500, details);
+    this.name = 'ToolExecutionError';
+  }
+}
+
+export class PlanningError extends AgentError {
+  constructor(message: string, details?: any) {
+    super(message, 'PLANNING_ERROR', 500, details);
+    this.name = 'PlanningError';
+  }
+}
+
+export class StateError extends AgentError {
+  constructor(message: string, details?: any) {
+    super(message, 'STATE_ERROR', 500, details);
+    this.name = 'StateError';
+  }
+}

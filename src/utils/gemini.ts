@@ -100,7 +100,7 @@ export class GeminiClient {
         model: modelName,
         contents,
         config: {
-          thinkingConfig: options.thinkingConfig ?? { thinkingBudget: 512 },
+           thinkingConfig: options.thinkingConfig ?? { thinkingBudget: 512 },
           stream: true
         }
       });
@@ -109,7 +109,15 @@ export class GeminiClient {
       
       if (streamCall && Symbol.asyncIterator in streamCall) {
         for await (const chunk of streamCall) {
-          const text = chunk?.text ?? chunk?.delta ?? '';
+          // --- FIX: Apply same logic from streamSimple to handleStreamedResponse ---
+          let text = '';
+          if (typeof chunk?.text === 'function') {
+            text = chunk.text();
+          } else {
+            text = chunk?.delta ?? ''; // Fallback
+          }
+          // --- END FIX ---
+
           if (text) {
             fullText += text;
             if (onChunk) onChunk(text);
@@ -125,7 +133,6 @@ export class GeminiClient {
 
   private formatConversationHistory(history: any[]): any[] {
     const formatted: any[] = [];
-    
     for (const msg of history) {
       if (msg.role === 'system') {
         // System messages become user messages in Gemini
@@ -166,8 +173,17 @@ export class GeminiClient {
     try {
       if (streamResp && Symbol.asyncIterator in streamResp) {
         for await (const chunk of streamResp) {
-          // Extract text
-          const text = chunk?.text ?? chunk?.delta ?? '';
+          
+          // --- FIX: Correctly extract text from stream ---
+          // This is the primary bug fix
+          let text = '';
+          if (typeof chunk?.text === 'function') {
+            text = chunk.text();
+          } else {
+            // Fallback for different stream formats or deltas
+            text = chunk?.delta ?? '';
+          }
+
           if (text) {
             fullText += text;
             if (onChunk) {
@@ -178,6 +194,7 @@ export class GeminiClient {
               }
             }
           }
+          // --- END FIX ---
           
           // Extract function calls
           if (chunk?.functionCalls) {
@@ -231,7 +248,6 @@ export class GeminiClient {
       const content = candidate?.content;
       if (content?.parts) {
         parts.push(...content.parts);
-        
         for (const part of content.parts) {
           if (part.functionCall) {
             toolCalls.push({
@@ -255,14 +271,12 @@ export class GeminiClient {
 
   private async withRetry<T>(fn: () => Promise<T>): Promise<T> {
     let lastErr: any;
-    
     for (let i = 0; i < this.maxRetries; i++) {
       try {
         return await fn();
       } catch (err) {
         lastErr = err;
         console.warn(`Attempt ${i + 1} failed:`, err);
-        
         if (i < this.maxRetries - 1) {
           const delay = this.baseBackoff * Math.pow(2, i);
           await new Promise(r => setTimeout(r, delay));
@@ -289,6 +303,7 @@ export class GeminiClient {
   }
 
   // ===== File Management =====
+  // (No changes needed in this section)
 
   async uploadFile(
     fileDataBase64: string, 

@@ -669,4 +669,4 @@ Begin by assessing the user's request and deciding your approach.`;
   }
 }
 
-export default AutonomousAgentV2;
+export default AutonomousAgent;

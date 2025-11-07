@@ -291,16 +291,16 @@ export class AutonomousAgent extends DurableObject<Env> {
     });
   }
 
-  private getStatus(): Response {
-    const state = await this.loadState();
-    return new Response(
-      this.stringify({
-        currentMode: state.currentMode,
-        currentPhase: state.currentPhase,
-        lastActivity: state.lastActivityAt,
-        sessionId: state.sessionId,
-      }),
-      { headers: { 'Content-Type': 'application/json' } }
-    );
+  private async getStatus(): Promise<Response> {
+  const state = await this.loadState();
+  return new Response(
+    this.stringify({
+      currentMode: state.currentMode,
+      currentPhase: state.currentPhase,
+      lastActivity: state.lastActivityAt,
+      sessionId: state.sessionId,
+    }),
+    { headers: { 'Content-Type': 'application/json' } }
+  ); 
   }
 }

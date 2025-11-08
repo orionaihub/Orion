@@ -1,4 +1,4 @@
-// src/utils/gemini.ts - Complete Updated Version (corrected)
+// src/utils/gemini.ts - Multi-step autonomous version
 import { GoogleGenAI } from '@google/genai';
 import type { TaskComplexity, ExecutionPlan, FileMetadata } from '../types';
 
@@ -16,6 +16,28 @@ export interface ExecutionConfig {
   allowComputerUse?: boolean;
   useVision?: boolean;
   stepAction?: string;
+}
+
+export interface Tool {
+  name: string;
+  description: string;
+  parameters: Record<string, any>;
+}
+
+export interface GenerateOptions {
+  model?: string;
+  stream?: boolean;
+  timeoutMs?: number;
+  thinkingConfig?: { thinkingBudget: number };
+  temperature?: number;
+}
+
+export interface GenerateResponse {
+  text: string;
+  toolCalls?: Array<{
+    name: string;
+    args: Record<string, any>;
+  }>;
 }
 
 interface ToolConfig {
@@ -121,7 +143,6 @@ export class GeminiClient {
   private parse<T>(text: string): T | null {
     try {
       if (!text) return null;
-      // remove surrounding ```json or ``` and whitespace
       const trimmed = text
         .trim()
         .replace(/^\s*```(?:json)?\s*/i, '')
@@ -159,51 +180,324 @@ export class GeminiClient {
     ]);
   }
 
-  // ===== Files API =====
+  // ===== Tool Conversion =====
 
-  async uploadFile(fileDataBase64: string, mimeType: string, displayName: string): Promise<FileMetadata> {
-    return this.withRetry(async () => {
-      const buffer = Buffer.from(fileDataBase64, 'base64');
-      const uploadResp: any = await this.withTimeout(
-        this.ai.files.upload({ file: buffer as any, config: { mimeType, displayName } }),
-        'uploadFile timed out'
-      );
-      const name = uploadResp?.name;
-      if (!name) {
-        throw new Error('uploadFile failed: no file name returned from upload');
+  private convertToolsToFunctions(tools: Tool[]): any[] {
+    return tools.map(tool => ({
+      name: tool.name,
+      description: tool.description,
+      parameters: tool.parameters
+    }));
+  }
+
+  private formatConversationHistory(history: any[]): any[] {
+    return history.map(msg => {
+      if (msg.role === 'system') {
+        // System messages become user messages with system context
+        return {
+          role: 'user',
+          parts: [{ text: `[System Instructions]\n${msg.content}` }]
+        };
       }
-      const meta: any = await this.ai.files.get({ name });
+      
       return {
-        fileUri: meta?.uri,
-        mimeType: meta?.mimeType ?? mimeType,
-        name: meta?.displayName ?? displayName,
-        sizeBytes: meta?.sizeBytes ?? buffer.length,
-        uploadedAt: Date.now(),
-        state: (meta?.state as any) ?? 'ACTIVE',
-        expiresAt: meta?.expirationTime ? new Date(meta.expirationTime).getTime() : undefined,
-      } as FileMetadata;
+        role: msg.role === 'model' || msg.role === 'assistant' ? 'model' : 'user',
+        parts: [{ text: msg.content || '' }]
+      };
     });
   }
 
-  async getFileStatus(fileUriOrName: string): Promise<string> {
+  private extractTextFromChunk(chunk: any): string {
+    return chunk?.text ?? chunk?.delta ?? chunk?.content?.text ?? '';
+  }
+
+  private async extractTextFromResponse(response: any): Promise<string> {
+    if (!response) return '';
+    if (typeof response?.text === 'string') return response.text;
+    if (typeof response?.text === 'function') return await response.text();
+    if (response?.response?.text) {
+      return typeof response.response.text === 'function'
+        ? await response.response.text()
+        : response.response.text;
+    }
+    if (response?.result?.text) {
+      return typeof response.result.text === 'function' 
+        ? await response.result.text() 
+        : response.result.text;
+    }
+    return '';
+  }
+
+  private parseResponse(response: any): GenerateResponse {
+    const result: GenerateResponse = { text: '' };
+
+    // Extract text
+    if (response?.candidates?.[0]?.content?.parts) {
+      const parts = response.candidates[0].content.parts;
+      result.text = parts
+        .filter((p: any) => p.text)
+        .map((p: any) => p.text)
+        .join('');
+      
+      // Extract function calls (tool calls)
+      const functionCalls = parts.filter((p: any) => p.functionCall);
+      if (functionCalls.length > 0) {
+        result.toolCalls = functionCalls.map((fc: any) => ({
+          name: fc.functionCall.name,
+          args: fc.functionCall.args || {}
+        }));
+      }
+    } else if (typeof response?.text === 'string') {
+      result.text = response.text;
+    }
+
+    return result;
+  }
+
+  private async handleStreamedResponse(
+    streamResp: any,
+    onChunk?: (text: string) => void
+  ): Promise<GenerateResponse> {
+    let fullText = '';
+    const toolCalls: Array<{ name: string; args: Record<string, any> }> = [];
+
     try {
-      const name = fileUriOrName.split('/').pop() ?? fileUriOrName;
-      const meta: any = await this.ai.files.get({ name });
-      return meta?.state ?? 'UNKNOWN';
+      if (streamResp && typeof streamResp[Symbol.asyncIterator] === 'function') {
+        for await (const chunk of streamResp) {
+          // Extract text
+          const text = this.extractTextFromChunk(chunk);
+          if (text) {
+            fullText += text;
+            if (onChunk) {
+              try {
+                onChunk(text);
+              } catch (e) {
+                console.warn('[GeminiClient] onChunk error:', e);
+              }
+            }
+          }
+
+          // Extract tool calls from chunks
+          if (chunk?.candidates?.[0]?.content?.parts) {
+            const parts = chunk.candidates[0].content.parts;
+            const functionCalls = parts.filter((p: any) => p.functionCall);
+            for (const fc of functionCalls) {
+              toolCalls.push({
+                name: fc.functionCall.name,
+                args: fc.functionCall.args || {}
+              });
+            }
+          }
+        }
+        
+        return { 
+          text: fullText, 
+          toolCalls: toolCalls.length > 0 ? toolCalls : undefined 
+        };
+      }
+
+      // Fallback
+      const candidateIterable = streamResp?.stream ?? streamResp?.iterable ?? null;
+      if (candidateIterable && typeof candidateIterable[Symbol.asyncIterator] === 'function') {
+        for await (const chunk of candidateIterable) {
+          const text = this.extractTextFromChunk(chunk);
+          if (text) {
+            fullText += text;
+            if (onChunk) {
+              try {
+                onChunk(text);
+              } catch (e) {
+                console.warn('[GeminiClient] onChunk error:', e);
+              }
+            }
+          }
+        }
+        return { text: fullText };
+      }
+
+      // Last fallback: direct extraction
+      const result = await Promise.resolve(streamResp);
+      const text = await this.extractTextFromResponse(result);
+      if (text) {
+        fullText = text;
+        if (onChunk) {
+          try {
+            onChunk(text);
+          } catch (e) {
+            console.warn('[GeminiClient] onChunk error:', e);
+          }
+        }
+      }
+
+      return { text: fullText };
     } catch (e) {
-      console.warn('[GeminiClient] getFileStatus failed', e);
-      return 'FAILED';
+      console.error('[GeminiClient] Stream handling failed:', e);
+      throw e;
     }
   }
 
-  async deleteFile(fileUriOrName: string): Promise<void> {
-    try {
-      const name = fileUriOrName.split('/').pop() ?? fileUriOrName;
-      await this.ai.files.delete({ name });
-    } catch (e) {
-      console.warn('[GeminiClient] deleteFile failed', e);
-    }
+  // ===== Main Multi-Step Method =====
+
+  /**
+   * Generate response with tool use capability
+   * This is the main method for the agentic loop
+   */
+  async generateWithTools(
+    conversationHistory: any[],
+    tools: Tool[],
+    options: GenerateOptions = {},
+    onChunk?: (text: string) => void
+  ): Promise<GenerateResponse> {
+    return this.withRetry(async () => {
+      const modelName = options.model ?? 'gemini-2.5-flash';
+      
+      // Convert conversation history to Gemini format
+      const contents = this.formatConversationHistory(conversationHistory);
+      
+      // Convert tools to Gemini function declaration format
+      const functionDeclarations = tools.length > 0 
+        ? this.convertToolsToFunctions(tools) 
+        : undefined;
+      
+      const config: any = {
+        thinkingConfig: options.thinkingConfig ?? { thinkingBudget: 1024 },
+        temperature: options.temperature ?? 0.7,
+      };
+      
+      if (functionDeclarations) {
+        config.tools = [{ functionDeclarations }];
+      }
+      
+      if (options.stream) {
+        // Streaming generation
+        const generateCall = this.ai.models.generateContentStream({
+          model: modelName,
+          contents,
+          config
+        } as any);
+
+        const streamResp = await this.withTimeout(
+          generateCall, 
+          'generateWithTools timeout', 
+          options.timeoutMs
+        );
+
+        return await this.handleStreamedResponse(streamResp, onChunk);
+      } else {
+        // Non-streaming generation
+        const generateCall = this.ai.models.generateContent({
+          model: modelName,
+          contents,
+          config
+        } as any);
+
+        const response = await this.withTimeout(
+          generateCall, 
+          'generateWithTools timeout', 
+          options.timeoutMs
+        );
+
+        const result = this.parseResponse(response);
+        
+        if (result.text && onChunk) {
+          try {
+            onChunk(result.text);
+          } catch (e) {
+            console.warn('[GeminiClient] onChunk error:', e);
+          }
+        }
+
+        return result;
+      }
+    });
   }
+
+  // ===== Legacy Methods (Maintained for Compatibility) =====
+
+  async streamResponse(
+    query: string,
+    history: Array<{ role: string; parts: any[] }>,
+    onChunk?: (text: string) => void,
+    opts?: { model?: string; thinkingConfig?: any; timeoutMs?: number }
+  ): Promise<string> {
+    return this.withRetry(async () => {
+      const modelName = opts?.model ?? 'gemini-2.5-flash';
+      const contents = this.buildContents(query, history);
+
+      const call: any = this.ai.models.generateContentStream({
+        model: modelName,
+        contents,
+        config: {
+          thinkingConfig: opts?.thinkingConfig ?? { thinkingBudget: 512 },
+        },
+      } as any);
+
+      const streamResp = await this.withTimeout(call, 'streamResponse timed out', opts?.timeoutMs);
+      const response = await this.handleStreamedResponse(streamResp, onChunk);
+      
+      return response.text || '';
+    });
+  }
+
+  async executeWithConfig(
+    prompt: string,
+    history: Array<{ role: string; parts: any[] }>,
+    config: ExecutionConfig,
+    onChunk?: (text: string) => void
+  ): Promise<string> {
+    return this.withRetry(async () => {
+      let tools: Array<Record<string, unknown>> = [];
+
+      const hasFiles = (config.files ?? []).length > 0;
+      const hasUrls = (config.urlList ?? []).length > 0;
+
+      if (config.stepAction) {
+        tools = this.mapActionToTools(config.stepAction, { hasFiles, hasUrls });
+      } else {
+        if (config.useSearch) tools.push({ googleSearch: {} });
+        if (config.useCodeExecution) tools.push({ codeExecution: {} });
+        if (config.useMapsGrounding) tools.push({ googleMaps: {} });
+        if (config.useUrlContext && hasUrls) tools.push({ urlContext: {} });
+        if (config.allowComputerUse) tools.push({ computerUse: {} });
+        if (hasFiles) tools.push({ fileAnalysis: {} });
+        if (config.useVision) tools.push({ vision: {} });
+      }
+
+      const contents = this.buildContents(prompt, history, config.files ?? [], config.urlList ?? []);
+
+      const call = this.ai.models.generateContent({
+        model: config.model ?? 'gemini-2.5-flash',
+        contents,
+        config: {
+          thinkingConfig: config.thinkingConfig ?? { thinkingBudget: 512 },
+          tools: tools.length ? tools : undefined,
+        },
+      } as any);
+
+      const resp: any = await this.withTimeout(call, 'executeWithConfig timed out', config.timeoutMs);
+
+      let text = '';
+      if (typeof resp?.text === 'string') {
+        text = resp.text;
+      } else if (typeof resp?.text === 'function') {
+        text = await resp.text();
+      } else {
+        text = (await this.extractTextFromResponse(resp)) ?? '';
+      }
+
+      if (text && onChunk) {
+        try {
+          onChunk(text);
+        } catch (e) {
+          console.warn('[GeminiClient] onChunk error:', e);
+        }
+      }
+
+      return text || '[no-result]';
+    });
+  }
+
+  // ===== Helper Methods =====
 
   private mapActionToTools(
     action: string | undefined,
@@ -267,196 +561,51 @@ export class GeminiClient {
     return contents;
   }
 
-  private extractTextFromChunk(chunk: any): string {
-    return chunk?.text ?? chunk?.delta ?? chunk?.content?.text ?? '';
+  // ===== Files API =====
+
+  async uploadFile(fileDataBase64: string, mimeType: string, displayName: string): Promise<FileMetadata> {
+    return this.withRetry(async () => {
+      const buffer = Buffer.from(fileDataBase64, 'base64');
+      const uploadResp: any = await this.withTimeout(
+        this.ai.files.upload({ file: buffer as any, config: { mimeType, displayName } }),
+        'uploadFile timed out'
+      );
+      const name = uploadResp?.name;
+      if (!name) {
+        throw new Error('uploadFile failed: no file name returned from upload');
+      }
+      const meta: any = await this.ai.files.get({ name });
+      return {
+        fileUri: meta?.uri,
+        mimeType: meta?.mimeType ?? mimeType,
+        name: meta?.displayName ?? displayName,
+        sizeBytes: meta?.sizeBytes ?? buffer.length,
+        uploadedAt: Date.now(),
+        state: (meta?.state as any) ?? 'ACTIVE',
+        expiresAt: meta?.expirationTime ? new Date(meta.expirationTime).getTime() : undefined,
+      } as FileMetadata;
+    });
   }
 
-  private async extractTextFromResponse(response: any): Promise<string> {
-    if (!response) return '';
-    if (typeof response?.text === 'string') return response.text;
-    if (typeof response?.text === 'function') return await response.text();
-    if (response?.response?.text) {
-      return typeof response.response.text === 'function'
-        ? await response.response.text()
-        : response.response.text;
-    }
-    // sometimes SDK exposes .result?.text
-    if (response?.result?.text) {
-      return typeof response.result.text === 'function' ? await response.result.text() : response.result.text;
-    }
-    return '';
-  }
-
-  private async handleStreamedResponse(
-    streamResp: any,
-    onChunk?: (text: string) => void
-  ): Promise<string> {
-    let fullText = '';
-
+  async getFileStatus(fileUriOrName: string): Promise<string> {
     try {
-      // If streamResp is an async iterable (most streaming SDKs)
-      if (streamResp && typeof streamResp[Symbol.asyncIterator] === 'function') {
-        for await (const chunk of streamResp) {
-          const text = this.extractTextFromChunk(chunk);
-          if (text) {
-            fullText += text;
-            if (onChunk) {
-              try {
-                onChunk(text);
-              } catch (e) {
-                console.warn('[GeminiClient] onChunk error:', e);
-              }
-            }
-          }
-        }
-        return fullText;
-      }
-
-      // If SDK returns object with .stream or .iterable property
-      const candidateIterable = streamResp?.stream ?? streamResp?.iterable ?? null;
-      if (candidateIterable && typeof candidateIterable[Symbol.asyncIterator] === 'function') {
-        for await (const chunk of candidateIterable) {
-          const text = this.extractTextFromChunk(chunk);
-          if (text) {
-            fullText += text;
-            if (onChunk) {
-              try {
-                onChunk(text);
-              } catch (e) {
-                console.warn('[GeminiClient] onChunk error:', e);
-              }
-            }
-          }
-        }
-        return fullText;
-      }
-
-      // Fallback: try to get text directly from response
-      const result = await Promise.resolve(streamResp);
-      const text = await this.extractTextFromResponse(result);
-      if (text) {
-        fullText = text;
-        if (onChunk) {
-          try {
-            onChunk(text);
-          } catch (e) {
-            console.warn('[GeminiClient] onChunk error:', e);
-          }
-        }
-      }
-
-      return fullText;
+      const name = fileUriOrName.split('/').pop() ?? fileUriOrName;
+      const meta: any = await this.ai.files.get({ name });
+      return meta?.state ?? 'UNKNOWN';
     } catch (e) {
-      console.error('[GeminiClient] Stream handling failed:', e);
-      throw e;
+      console.warn('[GeminiClient] getFileStatus failed', e);
+      return 'FAILED';
     }
   }
 
-  
- 
-  async streamResponse(
-    query: string,
-    history: Array<{ role: string; parts: any[] }>,
-    onChunk?: (text: string) => void,
-    opts?: { model?: string; thinkingConfig?: any; timeoutMs?: number }
-  ): Promise<string> {
-    return this.withRetry(async () => {
-      const modelName = opts?.model ?? 'gemini-2.5-flash';
-      // Use the same buildContents as elsewhere
-      const contents = this.buildContents(query, history);
-
-      // Use the streaming API (SDK shapes vary; cast to any)
-      const call: any = this.ai.models.generateContentStream({
-        model: modelName,
-        contents,
-        config: {
-          thinkingConfig: opts?.thinkingConfig ?? { thinkingBudget: 512 },
-        },
-      } as any);
-
-      // Respect timeout
-      const streamResp = await this.withTimeout(call, 'streamResponse timed out', opts?.timeoutMs);
-
-      // handleStreamedResponse is robust to async iterables or objects with .stream
-      const fullText = await this.handleStreamedResponse(streamResp, onChunk);
-
-      // If nothing collected, try direct final text fallback
-      if (!fullText) {
-        const finalText = await this.extractTextFromResponse(streamResp);
-        if (finalText && onChunk) {
-          try {
-            onChunk(finalText);
-          } catch (e) {
-            console.warn('[GeminiClient] onChunk error:', e);
-          }
-        }
-        return finalText ?? '';
-      }
-
-      return fullText;
-    });
+  async deleteFile(fileUriOrName: string): Promise<void> {
+    try {
+      const name = fileUriOrName.split('/').pop() ?? fileUriOrName;
+      await this.ai.files.delete({ name });
+    } catch (e) {
+      console.warn('[GeminiClient] deleteFile failed', e);
+    }
   }
-
-  async executeWithConfig(
-    prompt: string,
-    history: Array<{ role: string; parts: any[] }>,
-    config: ExecutionConfig,
-    onChunk?: (text: string) => void
-  ): Promise<string> {
-    return this.withRetry(async () => {
-      let tools: Array<Record<string, unknown>> = [];
-
-      const hasFiles = (config.files ?? []).length > 0;
-      const hasUrls = (config.urlList ?? []).length > 0;
-
-      if (config.stepAction) {
-        tools = this.mapActionToTools(config.stepAction, { hasFiles, hasUrls });
-      } else {
-        if (config.useSearch) tools.push({ googleSearch: {} });
-        if (config.useCodeExecution) tools.push({ codeExecution: {} });
-        if (config.useMapsGrounding) tools.push({ googleMaps: {} });
-        if (config.useUrlContext && hasUrls) tools.push({ urlContext: {} });
-        if (config.allowComputerUse) tools.push({ computerUse: {} });
-        if (hasFiles) tools.push({ fileAnalysis: {} });
-        if (config.useVision) tools.push({ vision: {} });
-      }
-
-      const contents = this.buildContents(prompt, history, config.files ?? [], config.urlList ?? []);
-
-      const call = this.ai.models.generateContent({
-        model: config.model ?? 'gemini-2.5-flash',
-        contents,
-        config: {
-          thinkingConfig: config.thinkingConfig ?? { thinkingBudget: 512 },
-          tools: tools.length ? tools : undefined,
-        },
-      } as any);
-
-      const resp: any = await this.withTimeout(call, 'executeWithConfig timed out', config.timeoutMs);
-
-      let text = '';
-      if (typeof resp?.text === 'string') {
-        text = resp.text;
-      } else if (typeof resp?.text === 'function') {
-        text = await resp.text();
-      } else {
-        // fallback: try response.result or similar shapes
-        text = (await this.extractTextFromResponse(resp)) ?? '';
-      }
-
-      if (text && onChunk) {
-        try {
-          onChunk(text);
-        } catch (e) {
-          console.warn('[GeminiClient] onChunk error:', e);
-        }
-      }
-
-      return text || '[no-result]';
-    });
-  }
-
-  
 
   getCircuitBreakerStatus() {
     return this.circuitBreaker.getStatus();

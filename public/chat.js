@@ -1,69 +1,123 @@
 /**
- * Suna-Lite Frontend with File Upload Support
- *
- * Handles chat UI, WebSocket communication, and file uploads
+ * Enhanced Suna-Lite Frontend with Markdown, Sidebar, and Full File Support
  */
 
 // DOM elements
 const chatMessages = document.getElementById("chat-messages");
+const welcomeScreen = document.getElementById("welcome-screen");
 const userInput = document.getElementById("user-input");
 const sendButton = document.getElementById("send-button");
 const typingIndicator = document.getElementById("typing-indicator");
+const typingText = document.getElementById("typing-text");
 const fileInput = document.getElementById("file-input");
-const uploadedFilesArea = document.getElementById("uploaded-files-area");
-const capabilitiesEl = document.getElementById("capabilities");
+const fileUploadArea = document.getElementById("file-upload-area");
+const uploadedFilesContainer = document.getElementById("uploaded-files");
+const sidebar = document.getElementById("sidebar");
+const sidebarOverlay = document.getElementById("sidebar-overlay");
+const mainContent = document.getElementById("main-content");
 
 // WebSocket connection
 let ws = null;
 let isConnecting = false;
 let reconnectAttempts = 0;
-const MAX_RECONNECT_DELAY = 30000; // 30 seconds
+const MAX_RECONNECT_DELAY = 30000;
 
 // Chat state
 let isProcessing = false;
 let currentMessageElement = null;
-let currentPlanElement = null;
-let uploadedFiles = [];
 let pendingFiles = [];
+let conversationStarted = false;
+
+// Configure marked.js for better markdown rendering
+marked.setOptions({
+  breaks: true,
+  gfm: true,
+  headerIds: false,
+  mangle: false,
+  highlight: function(code, lang) {
+    if (lang && hljs.getLanguage(lang)) {
+      try {
+        return hljs.highlight(code, { language: lang }).value;
+      } catch (err) {
+        console.error('Highlight error:', err);
+      }
+    }
+    return hljs.highlightAuto(code).value;
+  }
+});
 
 // Load chat history on page load
 window.addEventListener('DOMContentLoaded', () => {
   loadChatHistory();
   connectWebSocket();
   setupFileUpload();
+  setupInputHandlers();
+  checkMobileView();
 });
 
+// Window resize handler
+window.addEventListener('resize', checkMobileView);
+
 /**
- * Setup file upload handler
+ * Check if mobile view and adjust sidebar
+ */
+function checkMobileView() {
+  if (window.innerWidth <= 768) {
+    sidebar.classList.add('hidden');
+    mainContent.classList.add('expanded');
+  } else {
+    sidebar.classList.remove('hidden');
+    mainContent.classList.remove('expanded');
+    sidebarOverlay.classList.remove('visible');
+  }
+}
+
+/**
+ * Toggle sidebar (mobile)
+ */
+function toggleSidebar() {
+  if (window.innerWidth <= 768) {
+    sidebar.classList.toggle('hidden');
+    sidebar.classList.toggle('visible');
+    sidebarOverlay.classList.toggle('visible');
+  }
+}
+
+/**
+ * Setup file upload handler with extended support
  */
 function setupFileUpload() {
   fileInput.addEventListener('change', async (e) => {
     const files = Array.from(e.target.files);
     
     for (const file of files) {
-      if (file.size > 10 * 1024 * 1024) { // 10MB limit
-        addStatusMessage(`File ${file.name} is too large (max 10MB)`, 'error');
+      // 20MB limit
+      if (file.size > 20 * 1024 * 1024) {
+        addToast(`File ${file.name} is too large (max 20MB)`, 'error');
         continue;
       }
 
       try {
         const base64 = await fileToBase64(file);
-        pendingFiles.push({
-          data: base64.split(',')[1], // Remove data:xxx;base64, prefix
+        const fileData = {
+          data: base64.split(',')[1],
           mimeType: file.type,
           name: file.name,
           size: file.size
-        });
-
-        addFileChip(file.name, file.size);
+        };
+        
+        pendingFiles.push(fileData);
+        addFileChip(file);
+        
+        addToast(`Added: ${file.name}`, 'success');
       } catch (error) {
         console.error('File reading failed:', error);
-        addStatusMessage(`Failed to read ${file.name}`, 'error');
+        addToast(`Failed to read ${file.name}`, 'error');
       }
     }
 
-    // Clear file input
     fileInput.value = '';
+    updateFileUploadArea();
   });
 }
 
@@ -82,28 +136,59 @@ function fileToBase64(file) {
 /**
  * Add file chip to UI
  */
-function addFileChip(name, size) {
-  uploadedFilesArea.classList.remove('empty');
-  
+function addFileChip(file) {
   const chip = document.createElement('div');
   chip.className = 'file-chip';
+  chip.dataset.fileName = file.name;
+  
+  const icon = getFileIcon(file.type, file.name);
+  
   chip.innerHTML = `
-    <span>📄 ${name} (${formatFileSize(size)})</span>
-    <span class="remove" onclick="removeFileChip(this, '${name}')">✕</span>
+    <span class="file-chip-icon">${icon}</span>
+    <span>${file.name} (${formatFileSize(file.size)})</span>
+    <span class="file-chip-remove" onclick="removeFileChip('${escapeHtml(file.name)}')">✕</span>
   `;
   
-  uploadedFilesArea.appendChild(chip);
+  uploadedFilesContainer.appendChild(chip);
+}
+
+/**
+ * Get appropriate icon for file type
+ */
+function getFileIcon(mimeType, fileName) {
+  if (mimeType.startsWith('image/')) return '🖼️';
+  if (mimeType.includes('pdf')) return '📄';
+  if (mimeType.includes('word') || fileName.endsWith('.doc') || fileName.endsWith('.docx')) return '📝';
+  if (mimeType.includes('sheet') || fileName.endsWith('.csv') || fileName.endsWith('.xlsx')) return '📊';
+  if (mimeType.includes('json')) return '📋';
+  if (mimeType.includes('text')) return '📃';
+  return '📎';
 }
 
 /**
  * Remove file chip
  */
-function removeFileChip(element, fileName) {
+function removeFileChip(fileName) {
   pendingFiles = pendingFiles.filter(f => f.name !== fileName);
-  element.parentElement.remove();
   
-  if (pendingFiles.length === 0) {
-    uploadedFilesArea.classList.add('empty');
+  const chips = uploadedFilesContainer.querySelectorAll('.file-chip');
+  chips.forEach(chip => {
+    if (chip.dataset.fileName === fileName) {
+      chip.remove();
+    }
+  });
+  
+  updateFileUploadArea();
+}
+
+/**
+ * Update file upload area visibility
+ */
+function updateFileUploadArea() {
+  if (pendingFiles.length > 0) {
+    fileUploadArea.classList.add('has-files');
+  } else {
+    fileUploadArea.classList.remove('has-files');
   }
 }
 
@@ -114,6 +199,28 @@ function formatFileSize(bytes) {
   if (bytes < 1024) return bytes + ' B';
   if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
   return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+}
+
+/**
+ * Setup input handlers
+ */
+function setupInputHandlers() {
+  // Auto-resize textarea
+  userInput.addEventListener("input", function () {
+    this.style.height = "auto";
+    this.style.height = Math.min(this.scrollHeight, 200) + "px";
+  });
+
+  // Send on Enter (without Shift)
+  userInput.addEventListener("keydown", function (e) {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      sendMessage();
+    }
+  });
+
+  // Send button
+  sendButton.addEventListener("click", sendMessage);
 }
 
 /**
@@ -135,7 +242,6 @@ function connectWebSocket() {
     console.log('WebSocket connected');
     isConnecting = false;
     reconnectAttempts = 0;
-    updateConnectionStatus('connected');
   };
 
   ws.onmessage = (event) => {
@@ -150,7 +256,6 @@ function connectWebSocket() {
   ws.onclose = (event) => {
     console.log('WebSocket closed:', event.code, event.reason);
     isConnecting = false;
-    updateConnectionStatus('disconnected');
     
     reconnectAttempts++;
     const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), MAX_RECONNECT_DELAY);
@@ -168,103 +273,46 @@ function connectWebSocket() {
  * Handle messages from the server
  */
 function handleServerMessage(data) {
-  console.log('Received:', data.type);
+  console.log('Received:', data.type, data);
 
   switch (data.type) {
-    case 'connected':
-      console.log('Session ID:', data.sessionId);
-      if (data.capabilities) {
-        displayCapabilities(data.capabilities);
-      }
-      break;
-
     case 'status':
       updateTypingIndicator(data.message);
       break;
 
     case 'chunk':
       if (!currentMessageElement) {
+        hideWelcome();
         currentMessageElement = createMessageElement('assistant');
       }
       appendToMessage(currentMessageElement, data.content);
       scrollToBottom();
       break;
 
-    case 'plan':
-      currentPlanElement = createPlanElement(data.plan);
-      scrollToBottom();
-      break;
-
-    case 'step_start':
-      updateTypingIndicator(`Step ${data.step}/${data.total}: ${data.description}`);
-      if (currentPlanElement) {
-        updatePlanStep(currentPlanElement, data.step - 1, 'active');
+    case 'tool_use':
+      if (data.tools && data.tools.length > 0) {
+        showToolUse(data.tools);
       }
-      break;
-
-    case 'step_complete':
-      if (currentPlanElement) {
-        updatePlanStep(currentPlanElement, data.step - 1, 'completed');
-      }
-      break;
-
-    case 'step_error':
-      if (currentPlanElement) {
-        updatePlanStep(currentPlanElement, data.step - 1, 'failed');
-      }
-      addStatusMessage(`Error in step ${data.step}: ${data.error}`, 'error');
-      break;
-
-    case 'file_uploaded':
-      addStatusMessage(`✓ Uploaded: ${data.file.name} (${formatFileSize(data.file.size)})`, 'success');
-      break;
-
-    case 'file_analyzed':
-      addStatusMessage(`✓ Analyzed file: ${data.fileName}`, 'success');
-      break;
-
-    case 'code_executing':
-      addStatusMessage('⚙️ Executing code...', 'info');
-      break;
-
-    case 'code_result':
-      if (data.result) {
-        addCodeResultElement(data.result);
-      }
-      break;
-
-    case 'final_response':
-      currentMessageElement = createMessageElement('assistant');
-      appendToMessage(currentMessageElement, data.content);
-      scrollToBottom();
-      break;
-
-    case 'sources':
-      if (data.sources && data.sources.length > 0) {
-        addSourcesElement(data.sources);
-      }
-      break;
-
-    case 'thinking':
-      addThinkingElement(data.thoughts);
       break;
 
     case 'done':
       hideTypingIndicator();
+      if (currentMessageElement) {
+        finalizeMessage(currentMessageElement);
+      }
       currentMessageElement = null;
-      currentPlanElement = null;
       isProcessing = false;
       enableInput();
       
       // Clear pending files after successful send
       pendingFiles = [];
-      uploadedFilesArea.innerHTML = '';
-      uploadedFilesArea.classList.add('empty');
+      uploadedFilesContainer.innerHTML = '';
+      updateFileUploadArea();
       break;
 
     case 'error':
       hideTypingIndicator();
-      addStatusMessage(`Error: ${data.error}`, 'error');
+      addToast(`Error: ${data.error}`, 'error');
       currentMessageElement = null;
       isProcessing = false;
       enableInput();
@@ -276,26 +324,21 @@ function handleServerMessage(data) {
 }
 
 /**
- * Display capabilities
+ * Show tool usage indicator
  */
-function displayCapabilities(capabilities) {
-  capabilitiesEl.innerHTML = '';
+function showToolUse(tools) {
+  if (!currentMessageElement) {
+    hideWelcome();
+    currentMessageElement = createMessageElement('assistant');
+  }
   
-  const capabilityIcons = {
-    'search': '🔍 Search',
-    'code_execution': '💻 Code',
-    'file_analysis': '📄 Files',
-    'vision': '👁️ Vision',
-    'data_analysis': '📊 Data',
-    'image_generation': '🎨 Images'
-  };
-
-  capabilities.forEach(cap => {
-    const badge = document.createElement('span');
-    badge.className = 'capability-badge';
-    badge.textContent = capabilityIcons[cap] || cap;
-    capabilitiesEl.appendChild(badge);
-  });
+  const toolIndicator = document.createElement('div');
+  toolIndicator.className = 'tool-use-indicator';
+  toolIndicator.innerHTML = `🔧 Using tools: ${tools.join(', ')}`;
+  
+  const content = currentMessageElement.querySelector('.message-content');
+  content.appendChild(toolIndicator);
+  scrollToBottom();
 }
 
 /**
@@ -307,7 +350,7 @@ async function sendMessage() {
   if (message === "" || isProcessing) return;
 
   if (!ws || ws.readyState !== WebSocket.OPEN) {
-    addStatusMessage('Connecting to server...', 'info');
+    addToast('Connecting to server...', 'info');
     connectWebSocket();
     setTimeout(() => {
       if (ws && ws.readyState === WebSocket.OPEN) {
@@ -320,8 +363,11 @@ async function sendMessage() {
   isProcessing = true;
   disableInput();
 
+  // Hide welcome screen on first message
+  hideWelcome();
+
   // Add user message to chat
-  addMessageToChat("user", message);
+  addUserMessage(message);
 
   // Clear input
   userInput.value = "";
@@ -344,10 +390,20 @@ async function sendMessage() {
     ws.send(JSON.stringify(payload));
   } catch (error) {
     console.error('Error sending message:', error);
-    addStatusMessage('Failed to send message. Please try again.', 'error');
+    addToast('Failed to send message. Please try again.', 'error');
     isProcessing = false;
     enableInput();
     hideTypingIndicator();
+  }
+}
+
+/**
+ * Hide welcome screen
+ */
+function hideWelcome() {
+  if (!conversationStarted) {
+    welcomeScreen.classList.add('hidden');
+    conversationStarted = true;
   }
 }
 
@@ -360,243 +416,134 @@ async function loadChatHistory() {
     if (response.ok) {
       const data = await response.json();
       
-      chatMessages.innerHTML = '';
-      
-      if (data.history && data.history.length > 0) {
-        data.history.forEach(msg => {
-          const role = msg.role === 'model' ? 'assistant' : msg.role;
+      if (data.messages && data.messages.length > 0) {
+        hideWelcome();
+        
+        data.messages.forEach(msg => {
+          const role = msg.role === 'model' ? 'assistant' : 'user';
           if (msg.parts && msg.parts.length > 0) {
             const textParts = msg.parts
               .filter(p => p.text)
               .map(p => p.text)
               .join('\n');
             if (textParts) {
-              addMessageToChat(role, textParts, false);
+              if (role === 'user') {
+                addUserMessage(textParts, false);
+              } else {
+                addAssistantMessage(textParts, false);
+              }
             }
           }
         });
-      } else {
-        showWelcomeMessage();
+        
+        scrollToBottom();
       }
-
-      // Display uploaded files
-      if (data.files && data.files.length > 0) {
-        uploadedFiles = data.files;
-      }
-    } else {
-      showWelcomeMessage();
     }
   } catch (error) {
     console.error('Error loading chat history:', error);
-    showWelcomeMessage();
   }
-}
-
-/**
- * Show welcome message
- */
-function showWelcomeMessage() {
-  chatMessages.innerHTML = '';
-  const welcomeEl = document.createElement('div');
-  welcomeEl.className = 'message assistant-message';
-  welcomeEl.innerHTML = `
-    <p><strong>🤖 Welcome to Suna-Lite!</strong></p>
-    <p>I'm an autonomous AI agent powered by Gemini 2.0 Flash with enhanced capabilities:</p>
-    <ul>
-      <li>🔍 <strong>Web Search</strong> - Real-time information from Google</li>
-      <li>💻 <strong>Code Execution</strong> - Run Python code for calculations and analysis</li>
-      <li>📄 <strong>File Analysis</strong> - Process PDFs, CSVs, TXT, and more</li>
-      <li>👁️ <strong>Vision</strong> - Analyze and understand images</li>
-      <li>📊 <strong>Data Analysis</strong> - Comprehensive data processing</li>
-      <li>🧠 <strong>Multi-step Tasks</strong> - Complex task planning and execution</li>
-    </ul>
-    <p><strong>Try uploading files</strong> with the 📎 button and asking me to analyze them!</p>
-  `;
-  chatMessages.appendChild(welcomeEl);
 }
 
 /**
  * Create a message element
  */
 function createMessageElement(role) {
+  const wrapper = document.createElement("div");
+  wrapper.className = "message-wrapper";
+  
   const messageEl = document.createElement("div");
   messageEl.className = `message ${role}-message`;
-  messageEl.innerHTML = "<p></p>";
-  chatMessages.appendChild(messageEl);
+  
+  const avatar = role === 'user' ? '👤' : '🤖';
+  const sender = role === 'user' ? 'You' : 'Suna-Lite';
+  
+  messageEl.innerHTML = `
+    <div class="message-header">
+      <div class="message-avatar">${avatar}</div>
+      <span class="message-sender">${sender}</span>
+    </div>
+    <div class="message-content"></div>
+  `;
+  
+  wrapper.appendChild(messageEl);
+  chatMessages.appendChild(wrapper);
+  
   return messageEl;
 }
 
 /**
- * Append content to a message element
+ * Append content to a message (streaming)
  */
 function appendToMessage(element, content) {
-  const p = element.querySelector('p');
-  p.textContent += content;
-}
-
-/**
- * Add a complete message to chat
- */
-function addMessageToChat(role, content, scroll = true) {
-  const messageEl = document.createElement("div");
-  messageEl.className = `message ${role}-message`;
-  messageEl.innerHTML = `<p>${escapeHtml(content)}</p>`;
-  chatMessages.appendChild(messageEl);
-
-  if (scroll) {
-    scrollToBottom();
-  }
-}
-
-/**
- * Create execution plan element with sections
- */
-function createPlanElement(plan) {
-  const planEl = document.createElement('div');
-  planEl.className = 'plan-container';
+  const contentDiv = element.querySelector('.message-content');
   
-  const totalSteps = plan.steps?.length || 0;
+  // For streaming, append raw text temporarily
+  if (!contentDiv.dataset.streaming) {
+    contentDiv.dataset.streaming = 'true';
+    contentDiv.dataset.rawContent = '';
+  }
   
-  planEl.innerHTML = `
-    <div class="plan-header">
-      <strong>📋 Execution Plan</strong>
-      <span class="plan-status">${totalSteps} steps</span>
-    </div>
-    <div class="plan-sections"></div>
-  `;
-
-  const sectionsContainer = planEl.querySelector('.plan-sections');
-
-  if (plan.sections && plan.sections.length > 0) {
-    // Display with sections
-    plan.sections.forEach((section, sectionIdx) => {
-      const sectionEl = document.createElement('div');
-      sectionEl.className = 'plan-section';
-      sectionEl.innerHTML = `
-        <div class="section-header">${section.name}</div>
-        <div class="plan-steps"></div>
-      `;
-
-      const stepsContainer = sectionEl.querySelector('.plan-steps');
-      section.steps.forEach((step, stepIdx) => {
-        const globalIndex = plan.steps.findIndex(s => s.id === step.id);
-        const stepEl = createStepElement(step, globalIndex);
-        stepsContainer.appendChild(stepEl);
-      });
-
-      sectionsContainer.appendChild(sectionEl);
-    });
-  } else {
-    // Display without sections (flat list)
-    const sectionEl = document.createElement('div');
-    sectionEl.className = 'plan-steps';
-    
-    plan.steps.forEach((step, index) => {
-      const stepEl = createStepElement(step, index);
-      sectionEl.appendChild(stepEl);
-    });
-    
-    sectionsContainer.appendChild(sectionEl);
-  }
-
-  chatMessages.appendChild(planEl);
-  return planEl;
+  contentDiv.dataset.rawContent += content;
+  contentDiv.textContent = contentDiv.dataset.rawContent;
 }
 
 /**
- * Create step element
+ * Finalize message (render markdown)
  */
-function createStepElement(step, index) {
-  const stepEl = document.createElement('div');
-  stepEl.className = 'plan-step';
-  stepEl.dataset.index = index;
-  stepEl.innerHTML = `
-    <span class="step-number">${index + 1}</span>
-    <span class="step-description">${escapeHtml(step.description)}</span>
-    <span class="step-status">pending</span>
-  `;
-  return stepEl;
+function finalizeMessage(element) {
+  const contentDiv = element.querySelector('.message-content');
+  const rawContent = contentDiv.dataset.rawContent || contentDiv.textContent;
+  
+  // Render markdown
+  contentDiv.innerHTML = marked.parse(rawContent);
+  
+  // Highlight code blocks
+  contentDiv.querySelectorAll('pre code').forEach((block) => {
+    hljs.highlightElement(block);
+  });
+  
+  delete contentDiv.dataset.streaming;
+  delete contentDiv.dataset.rawContent;
 }
 
 /**
- * Update plan step status
+ * Add user message
  */
-function updatePlanStep(planElement, stepIndex, status) {
-  const step = planElement.querySelector(`[data-index="${stepIndex}"]`);
-  if (step) {
-    step.classList.remove('pending', 'active', 'completed', 'failed');
-    step.classList.add(status);
-    const statusSpan = step.querySelector('.step-status');
-    statusSpan.textContent = status;
-  }
+function addUserMessage(content, scroll = true) {
+  const messageEl = createMessageElement('user');
+  const contentDiv = messageEl.querySelector('.message-content');
+  contentDiv.textContent = content;
+  
+  if (scroll) scrollToBottom();
 }
 
 /**
- * Add status message
+ * Add assistant message (complete)
  */
-function addStatusMessage(message, type = 'info') {
-  const statusEl = document.createElement('div');
-  statusEl.className = `status-message status-${type}`;
-  const icon = type === 'error' ? '⚠️' : type === 'success' ? '✓' : 'ℹ️';
-  statusEl.innerHTML = `<p>${icon} ${escapeHtml(message)}</p>`;
-  chatMessages.appendChild(statusEl);
-  scrollToBottom();
-}
-
-/**
- * Add code result element
- */
-function addCodeResultElement(result) {
-  const codeEl = document.createElement('div');
-  codeEl.className = 'code-result-container';
-  codeEl.innerHTML = `
-    <div class="code-header"><strong>💻 Code Result</strong></div>
-    <pre>${escapeHtml(result)}</pre>
-  `;
-  chatMessages.appendChild(codeEl);
-  scrollToBottom();
-}
-
-/**
- * Add sources element
- */
-function addSourcesElement(sources) {
-  const sourcesEl = document.createElement('div');
-  sourcesEl.className = 'sources-container';
-  sourcesEl.innerHTML = `
-    <div class="sources-header"><strong>📚 Sources</strong></div>
-    <ul class="sources-list">
-      ${sources.map(source => `<li>${escapeHtml(source)}</li>`).join('')}
-    </ul>
-  `;
-  chatMessages.appendChild(sourcesEl);
-  scrollToBottom();
-}
-
-/**
- * Add thinking element
- */
-function addThinkingElement(thoughts) {
-  const thinkingEl = document.createElement('div');
-  thinkingEl.className = 'thinking-container';
-  thinkingEl.innerHTML = `
-    <div class="thinking-header"><strong>🧠 Thinking Process</strong></div>
-    <p>${escapeHtml(thoughts)}</p>
-  `;
-  chatMessages.appendChild(thinkingEl);
-  scrollToBottom();
+function addAssistantMessage(content, scroll = true) {
+  const messageEl = createMessageElement('assistant');
+  const contentDiv = messageEl.querySelector('.message-content');
+  contentDiv.innerHTML = marked.parse(content);
+  
+  // Highlight code blocks
+  contentDiv.querySelectorAll('pre code').forEach((block) => {
+    hljs.highlightElement(block);
+  });
+  
+  if (scroll) scrollToBottom();
 }
 
 /**
  * Typing indicator functions
  */
-function showTypingIndicator(message = 'AI is thinking...') {
-  typingIndicator.textContent = message;
+function showTypingIndicator(message = 'Thinking...') {
+  typingText.textContent = message;
   typingIndicator.classList.add("visible");
+  scrollToBottom();
 }
 
 function updateTypingIndicator(message) {
-  typingIndicator.textContent = message;
+  typingText.textContent = message;
 }
 
 function hideTypingIndicator() {
@@ -618,13 +565,6 @@ function enableInput() {
 }
 
 /**
- * Connection status indicator
- */
-function updateConnectionStatus(status) {
-  console.log('Connection status:', status);
-}
-
-/**
  * Scroll to bottom
  */
 function scrollToBottom() {
@@ -632,19 +572,37 @@ function scrollToBottom() {
 }
 
 /**
- * Escape HTML to prevent XSS
+ * Toast notification
  */
-function escapeHtml(text) {
-  const div = document.createElement('div');
-  div.textContent = text;
-  return div.innerHTML;
+function addToast(message, type = 'info') {
+  const toast = document.createElement('div');
+  toast.style.cssText = `
+    position: fixed;
+    bottom: 2rem;
+    right: 2rem;
+    padding: 1rem 1.5rem;
+    background: ${type === 'error' ? '#ef4444' : type === 'success' ? '#10b981' : '#3b82f6'};
+    color: white;
+    border-radius: 8px;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+    z-index: 10000;
+    animation: slideInRight 0.3s ease;
+    max-width: 300px;
+  `;
+  toast.textContent = message;
+  document.body.appendChild(toast);
+  
+  setTimeout(() => {
+    toast.style.animation = 'slideOutRight 0.3s ease';
+    setTimeout(() => toast.remove(), 300);
+  }, 3000);
 }
 
 /**
  * Clear chat history
  */
 async function clearChat() {
-  if (!confirm('Are you sure you want to clear the chat history and all uploaded files?')) {
+  if (!confirm('Start a new chat? This will clear the current conversation.')) {
     return;
   }
 
@@ -652,31 +610,83 @@ async function clearChat() {
     const response = await fetch('/api/clear', { method: 'POST' });
     if (response.ok) {
       chatMessages.innerHTML = '';
-      uploadedFiles = [];
       pendingFiles = [];
-      uploadedFilesArea.innerHTML = '';
-      uploadedFilesArea.classList.add('empty');
-      showWelcomeMessage();
+      uploadedFilesContainer.innerHTML = '';
+      updateFileUploadArea();
+      conversationStarted = false;
+      
+      // Re-add welcome screen
+      chatMessages.innerHTML = `
+        <div class="welcome-screen" id="welcome-screen">
+          <div class="welcome-icon">🤖</div>
+          <h2>Welcome to Suna-Lite</h2>
+          <p>Your autonomous AI assistant powered by Gemini 2.5 Flash</p>
+          
+          <div class="welcome-features">
+            <div class="welcome-feature">
+              <div class="welcome-feature-icon">🔍</div>
+              <h3>Web Search</h3>
+              <p>Access real-time information from the web</p>
+            </div>
+            <div class="welcome-feature">
+              <div class="welcome-feature-icon">💻</div>
+              <h3>Code Execution</h3>
+              <p>Run Python code for calculations and analysis</p>
+            </div>
+            <div class="welcome-feature">
+              <div class="welcome-feature-icon">📄</div>
+              <h3>File Analysis</h3>
+              <p>Process documents, spreadsheets, PDFs, and more</p>
+            </div>
+            <div class="welcome-feature">
+              <div class="welcome-feature-icon">🔄</div>
+              <h3>Multi-Step Tasks</h3>
+              <p>Complex task planning and autonomous execution</p>
+            </div>
+          </div>
+        </div>
+      `;
+      
+      addToast('Chat cleared successfully', 'success');
     }
   } catch (error) {
     console.error('Error clearing chat:', error);
-    addStatusMessage('Failed to clear chat history', 'error');
+    addToast('Failed to clear chat', 'error');
   }
 }
 
-// Auto-resize textarea as user types
-userInput.addEventListener("input", function () {
-  this.style.height = "auto";
-  this.style.height = this.scrollHeight + "px";
-});
+/**
+ * Escape HTML
+ */
+function escapeHtml(text) {
+  const div = document.createElement('div');
+  div.textContent = text;
+  return div.innerHTML;
+}
 
-// Send message on Enter (without Shift)
-userInput.addEventListener("keydown", function (e) {
-  if (e.key === "Enter" && !e.shiftKey) {
-    e.preventDefault();
-    sendMessage();
+// Add CSS animations
+const style = document.createElement('style');
+style.textContent = `
+  @keyframes slideInRight {
+    from {
+      transform: translateX(100%);
+      opacity: 0;
+    }
+    to {
+      transform: translateX(0);
+      opacity: 1;
+    }
   }
-});
-
-// Send button click handler
-sendButton.addEventListener("click", sendMessage);
+  
+  @keyframes slideOutRight {
+    from {
+      transform: translateX(0);
+      opacity: 1;
+    }
+    to {
+      transform: translateX(100%);
+      opacity: 0;
+    }
+  }
+`;
+document.head.appendChild(style);

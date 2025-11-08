@@ -615,37 +615,73 @@ async function clearChat() {
       updateFileUploadArea();
       conversationStarted = false;
       
-      // Re-add welcome screen
-      chatMessages.innerHTML = `
+      // Re-add welcome screen with full content
+      const welcomeHTML = `
         <div class="welcome-screen" id="welcome-screen">
           <div class="welcome-icon">🤖</div>
           <h2>Welcome to Suna-Lite</h2>
-          <p>Your autonomous AI assistant powered by Gemini 2.5 Flash</p>
+          <p>Your autonomous AI assistant powered by Gemini 2.5 Flash with advanced multi-step reasoning and tool execution capabilities</p>
           
           <div class="welcome-features">
             <div class="welcome-feature">
               <div class="welcome-feature-icon">🔍</div>
               <h3>Web Search</h3>
-              <p>Access real-time information from the web</p>
+              <p>Access real-time information from the web to answer current questions and find the latest data</p>
             </div>
             <div class="welcome-feature">
               <div class="welcome-feature-icon">💻</div>
               <h3>Code Execution</h3>
-              <p>Run Python code for calculations and analysis</p>
+              <p>Run Python code for complex calculations, data analysis, and algorithmic problem solving</p>
             </div>
             <div class="welcome-feature">
               <div class="welcome-feature-icon">📄</div>
               <h3>File Analysis</h3>
-              <p>Process documents, spreadsheets, PDFs, and more</p>
+              <p>Process and analyze documents, spreadsheets, PDFs, images, and various data formats</p>
             </div>
             <div class="welcome-feature">
               <div class="welcome-feature-icon">🔄</div>
               <h3>Multi-Step Tasks</h3>
-              <p>Complex task planning and autonomous execution</p>
+              <p>Autonomous planning and execution of complex tasks that require multiple steps and tools</p>
+            </div>
+            <div class="welcome-feature">
+              <div class="welcome-feature-icon">👁️</div>
+              <h3>Vision Analysis</h3>
+              <p>Understand and analyze images, charts, diagrams, and visual content with AI vision</p>
+            </div>
+            <div class="welcome-feature">
+              <div class="welcome-feature-icon">📊</div>
+              <h3>Data Processing</h3>
+              <p>Comprehensive data analysis, visualization, and insights from structured and unstructured data</p>
+            </div>
+          </div>
+
+          <div class="welcome-cta">
+            <p class="welcome-cta-text">✨ Try asking me something or choose a suggestion below:</p>
+            <div class="welcome-suggestions">
+              <div class="suggestion-chip" onclick="useSuggestion(this)">
+                What's the current Bitcoin price?
+              </div>
+              <div class="suggestion-chip" onclick="useSuggestion(this)">
+                Analyze this dataset for trends
+              </div>
+              <div class="suggestion-chip" onclick="useSuggestion(this)">
+                Calculate compound interest
+              </div>
+              <div class="suggestion-chip" onclick="useSuggestion(this)">
+                Search latest AI news
+              </div>
+              <div class="suggestion-chip" onclick="useSuggestion(this)">
+                Explain quantum computing
+              </div>
             </div>
           </div>
         </div>
       `;
+      
+      chatMessages.innerHTML = welcomeHTML;
+      
+      // Re-assign welcome screen reference
+      window.welcomeScreen = document.getElementById('welcome-screen');
       
       addToast('Chat cleared successfully', 'success');
     }
@@ -653,6 +689,17 @@ async function clearChat() {
     console.error('Error clearing chat:', error);
     addToast('Failed to clear chat', 'error');
   }
+}
+
+/**
+ * Use a suggestion chip
+ */
+function useSuggestion(element) {
+  const text = element.textContent.trim();
+  userInput.value = text;
+  userInput.focus();
+  // Optionally auto-send
+  // sendMessage();
 }
 
 /**

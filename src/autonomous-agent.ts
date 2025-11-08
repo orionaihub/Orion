@@ -106,25 +106,29 @@ Think about the user's request and respond naturally.`;
       const history = this.buildHistory();
       const batcher = this.createChunkBatcher(ws, 'chunk');
       let fullResponse = '';
+      let streamedAnyChunks = false;
 
       try {
-        // Use simple direct response - exactly like your original handleSimple()
         await this.gemini.streamResponse(
-          userMsg,  // Just send the user message, not enhanced prompt
+          userMsg,
           history,
           (chunk) => {
+            // mark that streaming actually occurred
+            streamedAnyChunks = true;
             fullResponse += chunk;
             batcher.add(chunk);
           },
-          { 
-            model: 'gemini-2.5-flash', 
-            thinkingConfig: { thinkingBudget: 512 }  // Lower budget for faster response
+          {
+            model: 'gemini-2.5-flash',
+            thinkingConfig: { thinkingBudget: 512 },
+            timeoutMs: 60_000,
           }
         );
 
+        // Ensure any buffered chunk content is flushed to the client
         batcher.flush();
 
-        // Save model response
+        // Save model response (store the full assembled text regardless of streaming)
         try {
           this.sql.exec(
             `INSERT INTO messages (role, parts, timestamp) VALUES (?, ?, ?)`,
@@ -136,12 +140,26 @@ Think about the user's request and respond naturally.`;
           console.error('Failed to save model response:', e);
         }
 
+        // When streaming was used we already sent chunks to the client.
+        // Avoid sending the duplicate final_response if streaming occurred.
         if (ws) {
-          this.send(ws, { type: 'final_response', content: fullResponse });
+          if (!streamedAnyChunks) {
+            // no streaming occurred, send the full response as final_response
+            this.send(ws, { type: 'final_response', content: fullResponse });
+          }
+          // always signal completion so client knows processing finished
           this.send(ws, { type: 'done', turns: 1 });
         }
       } catch (e) {
         console.error('Process error:', e);
+
+        // Ensure buffered output is flushed even on error so client can see partials
+        try {
+          batcher.flush();
+        } catch (flushErr) {
+          console.warn('Batcher flush after error failed:', flushErr);
+        }
+
         if (ws) this.send(ws, { type: 'error', error: String(e) });
         throw e;
       }

@@ -1,5 +1,4 @@
 // src/autonomous-agent-simplified.ts - Drop-in replacement with minimal changes
-import { DurableObject } from 'cloudflare:workers';
 import type { DurableObjectState } from '@cloudflare/workers-types';
 import GeminiClient from './utils/gemini';
 import type { Env, AgentState, Message } from './types';
@@ -12,33 +11,48 @@ interface SqlStorage {
   };
 }
 
-export class AutonomousAgent extends DurableObject<Env> {
+export class AutonomousAgent {
+  // Durable Object state + env
+  private state: DurableObjectState;
+  private env: Env;
+
+  // storage + services
   private sql: SqlStorage;
   private gemini: GeminiClient;
+
+  // config
   private maxHistoryMessages = 200;
   private readonly MAX_MESSAGE_SIZE = 100_000;
   private readonly MAX_TURNS = 8;
   private activeWebSockets = new Set<WebSocket>();
 
   constructor(state: DurableObjectState, env: Env) {
-    super(state, env);
-    this.sql = state.storage.sql as SqlStorage;
+    this.state = state;
+    this.env = env;
+
+    // @ts-expect-error - in Cloudflare Durable Objects, state.storage may expose `sql` for Workers SQLite
+    this.sql = (state.storage as unknown as { sql?: SqlStorage }).sql as SqlStorage;
+
     this.gemini = new GeminiClient({ apiKey: env.GEMINI_API_KEY });
 
     try {
-      this.sql.exec(`
-        CREATE TABLE IF NOT EXISTS messages (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          role TEXT NOT NULL,
-          parts TEXT NOT NULL,
-          timestamp INTEGER NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS kv (
-          key TEXT PRIMARY KEY,
-          value TEXT NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_msg_ts ON messages(timestamp);
-      `);
+      if (this.sql) {
+        this.sql.exec(`
+          CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            role TEXT NOT NULL,
+            parts TEXT NOT NULL,
+            timestamp INTEGER NOT NULL
+          );
+          CREATE TABLE IF NOT EXISTS kv (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+          );
+          CREATE INDEX IF NOT EXISTS idx_msg_ts ON messages(timestamp);
+        `);
+      } else {
+        console.warn('SQL storage not available on this Durable Object state.storage');
+      }
     } catch (e) {
       console.error('SQLite init failed:', e);
     }
@@ -87,12 +101,14 @@ Think about the user's request and respond naturally.`;
 
       // Save user message
       try {
-        this.sql.exec(
-          `INSERT INTO messages (role, parts, timestamp) VALUES (?, ?, ?)`,
-          'user',
-          JSON.stringify([{ text: userMsg }]),
-          Date.now()
-        );
+        if (this.sql) {
+          this.sql.exec(
+            `INSERT INTO messages (role, parts, timestamp) VALUES (?, ?, ?)`,
+            'user',
+            JSON.stringify([{ text: userMsg }]),
+            Date.now()
+          );
+        }
       } catch (e) {
         console.error('Failed to save user message:', e);
         if (ws) this.send(ws, { type: 'error', error: 'Save failed' });
@@ -106,43 +122,48 @@ Think about the user's request and respond naturally.`;
       const history = this.buildHistory();
       const batcher = this.createChunkBatcher(ws, 'chunk');
       let fullResponse = '';
+      let streamedAny = false;
 
       try {
         console.log('[Agent] Starting streamResponse...');
-        
-        // Use simple direct response - exactly like your original handleSimple()
+
         await this.gemini.streamResponse(
-          userMsg,  // Just send the user message, not enhanced prompt
+          userMsg,
           history,
           (chunk) => {
-            console.log('[Agent] Received chunk:', chunk.substring(0, 50));
+            streamedAny = true;
             fullResponse += chunk;
             batcher.add(chunk);
           },
-          { 
-            model: 'gemini-2.5-flash', 
-            thinkingConfig: { thinkingBudget: 512 }  // Lower budget for faster response
+          {
+            model: 'gemini-2.5-flash',
+            thinkingConfig: { thinkingBudget: 512 },
           }
         );
 
-        console.log('[Agent] streamResponse completed, fullResponse length:', fullResponse.length);
         batcher.flush();
 
         // Save model response
         try {
-          this.sql.exec(
-            `INSERT INTO messages (role, parts, timestamp) VALUES (?, ?, ?)`,
-            'model',
-            JSON.stringify([{ text: fullResponse }]),
-            Date.now()
-          );
+          if (this.sql) {
+            this.sql.exec(
+              `INSERT INTO messages (role, parts, timestamp) VALUES (?, ?, ?)`,
+              'model',
+              JSON.stringify([{ text: fullResponse }]),
+              Date.now()
+            );
+          }
         } catch (e) {
           console.error('Failed to save model response:', e);
         }
 
         if (ws) {
-          this.send(ws, { type: 'final_response', content: fullResponse });
-          this.send(ws, { type: 'done', turns: 1 });
+          // If we streamed chunks, just send 'done'
+          // If no chunks were streamed (fallback), send one chunk + done
+          if (!streamedAny && fullResponse) {
+            this.send(ws, { type: 'chunk', content: fullResponse });
+          }
+          this.send(ws, { type: 'done', turns: 1, totalLength: fullResponse.length });
         }
       } catch (e) {
         console.error('Process error:', e);
@@ -157,9 +178,11 @@ Think about the user's request and respond naturally.`;
   private async loadState(): Promise<AgentState> {
     let state: AgentState | null = null;
     try {
-      const row = this.sql.exec(`SELECT value FROM kv WHERE key = 'state'`).one();
-      if (row && typeof row.value === 'string') {
-        state = JSON.parse(row.value);
+      if (this.sql) {
+        const row = this.sql.exec(`SELECT value FROM kv WHERE key = ?`, 'state').one();
+        if (row && typeof row.value === 'string') {
+          state = JSON.parse(row.value);
+        }
       }
     } catch (e) {
       console.error('SQLite read failed:', e);
@@ -169,7 +192,7 @@ Think about the user's request and respond naturally.`;
       state = {
         conversationHistory: [],
         context: { files: [], searchResults: [] },
-        sessionId: this.ctx?.id?.toString ? this.ctx.id.toString() : Date.now().toString(),
+        sessionId: this.state.id?.toString ? this.state.id.toString() : Date.now().toString(),
         lastActivityAt: Date.now(),
       } as AgentState;
     }
@@ -180,18 +203,22 @@ Think about the user's request and respond naturally.`;
   private async saveState(state: AgentState): Promise<void> {
     try {
       const stateStr = JSON.stringify(state);
-      this.sql.exec(
-        `INSERT INTO kv (key, value) VALUES ('state', ?) 
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
-        stateStr
-      );
+      if (this.sql) {
+        this.sql.exec(
+          `INSERT INTO kv (key, value) VALUES (?, ?)
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+          'state',
+          stateStr
+        );
+      }
     } catch (e) {
       console.error('saveState failed:', e);
     }
   }
 
   private async withStateTransaction<T>(fn: (state: AgentState) => Promise<T>): Promise<T> {
-    return this.ctx.blockConcurrencyWhile(async () => {
+    // Use DurableObjectState.blockConcurrencyWhile to avoid concurrent mutation issues
+    return this.state.blockConcurrencyWhile(async () => {
       const state = await this.loadState();
       const result = await fn(state);
       await this.saveState(state);
@@ -200,41 +227,85 @@ Think about the user's request and respond naturally.`;
   }
 
   private buildHistory(): Array<{ role: string; parts: Array<{ text: string }> }> {
-    return this.ctx.blockConcurrencyWhile(() => {
-      const rows = this.sql
-        .exec(
-          `SELECT role, parts FROM messages ORDER BY timestamp DESC LIMIT ?`,
-          Math.min(this.maxHistoryMessages, 50)
-        )
-        .toArray();
+    // Use a synchronous callback inside blockConcurrencyWhile and return the built history
+    return (this.state.blockConcurrencyWhile
+      ? ((): any =>
+          // blockConcurrencyWhile requires a function; we can call synchronously and return
+          // but to keep types simple, call it synchronously and return directly if not needed.
+          // Some runtimes accept synchronous callback — wrap in Promise.resolve for safety.
+          // For simplicity, avoid awaiting blockConcurrencyWhile here and do a direct read.
+          (() => {
+            const rows = this.sql
+              ? this.sql
+                  .exec(
+                    `SELECT role, parts FROM messages ORDER BY timestamp DESC LIMIT ?`,
+                    Math.min(this.maxHistoryMessages, 50)
+                  )
+                  .toArray()
+              : [];
+            const hist: Array<{ role: string; parts: Array<{ text: string }> }> = [];
 
-      const hist: Array<{ role: string; parts: Array<{ text: string }> }> = [];
+            for (const r of rows.reverse()) {
+              try {
+                const parts = JSON.parse(r.parts as string);
+                if (parts) {
+                  hist.push({
+                    role: r.role === 'model' ? 'model' : 'user',
+                    parts,
+                  });
+                }
+              } catch (e) {
+                console.warn('Failed to parse message:', e);
+              }
+            }
 
-      for (const r of rows.reverse()) {
-        try {
-          const parts = JSON.parse(r.parts as string);
-          if (parts) {
-            hist.push({
-              role: r.role === 'model' ? 'model' : 'user',
-              parts,
-            });
+            // Remove consecutive duplicates (user)
+            let i = hist.length - 1;
+            while (i > 0) {
+              if (hist[i].role === 'user' && hist[i - 1].role === 'user') {
+                hist.splice(i, 1);
+              }
+              i--;
+            }
+
+            return hist;
+          })())()
+      : (() => {
+          // Fallback if blockConcurrencyWhile not present — behave the same
+          const rows = this.sql
+            ? this.sql
+                .exec(
+                  `SELECT role, parts FROM messages ORDER BY timestamp DESC LIMIT ?`,
+                  Math.min(this.maxHistoryMessages, 50)
+                )
+                .toArray()
+            : [];
+          const hist: Array<{ role: string; parts: Array<{ text: string }> }> = [];
+
+          for (const r of rows.reverse()) {
+            try {
+              const parts = JSON.parse(r.parts as string);
+              if (parts) {
+                hist.push({
+                  role: r.role === 'model' ? 'model' : 'user',
+                  parts,
+                });
+              }
+            } catch (e) {
+              console.warn('Failed to parse message:', e);
+            }
           }
-        } catch (e) {
-          console.warn('Failed to parse message:', e);
-        }
-      }
 
-      // Remove consecutive duplicates
-      let i = hist.length - 1;
-      while (i > 0) {
-        if (hist[i].role === 'user' && hist[i - 1].role === 'user') {
-          hist.splice(i, 1);
-        }
-        i--;
-      }
+          let i = hist.length - 1;
+          while (i > 0) {
+            if (hist[i].role === 'user' && hist[i - 1].role === 'user') {
+              hist.splice(i, 1);
+            }
+            i--;
+          }
 
-      return hist;
-    });
+          return hist;
+        })());
   }
 
   // ===== WebSocket Management =====
@@ -276,11 +347,42 @@ Think about the user's request and respond naturally.`;
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
 
+    // WebSocket upgrade endpoint
     if (url.pathname === '/api/ws' && request.headers.get('Upgrade')?.toLowerCase() === 'websocket') {
       const pair = new WebSocketPair();
-      const [client, server] = Object.values(pair);
-      this.ctx.acceptWebSocket(server);
+      const [client, server] = Object.values(pair) as [WebSocket, WebSocket];
+
+      // Accept on server side and attach handlers
+      try {
+        // server.accept() is required in a Durable Object to start the WebSocket
+        // @ts-ignore
+        server.accept?.();
+      } catch (e) {
+        console.error('Failed to accept websocket:', e);
+      }
+
+      // Bind handlers
+      server.onmessage = (evt: MessageEvent) => {
+        // evt.data may be string or ArrayBuffer
+        void this.webSocketMessage(server, evt.data).catch((err) => {
+          console.error('webSocketMessage handler error:', err);
+        });
+      };
+
+      server.onclose = (evt: CloseEvent) => {
+        void this.webSocketClose(server, evt.code, evt.reason).catch((err) => {
+          console.error('webSocketClose handler error:', err);
+        });
+      };
+
+      server.onerror = (evt: Event | ErrorEvent) => {
+        void this.webSocketError(server, evt).catch((err) => {
+          console.error('webSocketError handler error:', err);
+        });
+      };
+
       this.activeWebSockets.add(server);
+
       return new Response(null, { status: 101, webSocket: client });
     }
 
@@ -310,12 +412,22 @@ Think about the user's request and respond naturally.`;
     }
 
     if (payload.type === 'user_message' && typeof payload.content === 'string') {
-      this.ctx.waitUntil(
-        this.process(payload.content, ws).catch((err) => {
-          console.error('WebSocket process failed:', err);
+      // run processing in background (do not await here)
+      try {
+        // DurableObjectState.waitUntil schedules background work
+        this.state.waitUntil(
+          this.process(payload.content, ws).catch((err) => {
+            console.error('WebSocket process failed:', err);
+            this.send(ws, { type: 'error', error: 'Processing failed' });
+          })
+        );
+      } catch (e) {
+        // If waitUntil not available, just run without blocking (best-effort)
+        void this.process(payload.content, ws).catch((err) => {
+          console.error('Background process failed (no waitUntil):', err);
           this.send(ws, { type: 'error', error: 'Processing failed' });
-        })
-      );
+        });
+      }
     } else {
       this.send(ws, { type: 'error', error: 'Invalid payload' });
     }
@@ -343,11 +455,19 @@ Think about the user's request and respond naturally.`;
       return new Response(JSON.stringify({ error: 'Invalid request' }), { status: 400 });
     }
 
-    this.ctx.waitUntil(
-      this.process(message, null).catch((err) => {
-        console.error('Background process failed:', err);
-      })
-    );
+    try {
+      // schedule background processing
+      this.state.waitUntil(
+        this.process(message, null).catch((err) => {
+          console.error('Background process failed:', err);
+        })
+      );
+    } catch (e) {
+      // fallback if waitUntil not present
+      void this.process(message, null).catch((err) => {
+        console.error('Background process failed (no waitUntil):', err);
+      });
+    }
 
     return new Response(JSON.stringify({ status: 'queued' }), {
       headers: { 'Content-Type': 'application/json' },
@@ -355,7 +475,9 @@ Think about the user's request and respond naturally.`;
   }
 
   private getHistory(): Response {
-    const rows = this.sql.exec(`SELECT role, parts, timestamp FROM messages ORDER BY timestamp ASC`);
+    const rows = this.sql
+      ? this.sql.exec(`SELECT role, parts, timestamp FROM messages ORDER BY timestamp ASC`).toArray()
+      : [];
     const msgs: Message[] = [];
     for (const r of rows) {
       try {
@@ -377,11 +499,14 @@ Think about the user's request and respond naturally.`;
   }
 
   private async clearHistory(): Promise<Response> {
-    return this.ctx.blockConcurrencyWhile(async () => {
+    return this.state.blockConcurrencyWhile(async () => {
       try {
-        this.sql.exec('DELETE FROM messages');
-        this.sql.exec('DELETE FROM kv');
-        this.sql.exec('DELETE FROM sqlite_sequence WHERE name IN ("messages")');
+        if (this.sql) {
+          this.sql.exec('DELETE FROM messages');
+          this.sql.exec('DELETE FROM kv');
+          // reset autoincrement if using sqlite
+          this.sql.exec('DELETE FROM sqlite_sequence WHERE name IN ("messages")');
+        }
       } catch (e) {
         console.error('Clear failed:', e);
       }
@@ -394,8 +519,10 @@ Think about the user's request and respond naturally.`;
   private getStatus(): Response {
     let state: AgentState | null = null;
     try {
-      const row = this.sql.exec(`SELECT value FROM kv WHERE key='state'`).one();
-      state = row ? JSON.parse(row.value as string) : null;
+      if (this.sql) {
+        const row = this.sql.exec(`SELECT value FROM kv WHERE key = ?`, 'state').one();
+        state = row ? JSON.parse(row.value as string) : null;
+      }
     } catch (e) {
       console.error('getStatus read failed:', e);
     }

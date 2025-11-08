@@ -103,8 +103,7 @@ Think about the user's request and respond naturally.`;
       if (ws) this.send(ws, { type: 'status', message: 'Thinking…' });
 
       // Build history and response
-      // NOTE: buildHistory now includes the system prompt
-      const history = await this.buildHistory();
+      const history = this.buildHistory();
       const batcher = this.createChunkBatcher(ws, 'chunk');
       let fullResponse = '';
 
@@ -123,7 +122,7 @@ Think about the user's request and respond naturally.`;
           }
         );
 
-        batcher.flush(); // Ensure the last chunk is sent
+        batcher.flush();
 
         // Save model response
         try {
@@ -138,8 +137,7 @@ Think about the user's request and respond naturally.`;
         }
 
         if (ws) {
-          // *** FIX: Removed the redundant 'final_response' to prevent double output ***
-          // this.send(ws, { type: 'final_response', content: fullResponse }); 
+          this.send(ws, { type: 'final_response', content: fullResponse });
           this.send(ws, { type: 'done', turns: 1 });
         }
       } catch (e) {
@@ -197,8 +195,8 @@ Think about the user's request and respond naturally.`;
     });
   }
 
-  private async buildHistory(): Promise<Array<{ role: string; parts: Array<{ text: string }> }>> {
-    const historyPromise = this.ctx.blockConcurrencyWhile(() => {
+  private buildHistory(): Array<{ role: string; parts: Array<{ text: string }> }> {
+    return this.ctx.blockConcurrencyWhile(() => {
       const rows = this.sql
         .exec(
           `SELECT role, parts FROM messages ORDER BY timestamp DESC LIMIT ?`,
@@ -230,18 +228,9 @@ Think about the user's request and respond naturally.`;
         }
         i--;
       }
+
       return hist;
     });
-
-    const hasFiles = (await this.loadState()).context.files.length > 0;
-    const systemPrompt = this.getSystemPrompt(hasFiles);
-    const history = await historyPromise;
-
-    // *** FIX: Add system prompt as the first message in the history array ***
-    return [
-      { role: 'system', parts: [{ text: systemPrompt }] },
-      ...history
-    ];
   }
 
   // ===== WebSocket Management =====

@@ -108,14 +108,11 @@ Think about the user's request and respond naturally.`;
       let fullResponse = '';
 
       try {
-        console.log('[Agent] Starting streamResponse...');
-        
         // Use simple direct response - exactly like your original handleSimple()
         await this.gemini.streamResponse(
           userMsg,  // Just send the user message, not enhanced prompt
           history,
           (chunk) => {
-            console.log('[Agent] Received chunk:', chunk.substring(0, 50));
             fullResponse += chunk;
             batcher.add(chunk);
           },
@@ -125,7 +122,6 @@ Think about the user's request and respond naturally.`;
           }
         );
 
-        console.log('[Agent] streamResponse completed, fullResponse length:', fullResponse.length);
         batcher.flush();
 
         // Save model response

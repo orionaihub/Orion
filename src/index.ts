@@ -1,4 +1,4 @@
-import { AutonomousAgent } from './autonomous-agent';
+import { AutonomousAgent } from './agent';
 import type { Env } from './types';
 
 export { AutonomousAgent };

@@ -1,5 +1,4 @@
 // src/utils/gemini.ts - Complete Updated Version (corrected)
-import { Buffer } from 'buffer';
 import { GoogleGenAI } from '@google/genai';
 import type { TaskComplexity, ExecutionPlan, FileMetadata } from '../types';
 

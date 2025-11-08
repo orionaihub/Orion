@@ -1,6 +1,6 @@
 // src/autonomous-agent-simplified.ts - Drop-in replacement with minimal changes
 import type { DurableObjectState } from '@cloudflare/workers-types';
-import GeminiClient from './utils/gemini';
+import GeminiClient from './gemini';
 import type { Env, AgentState, Message } from './types';
 
 interface SqlStorage {

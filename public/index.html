@@ -1,1017 +1,217 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>Suna-Lite - Autonomous AI Agent</title>
     
-    <!-- Marked.js for Markdown rendering -->
+    <!-- External Libraries -->
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-    <!-- Highlight.js for code syntax highlighting -->
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
     <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
     
-    <style>
-        :root {
-            --primary: #667eea;
-            --primary-dark: #5a67d8;
-            --secondary: #764ba2;
-            --bg-main: #ffffff;
-            --bg-secondary: #f8f9fa;
-            --bg-sidebar: #1a1a2e;
-            --text-primary: #1f2937;
-            --text-secondary: #6b7280;
-            --text-light: #9ca3af;
-            --border: #e5e7eb;
-            --user-msg: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            --assistant-msg: #ffffff;
-            --shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-            --shadow-lg: 0 10px 25px rgba(0, 0, 0, 0.15);
-        }
-
-        * {
-            box-sizing: border-box;
-            margin: 0;
-            padding: 0;
-        }
-
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-            line-height: 1.6;
-            color: var(--text-primary);
-            background: var(--bg-secondary);
-            height: 100vh;
-            overflow: hidden;
-        }
-
-        /* Layout */
-        .app-container {
-            display: flex;
-            height: 100vh;
-            position: relative;
-        }
-
-        /* Sidebar */
-        .sidebar {
-            width: 280px;
-            background: var(--bg-sidebar);
-            color: white;
-            display: flex;
-            flex-direction: column;
-            position: fixed;
-            left: 0;
-            top: 0;
-            bottom: 0;
-            z-index: 1000;
-            transform: translateX(0);
-            transition: transform 0.3s ease;
-        }
-
-        .sidebar.hidden {
-            transform: translateX(-100%);
-        }
-
-        .sidebar-header {
-            padding: 1.5rem;
-            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
-        }
-
-        .sidebar-header h2 {
-            font-size: 1.25rem;
-            margin-bottom: 0.5rem;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            background-clip: text;
-        }
-
-        .sidebar-subtitle {
-            font-size: 0.8rem;
-            color: var(--text-light);
-        }
-
-        .sidebar-content {
-            flex: 1;
-            overflow-y: auto;
-            padding: 1rem;
-        }
-
-        .sidebar-section {
-            margin-bottom: 2rem;
-        }
-
-        .sidebar-section h3 {
-            font-size: 0.75rem;
-            text-transform: uppercase;
-            letter-spacing: 0.05em;
-            color: var(--text-light);
-            margin-bottom: 0.75rem;
-        }
-
-        .capability-list {
-            display: flex;
-            flex-direction: column;
-            gap: 0.5rem;
-        }
-
-        .capability-item {
-            display: flex;
-            align-items: center;
-            gap: 0.75rem;
-            padding: 0.75rem;
-            background: rgba(255, 255, 255, 0.05);
-            border-radius: 8px;
-            font-size: 0.85rem;
-        }
-
-        .capability-icon {
-            font-size: 1.2rem;
-        }
-
-        .new-chat-btn {
-            width: 100%;
-            padding: 0.75rem;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            border: none;
-            border-radius: 8px;
-            cursor: pointer;
-            font-weight: 600;
-            margin-bottom: 1rem;
-            transition: transform 0.2s, box-shadow 0.2s;
-        }
-
-        .new-chat-btn:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
-        }
-
-        .history-list {
-            display: flex;
-            flex-direction: column;
-            gap: 0.5rem;
-        }
-
-        .history-item {
-            padding: 0.75rem;
-            background: rgba(255, 255, 255, 0.05);
-            border-radius: 6px;
-            font-size: 0.85rem;
-            cursor: pointer;
-            transition: background 0.2s;
-            white-space: nowrap;
-            overflow: hidden;
-            text-overflow: ellipsis;
-        }
-
-        .history-item:hover {
-            background: rgba(255, 255, 255, 0.1);
-        }
-
-        /* Main Content */
-        .main-content {
-            flex: 1;
-            display: flex;
-            flex-direction: column;
-            margin-left: 280px;
-            transition: margin-left 0.3s ease;
-        }
-
-        .main-content.expanded {
-            margin-left: 0;
-        }
-
-        /* Header */
-        .header {
-            display: flex;
-            align-items: center;
-            gap: 1rem;
-            padding: 1rem 1.5rem;
-            background: var(--bg-main);
-            border-bottom: 1px solid var(--border);
-            box-shadow: var(--shadow);
-        }
-
-        .hamburger {
-            display: none;
-            flex-direction: column;
-            gap: 4px;
-            cursor: pointer;
-            padding: 0.5rem;
-        }
-
-        .hamburger span {
-            width: 24px;
-            height: 2px;
-            background: var(--text-primary);
-            transition: all 0.3s;
-        }
-
-        .header-title {
-            flex: 1;
-        }
-
-        .header-title h1 {
-            font-size: 1.25rem;
-            font-weight: 600;
-        }
-
-        .header-actions {
-            display: flex;
-            gap: 0.5rem;
-        }
-
-        .icon-btn {
-            padding: 0.5rem;
-            background: var(--bg-secondary);
-            border: none;
-            border-radius: 6px;
-            cursor: pointer;
-            font-size: 1.2rem;
-            transition: background 0.2s;
-        }
-
-        .icon-btn:hover {
-            background: var(--border);
-        }
-
-        /* Chat Area */
-        .chat-area {
-            flex: 1;
-            display: flex;
-            flex-direction: column;
-            overflow: hidden;
-        }
-
-        .chat-messages {
-            flex: 1;
-            overflow-y: auto;
-            padding: 2rem;
-            background: var(--bg-secondary);
-        }
-
-        .chat-messages::-webkit-scrollbar {
-            width: 8px;
-        }
-
-        .chat-messages::-webkit-scrollbar-track {
-            background: transparent;
-        }
-
-        .chat-messages::-webkit-scrollbar-thumb {
-            background: var(--border);
-            border-radius: 4px;
-        }
-
-        .chat-messages::-webkit-scrollbar-thumb:hover {
-            background: var(--text-secondary);
-        }
-
-        /* Welcome Screen */
-        .welcome-screen {
-            max-width: 1000px;
-            margin: 0 auto;
-            padding: 4rem 2rem;
-            text-align: center;
-            animation: fadeIn 0.6s ease;
-            min-height: 600px;
-            display: flex;
-            flex-direction: column;
-            justify-content: center;
-        }
-
-        @keyframes fadeIn {
-            from {
-                opacity: 0;
-                transform: translateY(30px);
-            }
-            to {
-                opacity: 1;
-                transform: translateY(0);
-            }
-        }
-
-        .welcome-screen.hidden {
-            display: none;
-        }
-
-        .welcome-icon {
-            font-size: 5rem;
-            margin-bottom: 2rem;
-            animation: bounce 2s infinite;
-        }
-
-        @keyframes bounce {
-            0%, 100% {
-                transform: translateY(0);
-            }
-            50% {
-                transform: translateY(-10px);
-            }
-        }
-
-        .welcome-screen h2 {
-            font-size: 2.5rem;
-            margin-bottom: 1rem;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            background-clip: text;
-            font-weight: 700;
-        }
-
-        .welcome-screen p {
-            color: var(--text-secondary);
-            font-size: 1.2rem;
-            margin-bottom: 3rem;
-            max-width: 600px;
-            margin-left: auto;
-            margin-right: auto;
-        }
-
-        .welcome-features {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-            gap: 1.5rem;
-            text-align: left;
-            margin-top: 2rem;
-            max-width: 900px;
-            margin-left: auto;
-            margin-right: auto;
-        }
-
-        .welcome-feature {
-            padding: 2rem;
-            background: var(--bg-main);
-            border-radius: 16px;
-            box-shadow: var(--shadow);
-            transition: transform 0.3s ease, box-shadow 0.3s ease;
-            border: 1px solid var(--border);
-        }
-
-        .welcome-feature:hover {
-            transform: translateY(-5px);
-            box-shadow: var(--shadow-lg);
-        }
-
-        .welcome-feature-icon {
-            font-size: 2.5rem;
-            margin-bottom: 1rem;
-            display: block;
-        }
-
-        .welcome-feature h3 {
-            font-size: 1.1rem;
-            margin-bottom: 0.5rem;
-            color: var(--text-primary);
-            font-weight: 600;
-        }
-
-        .welcome-feature p {
-            font-size: 0.9rem;
-            color: var(--text-secondary);
-            margin: 0;
-            line-height: 1.5;
-        }
-
-        .welcome-cta {
-            margin-top: 3rem;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            gap: 1rem;
-        }
-
-        .welcome-cta-text {
-            font-size: 1rem;
-            color: var(--text-light);
-            font-style: italic;
-        }
-
-        .welcome-suggestions {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 0.75rem;
-            justify-content: center;
-            margin-top: 2rem;
-        }
-
-        .suggestion-chip {
-            padding: 0.75rem 1.25rem;
-            background: linear-gradient(135deg, rgba(102, 126, 234, 0.1) 0%, rgba(118, 75, 162, 0.1) 100%);
-            border: 1px solid rgba(102, 126, 234, 0.3);
-            border-radius: 24px;
-            cursor: pointer;
-            font-size: 0.9rem;
-            transition: all 0.3s ease;
-            color: var(--text-primary);
-        }
-
-        .suggestion-chip:hover {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            transform: scale(1.05);
-            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.3);
-        }
-
-        /* Messages */
-        .message-wrapper {
-            max-width: 900px;
-            margin: 0 auto 1.5rem auto;
-            animation: slideUp 0.3s ease;
-        }
-
-        @keyframes slideUp {
-            from {
-                opacity: 0;
-                transform: translateY(10px);
-            }
-            to {
-                opacity: 1;
-                transform: translateY(0);
-            }
-        }
-
-        .message {
-            padding: 1.25rem;
-            border-radius: 12px;
-            box-shadow: var(--shadow);
-        }
-
-        .message-header {
-            display: flex;
-            align-items: center;
-            gap: 0.75rem;
-            margin-bottom: 0.75rem;
-        }
-
-        .message-avatar {
-            width: 32px;
-            height: 32px;
-            border-radius: 50%;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-size: 1.2rem;
-        }
-
-        .message-sender {
-            font-weight: 600;
-            font-size: 0.9rem;
-        }
-
-        .user-message {
-            background: var(--user-msg);
-            color: white;
-            margin-left: auto;
-            max-width: 85%;
-        }
-
-        .user-message .message-avatar {
-            background: rgba(255, 255, 255, 0.2);
-        }
-
-        .assistant-message {
-            background: var(--assistant-msg);
-            max-width: 100%;
-        }
-
-        .assistant-message .message-avatar {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        }
-
-        /* Markdown Content Styling */
-        .message-content {
-            line-height: 1.7;
-        }
-
-        .message-content h1, 
-        .message-content h2, 
-        .message-content h3 {
-            margin-top: 1.5rem;
-            margin-bottom: 0.75rem;
-        }
-
-        .message-content h1 { font-size: 1.75rem; }
-        .message-content h2 { font-size: 1.5rem; }
-        .message-content h3 { font-size: 1.25rem; }
-
-        .message-content p {
-            margin-bottom: 1rem;
-        }
-
-        .message-content ul, 
-        .message-content ol {
-            margin-left: 1.5rem;
-            margin-bottom: 1rem;
-        }
-
-        .message-content li {
-            margin-bottom: 0.5rem;
-        }
-
-        .message-content code {
-            background: rgba(0, 0, 0, 0.05);
-            padding: 0.2rem 0.4rem;
-            border-radius: 4px;
-            font-family: 'Monaco', 'Courier New', monospace;
-            font-size: 0.9em;
-        }
-
-        .user-message .message-content code {
-            background: rgba(255, 255, 255, 0.2);
-        }
-
-        .message-content pre {
-            background: #1e1e1e;
-            padding: 1rem;
-            border-radius: 8px;
-            overflow-x: auto;
-            margin-bottom: 1rem;
-        }
-
-        .message-content pre code {
-            background: none;
-            padding: 0;
-            color: #d4d4d4;
-            font-size: 0.85rem;
-        }
-
-        .message-content blockquote {
-            border-left: 4px solid var(--primary);
-            padding-left: 1rem;
-            margin: 1rem 0;
-            color: var(--text-secondary);
-            font-style: italic;
-        }
-
-        .message-content table {
-            width: 100%;
-            border-collapse: collapse;
-            margin-bottom: 1rem;
-        }
-
-        .message-content th,
-        .message-content td {
-            padding: 0.75rem;
-            border: 1px solid var(--border);
-            text-align: left;
-        }
-
-        .message-content th {
-            background: var(--bg-secondary);
-            font-weight: 600;
-        }
-
-        .message-content a {
-            color: var(--primary);
-            text-decoration: none;
-        }
-
-        .message-content a:hover {
-            text-decoration: underline;
-        }
-
-        /* Tool Usage */
-        .tool-use-indicator {
-            display: inline-flex;
-            align-items: center;
-            gap: 0.5rem;
-            padding: 0.5rem 0.75rem;
-            background: rgba(102, 126, 234, 0.1);
-            border-radius: 6px;
-            font-size: 0.85rem;
-            margin-bottom: 0.75rem;
-        }
-
-        /* Typing Indicator */
-        .typing-indicator {
-            display: none;
-            max-width: 900px;
-            margin: 0 auto 1.5rem auto;
-            padding: 1rem;
-            background: var(--bg-main);
-            border-radius: 12px;
-            box-shadow: var(--shadow);
-        }
-
-        .typing-indicator.visible {
-            display: block;
-        }
-
-        .typing-dots {
-            display: flex;
-            gap: 0.5rem;
-            align-items: center;
-        }
-
-        .typing-dots span {
-            width: 8px;
-            height: 8px;
-            background: var(--primary);
-            border-radius: 50%;
-            animation: typing 1.4s infinite;
-        }
-
-        .typing-dots span:nth-child(2) {
-            animation-delay: 0.2s;
-        }
-
-        .typing-dots span:nth-child(3) {
-            animation-delay: 0.4s;
-        }
-
-        @keyframes typing {
-            0%, 60%, 100% {
-                transform: translateY(0);
-                opacity: 0.7;
-            }
-            30% {
-                transform: translateY(-10px);
-                opacity: 1;
-            }
-        }
-
-        /* File Upload Area */
-        .file-upload-area {
-            background: var(--bg-main);
-            border-bottom: 1px solid var(--border);
-            padding: 1rem 1.5rem;
-            display: none;
-        }
-
-        .file-upload-area.has-files {
-            display: block;
-        }
-
-        .uploaded-files {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 0.5rem;
-        }
-
-        .file-chip {
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
-            padding: 0.5rem 0.75rem;
-            background: var(--bg-secondary);
-            border: 1px solid var(--border);
-            border-radius: 8px;
-            font-size: 0.85rem;
-        }
-
-        .file-chip-icon {
-            font-size: 1.2rem;
-        }
-
-        .file-chip-remove {
-            cursor: pointer;
-            color: #ef4444;
-            font-weight: bold;
-            margin-left: 0.5rem;
-        }
-
-        /* Input Area */
-        .input-area {
-            background: var(--bg-main);
-            border-top: 1px solid var(--border);
-            padding: 1rem 1.5rem;
-            box-shadow: 0 -4px 12px rgba(0, 0, 0, 0.05);
-            position: relative;
-            z-index: 10;
-        }
-
-        .input-wrapper {
-            max-width: 900px;
-            margin: 0 auto;
-            display: flex;
-            gap: 0.75rem;
-            align-items: flex-end;
-        }
-
-        .input-actions {
-            display: flex;
-            flex-direction: column;
-            gap: 0.5rem;
-        }
-
-        .attach-btn {
-            padding: 0.75rem;
-            background: var(--bg-secondary);
-            border: none;
-            border-radius: 8px;
-            cursor: pointer;
-            font-size: 1.2rem;
-            transition: all 0.2s;
-        }
-
-        .attach-btn:hover {
-            background: var(--border);
-            transform: scale(1.05);
-        }
-
-        #user-input {
-            flex: 1;
-            padding: 0.875rem 1rem;
-            border: 2px solid var(--border);
-            border-radius: 12px;
-            font-family: inherit;
-            font-size: 0.95rem;
-            resize: none;
-            min-height: 50px;
-            max-height: 200px;
-            transition: border-color 0.2s, box-shadow 0.2s;
-        }
-
-        #user-input:focus {
-            outline: none;
-            border-color: var(--primary);
-            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
-        }
-
-        #send-button {
-            padding: 0.875rem 1.5rem;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            border: none;
-            border-radius: 12px;
-            cursor: pointer;
-            font-weight: 600;
-            transition: transform 0.2s, box-shadow 0.2s;
-            min-width: 100px;
-            font-size: 0.95rem;
-        }
-
-        #send-button:hover:not(:disabled) {
-            transform: translateY(-2px);
-            box-shadow: 0 6px 20px rgba(102, 126, 234, 0.4);
-        }
-
-        #send-button:disabled {
-            opacity: 0.5;
-            cursor: not-allowed;
-        }
-
-        #file-input {
-            display: none;
-        }
-
-        /* Mobile Responsive */
-        @media (max-width: 768px) {
-            .sidebar {
-                transform: translateX(-100%);
-            }
-
-            .sidebar.visible {
-                transform: translateX(0);
-            }
-
-            .main-content {
-                margin-left: 0;
-            }
-
-            .hamburger {
-                display: flex;
-            }
-
-            .chat-messages {
-                padding: 1rem;
-            }
-
-            .message-wrapper {
-                margin-bottom: 1rem;
-            }
-
-            .user-message {
-                max-width: 90%;
-            }
-
-            .input-area {
-                padding: 0.75rem;
-            }
-
-            .welcome-features {
-                grid-template-columns: 1fr;
-            }
-
-            .welcome-screen {
-                padding: 2rem 1rem;
-                min-height: 500px;
-            }
-
-            .welcome-icon {
-                font-size: 3.5rem;
-            }
-
-            .welcome-screen h2 {
-                font-size: 1.75rem;
-            }
-
-            .welcome-screen p {
-                font-size: 1rem;
-            }
-        }
-
-        /* Overlay for mobile sidebar */
-        .sidebar-overlay {
-            display: none;
-            position: fixed;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            background: rgba(0, 0, 0, 0.5);
-            z-index: 999;
-        }
-
-        .sidebar-overlay.visible {
-            display: block;
-        }
-    </style>
+    <!-- Custom Styles -->
+    <link rel="stylesheet" href="chat.css">
 </head>
 <body>
     <div class="app-container">
-        <!-- Sidebar Overlay (mobile) -->
-        <div class="sidebar-overlay" id="sidebar-overlay" onclick="toggleSidebar()"></div>
+        <!-- Mobile Header -->
+        <header class="mobile-header">
+            <button class="menu-toggle" id="menu-toggle" aria-label="Toggle menu">
+                <span></span>
+                <span></span>
+                <span></span>
+            </button>
+            <h1 class="app-title">Suna-Lite</h1>
+            <button class="new-chat-btn-mobile" onclick="clearChat()" aria-label="New chat">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <line x1="12" y1="5" x2="12" y2="19"></line>
+                    <line x1="5" y1="12" x2="19" y2="12"></line>
+                </svg>
+            </button>
+        </header>
 
         <!-- Sidebar -->
         <aside class="sidebar" id="sidebar">
             <div class="sidebar-header">
-                <h2>🤖 Suna-Lite</h2>
-                <p class="sidebar-subtitle">Autonomous AI Agent</p>
+                <div class="sidebar-title">
+                    <span class="logo">🤖</span>
+                    <div>
+                        <h2>Suna-Lite</h2>
+                        <p>Autonomous AI Agent</p>
+                    </div>
+                </div>
             </div>
             
-            <div class="sidebar-content">
+            <nav class="sidebar-nav">
                 <button class="new-chat-btn" onclick="clearChat()">
-                    ✨ New Chat
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <line x1="12" y1="5" x2="12" y2="19"></line>
+                        <line x1="5" y1="12" x2="19" y2="12"></line>
+                    </svg>
+                    New Chat
                 </button>
 
-                <div class="sidebar-section">
+                <div class="nav-section">
                     <h3>Capabilities</h3>
-                    <div class="capability-list" id="capabilities">
-                        <div class="capability-item">
-                            <span class="capability-icon">🔍</span>
-                            <span>Web Search</span>
+                    <div class="capability-grid">
+                        <div class="capability-item" data-tooltip="Web Search">
+                            <span>🔍</span>
+                            <span>Search</span>
                         </div>
-                        <div class="capability-item">
-                            <span class="capability-icon">💻</span>
-                            <span>Code Execution</span>
+                        <div class="capability-item" data-tooltip="Code Execution">
+                            <span>💻</span>
+                            <span>Code</span>
                         </div>
-                        <div class="capability-item">
-                            <span class="capability-icon">📄</span>
-                            <span>File Analysis</span>
+                        <div class="capability-item" data-tooltip="File Analysis">
+                            <span>📄</span>
+                            <span>Files</span>
                         </div>
-                        <div class="capability-item">
-                            <span class="capability-icon">👁️</span>
+                        <div class="capability-item" data-tooltip="Vision">
+                            <span>👁️</span>
                             <span>Vision</span>
                         </div>
-                        <div class="capability-item">
-                            <span class="capability-icon">📊</span>
-                            <span>Data Analysis</span>
+                        <div class="capability-item" data-tooltip="Data Analysis">
+                            <span>📊</span>
+                            <span>Data</span>
                         </div>
-                        <div class="capability-item">
-                            <span class="capability-icon">🔄</span>
-                            <span>Multi-Step Tasks</span>
+                        <div class="capability-item" data-tooltip="Multi-Step Tasks">
+                            <span>🔄</span>
+                            <span>Tasks</span>
                         </div>
                     </div>
                 </div>
 
-                <!-- History section (placeholder) -->
-                <!--
-                <div class="sidebar-section">
-                    <h3>Recent Chats</h3>
+                <div class="nav-section">
+                    <h3>Recent</h3>
                     <div class="history-list" id="history-list">
-                        <div class="history-item">Previous conversation...</div>
+                        <!-- Dynamic history items -->
                     </div>
                 </div>
-                -->
+            </nav>
+
+            <div class="sidebar-footer">
+                <button class="settings-btn">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <circle cx="12" cy="12" r="3"></circle>
+                        <path d="M12 1v6m0 6v6m11-7h-6m-6 0H1"></path>
+                    </svg>
+                    Settings
+                </button>
             </div>
         </aside>
 
         <!-- Main Content -->
-        <main class="main-content" id="main-content">
-            <!-- Header -->
-            <header class="header">
-                <div class="hamburger" id="hamburger" onclick="toggleSidebar()">
-                    <span></span>
-                    <span></span>
-                    <span></span>
-                </div>
-                <div class="header-title">
-                    <h1>Suna-Lite Agent</h1>
-                </div>
-                <div class="header-actions">
-                    <button class="icon-btn" onclick="clearChat()" title="New Chat">
-                        ✨
-                    </button>
-                </div>
-            </header>
+        <main class="main-content">
+            <!-- Overlay for mobile -->
+            <div class="overlay" id="overlay"></div>
 
-            <!-- Chat Area -->
-            <div class="chat-area">
-                <!-- File Upload Area -->
-                <div class="file-upload-area" id="file-upload-area">
-                    <div class="uploaded-files" id="uploaded-files"></div>
-                </div>
-
-                <!-- Messages -->
-                <div class="chat-messages" id="chat-messages">
-                    <!-- Welcome Screen -->
-                    <div class="welcome-screen" id="welcome-screen">
+            <!-- Chat Container -->
+            <div class="chat-container">
+                <!-- Welcome Screen -->
+                <div class="welcome-screen" id="welcome-screen">
+                    <div class="welcome-content">
                         <div class="welcome-icon">🤖</div>
-                        <h2>Welcome to Suna-Lite</h2>
-                        <p>Your autonomous AI assistant powered by Gemini 2.5 Flash with advanced multi-step reasoning and tool execution capabilities</p>
+                        <h1>Welcome to Suna-Lite</h1>
+                        <p>Your autonomous AI assistant with advanced multi-step reasoning and tool execution capabilities</p>
                         
-                        <div class="welcome-features">
-                            <div class="welcome-feature">
-                                <div class="welcome-feature-icon">🔍</div>
+                        <div class="capabilities-showcase">
+                            <div class="capability-card">
+                                <div class="capability-icon">🔍</div>
                                 <h3>Web Search</h3>
-                                <p>Access real-time information from the web to answer current questions and find the latest data</p>
+                                <p>Real-time information access</p>
                             </div>
-                            <div class="welcome-feature">
-                                <div class="welcome-feature-icon">💻</div>
+                            <div class="capability-card">
+                                <div class="capability-icon">💻</div>
                                 <h3>Code Execution</h3>
-                                <p>Run Python code for complex calculations, data analysis, and algorithmic problem solving</p>
+                                <p>Python & data analysis</p>
                             </div>
-                            <div class="welcome-feature">
-                                <div class="welcome-feature-icon">📄</div>
+                            <div class="capability-card">
+                                <div class="capability-icon">📄</div>
                                 <h3>File Analysis</h3>
-                                <p>Process and analyze documents, spreadsheets, PDFs, images, and various data formats</p>
+                                <p>Documents & images</p>
                             </div>
-                            <div class="welcome-feature">
-                                <div class="welcome-feature-icon">🔄</div>
-                                <h3>Multi-Step Tasks</h3>
-                                <p>Autonomous planning and execution of complex tasks that require multiple steps and tools</p>
-                            </div>
-                            <div class="welcome-feature">
-                                <div class="welcome-feature-icon">👁️</div>
-                                <h3>Vision Analysis</h3>
-                                <p>Understand and analyze images, charts, diagrams, and visual content with AI vision</p>
-                            </div>
-                            <div class="welcome-feature">
-                                <div class="welcome-feature-icon">📊</div>
-                                <h3>Data Processing</h3>
-                                <p>Comprehensive data analysis, visualization, and insights from structured and unstructured data</p>
+                            <div class="capability-card">
+                                <div class="capability-icon">👁️</div>
+                                <h3>Vision</h3>
+                                <p>Image understanding</p>
                             </div>
                         </div>
 
-                        <div class="welcome-cta">
-                            <p class="welcome-cta-text">✨ Try asking me something or choose a suggestion below:</p>
-                            <div class="welcome-suggestions">
-                                <div class="suggestion-chip" onclick="useSuggestion(this)">
-                                    What's the current Bitcoin price?
-                                </div>
-                                <div class="suggestion-chip" onclick="useSuggestion(this)">
-                                    Analyze this dataset for trends
-                                </div>
-                                <div class="suggestion-chip" onclick="useSuggestion(this)">
-                                    Calculate compound interest
-                                </div>
-                                <div class="suggestion-chip" onclick="useSuggestion(this)">
-                                    Search latest AI news
-                                </div>
-                                <div class="suggestion-chip" onclick="useSuggestion(this)">
-                                    Explain quantum computing
-                                </div>
+                        <div class="quick-starters">
+                            <h3>Try these:</h3>
+                            <div class="suggestion-chips">
+                                <button class="suggestion-chip" onclick="useSuggestion(this)">What's Bitcoin's current price?</button>
+                                <button class="suggestion-chip" onclick="useSuggestion(this)">Analyze this dataset</button>
+                                <button class="suggestion-chip" onclick="useSuggestion(this)">Calculate compound interest</button>
+                                <button class="suggestion-chip" onclick="useSuggestion(this)">Latest AI news</button>
+                                <button class="suggestion-chip" onclick="useSuggestion(this)">Explain quantum computing</button>
+                                <button class="suggestion-chip" onclick="useSuggestion(this)">Generate a plot</button>
                             </div>
                         </div>
                     </div>
+                </div>
+
+                <!-- Messages Area -->
+                <div class="messages-area" id="chat-messages">
+                    <!-- Messages will be dynamically added here -->
                 </div>
 
                 <!-- Typing Indicator -->
                 <div class="typing-indicator" id="typing-indicator">
-                    <div class="typing-dots">
-                        <span></span>
-                        <span></span>
-                        <span></span>
-                        <span style="margin-left: 0.5rem;" id="typing-text">Thinking...</span>
+                    <div class="typing-content">
+                        <div class="typing-dots">
+                            <span></span>
+                            <span></span>
+                            <span></span>
+                        </div>
+                        <span id="typing-text">Thinking...</span>
                     </div>
                 </div>
+            </div>
 
-                <!-- Input Area -->
-                <div class="input-area">
+            <!-- Input Area -->
+            <div class="input-area">
+                <div class="input-container">
+                    <!-- File Upload Preview -->
+                    <div class="file-preview" id="file-preview"></div>
+                    
                     <div class="input-wrapper">
-                        <input type="file" id="file-input" multiple 
-                               accept=".pdf,.doc,.docx,.txt,.csv,.xlsx,.xls,.json,.png,.jpg,.jpeg,.gif,.webp">
-                        <div class="input-actions">
-                            <button class="attach-btn" onclick="document.getElementById('file-input').click()" 
-                                    title="Attach files">
-                                📎
+                        <input type="file" id="file-input" multiple accept="*/*" style="display: none;">
+                        
+                        <button class="attach-btn" onclick="document.getElementById('file-input').click()" 
+                                aria-label="Attach files">
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"></path>
+                            </svg>
+                        </button>
+                        
+                        <div class="input-field">
+                            <textarea 
+                                id="user-input"
+                                placeholder="Message Suna-Lite..."
+                                rows="1"
+                                autofocus
+                            ></textarea>
+                            <button id="send-button" class="send-btn" aria-label="Send message">
+                                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <line x1="22" y1="2" x2="11" y2="13"></line>
+                                    <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+                                </svg>
                             </button>
                         </div>
-                        <textarea
-                            id="user-input"
-                            placeholder="Ask me anything, upload files, or request multi-step analysis..."
-                            rows="1"
-                            autofocus
-                        ></textarea>
-                        <button id="send-button">Send</button>
+                    </div>
+                    
+                    <div class="input-footer">
+                        <span class="input-hint">Press Enter to send, Shift + Enter for new line</span>
                     </div>
                 </div>
             </div>
         </main>
     </div>
+
+    <!-- Toast Container -->
+    <div class="toast-container" id="toast-container"></div>
 
     <script src="chat.js"></script>
 </body>

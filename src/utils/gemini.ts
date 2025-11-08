@@ -1,4 +1,5 @@
-// src/utils/gemini.ts - Complete Updated Version
+// src/utils/gemini.ts - Complete Updated Version (corrected)
+import { Buffer } from 'buffer';
 import { GoogleGenAI } from '@google/genai';
 import type { TaskComplexity, ExecutionPlan, FileMetadata } from '../types';
 
@@ -28,7 +29,7 @@ class CircuitBreaker {
   private failures = 0;
   private lastFailureTime = 0;
   private readonly threshold = 5;
-  private readonly resetTimeout = 60000;
+  private readonly resetTimeout = 60_000;
 
   async execute<T>(fn: () => Promise<T>): Promise<T> {
     if (this.isOpen()) {
@@ -121,7 +122,11 @@ export class GeminiClient {
   private parse<T>(text: string): T | null {
     try {
       if (!text) return null;
-      const trimmed = text.trim().replace(/^```json\s*/, '').replace(/```$/, '');
+      // remove surrounding ```json or ``` and whitespace
+      const trimmed = text
+        .trim()
+        .replace(/^\s*```(?:json)?\s*/i, '')
+        .replace(/\s*```\s*$/i, '');
       if (!trimmed) return null;
       return JSON.parse(trimmed) as T;
     } catch (e) {
@@ -160,20 +165,23 @@ export class GeminiClient {
   async uploadFile(fileDataBase64: string, mimeType: string, displayName: string): Promise<FileMetadata> {
     return this.withRetry(async () => {
       const buffer = Buffer.from(fileDataBase64, 'base64');
-      const uploadResp = await this.withTimeout(
+      const uploadResp: any = await this.withTimeout(
         this.ai.files.upload({ file: buffer as any, config: { mimeType, displayName } }),
         'uploadFile timed out'
       );
-      const name = uploadResp.name;
-      const meta = await this.ai.files.get({ name });
+      const name = uploadResp?.name;
+      if (!name) {
+        throw new Error('uploadFile failed: no file name returned from upload');
+      }
+      const meta: any = await this.ai.files.get({ name });
       return {
-        fileUri: meta.uri,
-        mimeType: meta.mimeType,
-        name: meta.displayName ?? displayName,
-        sizeBytes: meta.sizeBytes ?? buffer.length,
+        fileUri: meta?.uri,
+        mimeType: meta?.mimeType ?? mimeType,
+        name: meta?.displayName ?? displayName,
+        sizeBytes: meta?.sizeBytes ?? buffer.length,
         uploadedAt: Date.now(),
-        state: (meta.state as any) ?? 'ACTIVE',
-        expiresAt: meta.expirationTime ? new Date(meta.expirationTime).getTime() : undefined,
+        state: (meta?.state as any) ?? 'ACTIVE',
+        expiresAt: meta?.expirationTime ? new Date(meta.expirationTime).getTime() : undefined,
       } as FileMetadata;
     });
   }
@@ -181,8 +189,8 @@ export class GeminiClient {
   async getFileStatus(fileUriOrName: string): Promise<string> {
     try {
       const name = fileUriOrName.split('/').pop() ?? fileUriOrName;
-      const meta = await this.ai.files.get({ name });
-      return meta.state ?? 'UNKNOWN';
+      const meta: any = await this.ai.files.get({ name });
+      return meta?.state ?? 'UNKNOWN';
     } catch (e) {
       console.warn('[GeminiClient] getFileStatus failed', e);
       return 'FAILED';
@@ -265,12 +273,17 @@ export class GeminiClient {
   }
 
   private async extractTextFromResponse(response: any): Promise<string> {
+    if (!response) return '';
     if (typeof response?.text === 'string') return response.text;
     if (typeof response?.text === 'function') return await response.text();
     if (response?.response?.text) {
       return typeof response.response.text === 'function'
         ? await response.response.text()
         : response.response.text;
+    }
+    // sometimes SDK exposes .result?.text
+    if (response?.result?.text) {
+      return typeof response.result.text === 'function' ? await response.result.text() : response.result.text;
     }
     return '';
   }
@@ -282,11 +295,8 @@ export class GeminiClient {
     let fullText = '';
 
     try {
-      console.log('[GeminiClient] Starting stream handling...');
-      
-      // Check if it's an async iterable
+      // If streamResp is an async iterable (most streaming SDKs)
       if (streamResp && typeof streamResp[Symbol.asyncIterator] === 'function') {
-        console.log('[GeminiClient] Using async iterator');
         for await (const chunk of streamResp) {
           const text = this.extractTextFromChunk(chunk);
           if (text) {
@@ -300,12 +310,29 @@ export class GeminiClient {
             }
           }
         }
-        console.log('[GeminiClient] Stream completed, total length:', fullText.length);
         return fullText;
       }
 
-      // Fallback: try to get text directly
-      console.log('[GeminiClient] No async iterator, trying direct text extraction');
+      // If SDK returns object with .stream or .iterable property
+      const candidateIterable = streamResp?.stream ?? streamResp?.iterable ?? null;
+      if (candidateIterable && typeof candidateIterable[Symbol.asyncIterator] === 'function') {
+        for await (const chunk of candidateIterable) {
+          const text = this.extractTextFromChunk(chunk);
+          if (text) {
+            fullText += text;
+            if (onChunk) {
+              try {
+                onChunk(text);
+              } catch (e) {
+                console.warn('[GeminiClient] onChunk error:', e);
+              }
+            }
+          }
+        }
+        return fullText;
+      }
+
+      // Fallback: try to get text directly from response
       const result = await Promise.resolve(streamResp);
       const text = await this.extractTextFromResponse(result);
       if (text) {
@@ -319,7 +346,6 @@ export class GeminiClient {
         }
       }
 
-      console.log('[GeminiClient] Extracted text length:', fullText.length);
       return fullText;
     } catch (e) {
       console.error('[GeminiClient] Stream handling failed:', e);
@@ -347,12 +373,12 @@ Rules:
 Files: ${hasFiles ? 'YES' : 'NO'}
 Query: ${query}`;
 
-      const resp = await this.withTimeout(
+      const resp: any = await this.withTimeout(
         this.ai.models.generateContent({
           model: 'gemini-2.5-flash',
           contents: prompt,
           config: { thinkingConfig: { thinkingBudget: 512 } },
-        }),
+        } as any),
         'analyzeComplexity timed out',
         30_000
       );
@@ -402,12 +428,12 @@ Tools needed: ${complexity.requiredTools.join(', ') || 'none'}
 
 Query: ${query}`;
 
-      const resp = await this.withTimeout(
+      const resp: any = await this.withTimeout(
         this.ai.models.generateContent({
           model: 'gemini-2.5-flash',
           contents: prompt,
           config: { thinkingConfig: { thinkingBudget: 1024 } },
-        }),
+        } as any),
         'generatePlan timed out',
         30_000
       );
@@ -459,55 +485,38 @@ Query: ${query}`;
   ): Promise<string> {
     return this.withRetry(async () => {
       const modelName = opts?.model ?? 'gemini-2.5-flash';
+      // Use the same buildContents as elsewhere
       const contents = this.buildContents(query, history);
 
-      console.log('[GeminiClient] streamResponse called');
-      console.log('[GeminiClient] Model:', modelName);
-      console.log('[GeminiClient] Contents length:', contents.length);
+      // Use the streaming API (SDK shapes vary; cast to any)
+      const call: any = this.ai.models.generateContentStream({
+        model: modelName,
+        contents,
+        config: {
+          thinkingConfig: opts?.thinkingConfig ?? { thinkingBudget: 512 },
+        },
+      } as any);
 
-      try {
-        const streamCall = this.ai.models.generateContent({
-          model: modelName,
-          contents,
-          config: {
-            thinkingConfig: opts?.thinkingConfig ?? { thinkingBudget: 512 },
-          },
-        } as any);
+      // Respect timeout
+      const streamResp = await this.withTimeout(call, 'streamResponse timed out', opts?.timeoutMs);
 
-        console.log('[GeminiClient] Generate content called, awaiting response...');
-        
-        const result = await this.withTimeout(
-          streamCall,
-          'streamResponse timed out',
-          opts?.timeoutMs ?? this.defaultTimeoutMs
-        );
+      // handleStreamedResponse is robust to async iterables or objects with .stream
+      const fullText = await this.handleStreamedResponse(streamResp, onChunk);
 
-        console.log('[GeminiClient] Response received');
-        
-        // Extract text from response
-        let fullText = '';
-        if (typeof result?.text === 'string') {
-          fullText = result.text;
-        } else if (typeof result?.text === 'function') {
-          fullText = await result.text();
-        }
-
-        console.log('[GeminiClient] Extracted text length:', fullText.length);
-
-        // Call onChunk with full text if provided
-        if (fullText && onChunk) {
+      // If nothing collected, try direct final text fallback
+      if (!fullText) {
+        const finalText = await this.extractTextFromResponse(streamResp);
+        if (finalText && onChunk) {
           try {
-            onChunk(fullText);
+            onChunk(finalText);
           } catch (e) {
             console.warn('[GeminiClient] onChunk error:', e);
           }
         }
-
-        return fullText;
-      } catch (e) {
-        console.error('[GeminiClient] streamResponse error:', e);
-        throw e;
+        return finalText ?? '';
       }
+
+      return fullText;
     });
   }
 
@@ -546,13 +555,16 @@ Query: ${query}`;
         },
       } as any);
 
-      const resp = await this.withTimeout(call, 'executeWithConfig timed out', config.timeoutMs);
-      
+      const resp: any = await this.withTimeout(call, 'executeWithConfig timed out', config.timeoutMs);
+
       let text = '';
       if (typeof resp?.text === 'string') {
         text = resp.text;
       } else if (typeof resp?.text === 'function') {
         text = await resp.text();
+      } else {
+        // fallback: try response.result or similar shapes
+        text = (await this.extractTextFromResponse(resp)) ?? '';
       }
 
       if (text && onChunk) {
@@ -580,12 +592,12 @@ ${stepResults.map((s, i) => `${i + 1}. ${s.description}: ${s.result.substring(0,
 
 Provide comprehensive answer:`;
 
-      const resp = await this.withTimeout(
+      const resp: any = await this.withTimeout(
         this.ai.models.generateContent({
           model: 'gemini-2.5-flash',
           contents: prompt,
           config: { thinkingConfig: { thinkingBudget: 1024 } },
-        }),
+        } as any),
         'synthesize timed out',
         45_000
       );
@@ -595,6 +607,8 @@ Provide comprehensive answer:`;
         text = resp.text;
       } else if (typeof resp?.text === 'function') {
         text = await resp.text();
+      } else {
+        text = (await this.extractTextFromResponse(resp)) ?? '';
       }
 
       return text || '[no-answer]';

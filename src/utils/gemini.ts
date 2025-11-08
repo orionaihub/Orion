@@ -327,7 +327,6 @@ export class GeminiClient {
     }
   }
 
- 
   async analyzeComplexity(query: string, hasFiles = false): Promise<TaskComplexity> {
     return this.withRetry(async () => {
       const prompt = `Analyze request complexity - respond with JSON only:
@@ -466,7 +465,6 @@ Query: ${query}`;
       console.log('[GeminiClient] Model:', modelName);
       console.log('[GeminiClient] Contents length:', contents.length);
 
-      // Build the generateContent call (may return an async iterable or final object)
       try {
         const streamCall = this.ai.models.generateContent({
           model: modelName,
@@ -476,16 +474,34 @@ Query: ${query}`;
           },
         } as any);
 
+        console.log('[GeminiClient] Generate content called, awaiting response...');
+        
         const result = await this.withTimeout(
           streamCall,
           'streamResponse timed out',
           opts?.timeoutMs ?? this.defaultTimeoutMs
         );
 
-        // If the result is an async iterable, handle it incrementally;
-        // otherwise fall back to the regular extraction logic.
-        // Use handleStreamedResponse which already supports both cases.
-        const fullText = await this.handleStreamedResponse(result, onChunk);
+        console.log('[GeminiClient] Response received');
+        
+        // Extract text from response
+        let fullText = '';
+        if (typeof result?.text === 'string') {
+          fullText = result.text;
+        } else if (typeof result?.text === 'function') {
+          fullText = await result.text();
+        }
+
+        console.log('[GeminiClient] Extracted text length:', fullText.length);
+
+        // Call onChunk with full text if provided
+        if (fullText && onChunk) {
+          try {
+            onChunk(fullText);
+          } catch (e) {
+            console.warn('[GeminiClient] onChunk error:', e);
+          }
+        }
 
         return fullText;
       } catch (e) {
@@ -494,7 +510,6 @@ Query: ${query}`;
       }
     });
   }
-  
 
   async executeWithConfig(
     prompt: string,

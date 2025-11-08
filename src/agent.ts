@@ -1,4 +1,4 @@
-// src/autonomous-agent-simplified.ts - Drop-in replacement with minimal changes
+// src/autonomous-agent-simplified.ts - Multi-step autonomous version
 import type { DurableObjectState } from '@cloudflare/workers-types';
 import GeminiClient from './gemini';
 import type { Env, AgentState, Message } from './types';
@@ -11,16 +11,28 @@ interface SqlStorage {
   };
 }
 
+interface Tool {
+  name: string;
+  description: string;
+  parameters: Record<string, any>;
+}
+
+interface ToolCall {
+  name: string;
+  args: Record<string, any>;
+}
+
+interface ToolResult {
+  name: string;
+  success: boolean;
+  result: string;
+}
+
 export class AutonomousAgent {
-  // Durable Object state + env
   private state: DurableObjectState;
   private env: Env;
-
-  // storage + services
   private sql: SqlStorage;
   private gemini: GeminiClient;
-
-  // config
   private maxHistoryMessages = 200;
   private readonly MAX_MESSAGE_SIZE = 100_000;
   private readonly MAX_TURNS = 8;
@@ -29,10 +41,7 @@ export class AutonomousAgent {
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
     this.env = env;
-
-    // @ts-expect-error - in Cloudflare Durable Objects, state.storage may expose `sql` for Workers SQLite
     this.sql = (state.storage as unknown as { sql?: SqlStorage }).sql as SqlStorage;
-
     this.gemini = new GeminiClient({ apiKey: env.GEMINI_API_KEY });
 
     try {
@@ -50,8 +59,6 @@ export class AutonomousAgent {
           );
           CREATE INDEX IF NOT EXISTS idx_msg_ts ON messages(timestamp);
         `);
-      } else {
-        console.warn('SQL storage not available on this Durable Object state.storage');
       }
     } catch (e) {
       console.error('SQLite init failed:', e);
@@ -60,35 +67,165 @@ export class AutonomousAgent {
 
   // ===== System Prompt =====
 
-  private getSystemPrompt(hasFiles: boolean): string {
-    return `You are an autonomous AI assistant. Follow these guidelines:
+  private buildSystemPrompt(state: AgentState): string {
+    const hasFiles = (state.context?.files?.length ?? 0) > 0;
+    
+    return `You are an autonomous AI assistant with tool-use capabilities. Your goal is to help users by breaking down complex tasks and using available tools when needed.
 
 # Response Strategy
-1. For simple questions (greetings, definitions, facts): Answer directly and concisely
-2. For complex tasks (research, analysis, multi-step): Break down your approach and execute progressively
-3. Always explain your reasoning briefly
+1. For simple questions: Answer directly without using tools
+2. For complex tasks: Use available tools iteratively to gather information and complete the task
+3. When you have enough information: Provide a comprehensive final answer
 
-# Available Capabilities
-- General knowledge and reasoning
-- Step-by-step problem solving
-- Data analysis and calculations
-${hasFiles ? '- File analysis (user has uploaded files)' : ''}
+# Available Tools
+You have access to tools for web search, code execution, file analysis, and more. Use them when they would help answer the user's question.
 
-# Style
-- Be conversational and helpful
-- Provide structured responses for complex topics
-- Cite sources when discussing recent information
-- Admit if you don't know something
+# Tool Usage Guidelines
+- Use tools when you need current information, need to perform calculations, or analyze data
+- After receiving tool results, decide if you need more information or can provide a final answer
+- Don't use tools unnecessarily for questions you can answer directly
+- You can use multiple tools across multiple steps to accomplish complex tasks
 
-# Rules
-- Respond directly without unnecessary planning
-- Don't overthink simple queries
-- For research topics, acknowledge your knowledge cutoff (January 2025)
+# Important
+- Always explain your reasoning briefly
+- When using tools, tell the user what you're doing
+- Provide clear, actionable final answers
+${hasFiles ? '- User has uploaded files available for analysis' : ''}
 
-Think about the user's request and respond naturally.`;
+Your knowledge cutoff is January 2025. Use tools to access current information when needed.`;
   }
 
-  // ===== Core Processing =====
+  // ===== Tool Definitions =====
+
+  private getAvailableTools(state: AgentState): Tool[] {
+    const tools: Tool[] = [
+      {
+        name: 'web_search',
+        description: 'Search the web for current information, recent events, or factual data',
+        parameters: {
+          type: 'object',
+          properties: {
+            query: { type: 'string', description: 'Search query' }
+          },
+          required: ['query']
+        }
+      },
+      {
+        name: 'code_execute',
+        description: 'Execute Python code for calculations, data analysis, or processing',
+        parameters: {
+          type: 'object',
+          properties: {
+            code: { type: 'string', description: 'Python code to execute' }
+          },
+          required: ['code']
+        }
+      }
+    ];
+
+    // Add file analysis if files are available
+    if ((state.context?.files?.length ?? 0) > 0) {
+      tools.push({
+        name: 'analyze_file',
+        description: 'Analyze uploaded files',
+        parameters: {
+          type: 'object',
+          properties: {
+            file_index: { type: 'number', description: 'Index of file to analyze' },
+            question: { type: 'string', description: 'Question about the file' }
+          },
+          required: ['file_index']
+        }
+      });
+    }
+
+    return tools;
+  }
+
+  // ===== Tool Execution =====
+
+  private async executeTools(toolCalls: ToolCall[], state: AgentState): Promise<ToolResult[]> {
+    const results: ToolResult[] = [];
+
+    for (const call of toolCalls) {
+      try {
+        let result: string;
+
+        switch (call.name) {
+          case 'web_search':
+            result = await this.executeWebSearch(call.args.query);
+            results.push({ name: call.name, success: true, result });
+            break;
+
+          case 'code_execute':
+            result = await this.executeCode(call.args.code);
+            results.push({ name: call.name, success: true, result });
+            break;
+
+          case 'analyze_file':
+            result = await this.analyzeFile(call.args.file_index, call.args.question, state);
+            results.push({ name: call.name, success: true, result });
+            break;
+
+          default:
+            results.push({ 
+              name: call.name, 
+              success: false, 
+              result: `Unknown tool: ${call.name}` 
+            });
+        }
+      } catch (e) {
+        results.push({
+          name: call.name,
+          success: false,
+          result: `Tool execution failed: ${String(e)}`
+        });
+      }
+    }
+
+    return results;
+  }
+
+  private async executeWebSearch(query: string): Promise<string> {
+    // Use Gemini's built-in search via executeWithConfig
+    const result = await this.gemini.executeWithConfig(
+      `Search for: ${query}`,
+      [],
+      { useSearch: true, model: 'gemini-2.5-flash' }
+    );
+    return result || 'No search results found';
+  }
+
+  private async executeCode(code: string): Promise<string> {
+    // Use Gemini's code execution capability
+    const result = await this.gemini.executeWithConfig(
+      `Execute this code and return the output:\n\`\`\`python\n${code}\n\`\`\``,
+      [],
+      { useCodeExecution: true, model: 'gemini-2.5-flash' }
+    );
+    return result || 'Code execution produced no output';
+  }
+
+  private async analyzeFile(fileIndex: number, question: string | undefined, state: AgentState): Promise<string> {
+    const files = state.context?.files ?? [];
+    if (fileIndex >= files.length) {
+      return 'File index out of range';
+    }
+
+    const file = files[fileIndex];
+    const prompt = question 
+      ? `Analyze this file and answer: ${question}` 
+      : 'Analyze this file and provide a summary';
+
+    const result = await this.gemini.executeWithConfig(
+      prompt,
+      [],
+      { files: [file], model: 'gemini-2.5-flash' }
+    );
+    return result || 'File analysis produced no results';
+  }
+
+  // ===== Main Processing Loop (Multi-step) =====
 
   private async process(userMsg: string, ws: WebSocket | null): Promise<void> {
     return this.withStateTransaction(async (state) => {
@@ -115,56 +252,119 @@ Think about the user's request and respond naturally.`;
         throw e;
       }
 
-      // Send status
-      if (ws) this.send(ws, { type: 'status', message: 'Thinking…' });
-
-      // Build history and response
+      // Build conversation history
+      const systemPrompt = this.buildSystemPrompt(state);
       const history = this.buildHistory();
-      const batcher = this.createChunkBatcher(ws, 'chunk');
+      
+      let conversationHistory: any[] = [
+        { role: 'system', content: systemPrompt },
+        ...history.map(h => ({
+          role: h.role,
+          content: h.parts.map((p: any) => p.text).join('\n')
+        })),
+        { role: 'user', content: userMsg }
+      ];
+
+      let turn = 0;
       let fullResponse = '';
-      let streamedAny = false;
+      const batcher = this.createChunkBatcher(ws, 'chunk');
 
       try {
-        console.log('[Agent] Starting streamResponse...');
+        // Agentic loop - model decides when to stop
+        while (turn < this.MAX_TURNS) {
+          turn++;
 
-        await this.gemini.streamResponse(
-          userMsg,
-          history,
-          (chunk) => {
-            streamedAny = true;
-            fullResponse += chunk;
-            batcher.add(chunk);
-          },
-          {
-            model: 'gemini-2.5-flash',
-            thinkingConfig: { thinkingBudget: 512 },
+          if (ws) {
+            this.send(ws, {
+              type: 'status',
+              message: turn === 1 ? 'Thinking...' : `Processing step ${turn}...`
+            });
           }
-        );
 
-        batcher.flush();
+          console.log(`[Agent] Turn ${turn}/${this.MAX_TURNS}`);
 
-        // Save model response
-        try {
-          if (this.sql) {
-            this.sql.exec(
-              `INSERT INTO messages (role, parts, timestamp) VALUES (?, ?, ?)`,
-              'model',
-              JSON.stringify([{ text: fullResponse }]),
-              Date.now()
-            );
+          // Generate response with tool capability
+          const response = await this.gemini.generateWithTools(
+            conversationHistory,
+            this.getAvailableTools(state),
+            {
+              model: 'gemini-2.5-flash',
+              thinkingConfig: { thinkingBudget: 1024 },
+              stream: true
+            },
+            (chunk: string) => {
+              fullResponse += chunk;
+              batcher.add(chunk);
+            }
+          );
+
+          batcher.flush();
+
+          // Check if model used tools
+          if (response.toolCalls && response.toolCalls.length > 0) {
+            console.log(`[Agent] Tool calls detected: ${response.toolCalls.map((t: ToolCall) => t.name).join(', ')}`);
+
+            if (ws) {
+              this.send(ws, {
+                type: 'tool_use',
+                tools: response.toolCalls.map((t: ToolCall) => t.name)
+              });
+            }
+
+            // Execute tools
+            const toolResults = await this.executeTools(response.toolCalls, state);
+
+            // Add assistant's response with tool calls to history
+            conversationHistory.push({
+              role: 'assistant',
+              content: response.text || '[used tools]',
+              toolCalls: response.toolCalls
+            });
+
+            // Add tool results to history
+            const resultsText = toolResults.map(r =>
+              `${r.name}: ${r.success ? 'Success' : 'Failed'}\n${r.result}`
+            ).join('\n\n');
+
+            conversationHistory.push({
+              role: 'user',
+              content: `Tool Results:\n${resultsText}`
+            });
+
+            // Reset for next turn
+            fullResponse = '';
+            continue;
           }
-        } catch (e) {
-          console.error('Failed to save model response:', e);
+
+          // No tool calls - model provided final answer
+          console.log('[Agent] Final answer received, stopping loop');
+          break;
+        }
+
+        // Save final response
+        if (fullResponse) {
+          try {
+            if (this.sql) {
+              this.sql.exec(
+                `INSERT INTO messages (role, parts, timestamp) VALUES (?, ?, ?)`,
+                'model',
+                JSON.stringify([{ text: fullResponse }]),
+                Date.now()
+              );
+            }
+          } catch (e) {
+            console.error('Failed to save model response:', e);
+          }
         }
 
         if (ws) {
-          // If we streamed chunks, just send 'done'
-          // If no chunks were streamed (fallback), send one chunk + done
-          if (!streamedAny && fullResponse) {
-            this.send(ws, { type: 'chunk', content: fullResponse });
+          if (!fullResponse) {
+            // If no final response collected, still signal completion
+            this.send(ws, { type: 'chunk', content: '[Task completed]' });
           }
-          this.send(ws, { type: 'done', turns: 1, totalLength: fullResponse.length });
+          this.send(ws, { type: 'done', turns: turn, totalLength: fullResponse.length });
         }
+
       } catch (e) {
         console.error('Process error:', e);
         if (ws) this.send(ws, { type: 'error', error: String(e) });
@@ -217,7 +417,6 @@ Think about the user's request and respond naturally.`;
   }
 
   private async withStateTransaction<T>(fn: (state: AgentState) => Promise<T>): Promise<T> {
-    // Use DurableObjectState.blockConcurrencyWhile to avoid concurrent mutation issues
     return this.state.blockConcurrencyWhile(async () => {
       const state = await this.loadState();
       const result = await fn(state);
@@ -227,85 +426,41 @@ Think about the user's request and respond naturally.`;
   }
 
   private buildHistory(): Array<{ role: string; parts: Array<{ text: string }> }> {
-    // Use a synchronous callback inside blockConcurrencyWhile and return the built history
-    return (this.state.blockConcurrencyWhile
-      ? ((): any =>
-          // blockConcurrencyWhile requires a function; we can call synchronously and return
-          // but to keep types simple, call it synchronously and return directly if not needed.
-          // Some runtimes accept synchronous callback — wrap in Promise.resolve for safety.
-          // For simplicity, avoid awaiting blockConcurrencyWhile here and do a direct read.
-          (() => {
-            const rows = this.sql
-              ? this.sql
-                  .exec(
-                    `SELECT role, parts FROM messages ORDER BY timestamp DESC LIMIT ?`,
-                    Math.min(this.maxHistoryMessages, 50)
-                  )
-                  .toArray()
-              : [];
-            const hist: Array<{ role: string; parts: Array<{ text: string }> }> = [];
+    const rows = this.sql
+      ? this.sql
+          .exec(
+            `SELECT role, parts FROM messages ORDER BY timestamp DESC LIMIT ?`,
+            Math.min(this.maxHistoryMessages, 50)
+          )
+          .toArray()
+      : [];
+    
+    const hist: Array<{ role: string; parts: Array<{ text: string }> }> = [];
 
-            for (const r of rows.reverse()) {
-              try {
-                const parts = JSON.parse(r.parts as string);
-                if (parts) {
-                  hist.push({
-                    role: r.role === 'model' ? 'model' : 'user',
-                    parts,
-                  });
-                }
-              } catch (e) {
-                console.warn('Failed to parse message:', e);
-              }
-            }
+    for (const r of rows.reverse()) {
+      try {
+        const parts = JSON.parse(r.parts as string);
+        if (parts) {
+          hist.push({
+            role: r.role === 'model' ? 'model' : 'user',
+            parts,
+          });
+        }
+      } catch (e) {
+        console.warn('Failed to parse message:', e);
+      }
+    }
 
-            // Remove consecutive duplicates (user)
-            let i = hist.length - 1;
-            while (i > 0) {
-              if (hist[i].role === 'user' && hist[i - 1].role === 'user') {
-                hist.splice(i, 1);
-              }
-              i--;
-            }
+    // Remove consecutive duplicate user messages
+    let i = hist.length - 1;
+    while (i > 0) {
+      if (hist[i].role === 'user' && hist[i - 1].role === 'user') {
+        hist.splice(i, 1);
+      }
+      i--;
+    }
 
-            return hist;
-          })())()
-      : (() => {
-          // Fallback if blockConcurrencyWhile not present — behave the same
-          const rows = this.sql
-            ? this.sql
-                .exec(
-                  `SELECT role, parts FROM messages ORDER BY timestamp DESC LIMIT ?`,
-                  Math.min(this.maxHistoryMessages, 50)
-                )
-                .toArray()
-            : [];
-          const hist: Array<{ role: string; parts: Array<{ text: string }> }> = [];
-
-          for (const r of rows.reverse()) {
-            try {
-              const parts = JSON.parse(r.parts as string);
-              if (parts) {
-                hist.push({
-                  role: r.role === 'model' ? 'model' : 'user',
-                  parts,
-                });
-              }
-            } catch (e) {
-              console.warn('Failed to parse message:', e);
-            }
-          }
-
-          let i = hist.length - 1;
-          while (i > 0) {
-            if (hist[i].role === 'user' && hist[i - 1].role === 'user') {
-              hist.splice(i, 1);
-            }
-            i--;
-          }
-
-          return hist;
-        })());
+    return hist;
   }
 
   // ===== WebSocket Management =====
@@ -347,23 +502,17 @@ Think about the user's request and respond naturally.`;
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
 
-    // WebSocket upgrade endpoint
     if (url.pathname === '/api/ws' && request.headers.get('Upgrade')?.toLowerCase() === 'websocket') {
       const pair = new WebSocketPair();
       const [client, server] = Object.values(pair) as [WebSocket, WebSocket];
 
-      // Accept on server side and attach handlers
       try {
-        // server.accept() is required in a Durable Object to start the WebSocket
-        // @ts-ignore
-        server.accept?.();
+        (server as any).accept?.();
       } catch (e) {
         console.error('Failed to accept websocket:', e);
       }
 
-      // Bind handlers
       server.onmessage = (evt: MessageEvent) => {
-        // evt.data may be string or ArrayBuffer
         void this.webSocketMessage(server, evt.data).catch((err) => {
           console.error('webSocketMessage handler error:', err);
         });
@@ -398,10 +547,7 @@ Think about the user's request and respond naturally.`;
 
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
     if (typeof message !== 'string') return;
-    if (ws.readyState !== WebSocket.OPEN) {
-      console.warn('WebSocket not open, discarding message');
-      return;
-    }
+    if (ws.readyState !== WebSocket.OPEN) return;
 
     let payload: any;
     try {
@@ -412,9 +558,7 @@ Think about the user's request and respond naturally.`;
     }
 
     if (payload.type === 'user_message' && typeof payload.content === 'string') {
-      // run processing in background (do not await here)
       try {
-        // DurableObjectState.waitUntil schedules background work
         this.state.waitUntil(
           this.process(payload.content, ws).catch((err) => {
             console.error('WebSocket process failed:', err);
@@ -422,9 +566,8 @@ Think about the user's request and respond naturally.`;
           })
         );
       } catch (e) {
-        // If waitUntil not available, just run without blocking (best-effort)
         void this.process(payload.content, ws).catch((err) => {
-          console.error('Background process failed (no waitUntil):', err);
+          console.error('Background process failed:', err);
           this.send(ws, { type: 'error', error: 'Processing failed' });
         });
       }
@@ -456,16 +599,14 @@ Think about the user's request and respond naturally.`;
     }
 
     try {
-      // schedule background processing
       this.state.waitUntil(
         this.process(message, null).catch((err) => {
           console.error('Background process failed:', err);
         })
       );
     } catch (e) {
-      // fallback if waitUntil not present
       void this.process(message, null).catch((err) => {
-        console.error('Background process failed (no waitUntil):', err);
+        console.error('Background process failed:', err);
       });
     }
 
@@ -504,7 +645,6 @@ Think about the user's request and respond naturally.`;
         if (this.sql) {
           this.sql.exec('DELETE FROM messages');
           this.sql.exec('DELETE FROM kv');
-          // reset autoincrement if using sqlite
           this.sql.exec('DELETE FROM sqlite_sequence WHERE name IN ("messages")');
         }
       } catch (e) {

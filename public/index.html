@@ -269,17 +269,21 @@
 
         /* Welcome Screen */
         .welcome-screen {
-            max-width: 800px;
+            max-width: 1000px;
             margin: 0 auto;
-            padding: 3rem 1.5rem;
+            padding: 4rem 2rem;
             text-align: center;
-            animation: fadeIn 0.5s ease;
+            animation: fadeIn 0.6s ease;
+            min-height: 600px;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
         }
 
         @keyframes fadeIn {
             from {
                 opacity: 0;
-                transform: translateY(20px);
+                transform: translateY(30px);
             }
             to {
                 opacity: 1;
@@ -292,54 +296,122 @@
         }
 
         .welcome-icon {
-            font-size: 4rem;
-            margin-bottom: 1.5rem;
+            font-size: 5rem;
+            margin-bottom: 2rem;
+            animation: bounce 2s infinite;
+        }
+
+        @keyframes bounce {
+            0%, 100% {
+                transform: translateY(0);
+            }
+            50% {
+                transform: translateY(-10px);
+            }
         }
 
         .welcome-screen h2 {
-            font-size: 2rem;
+            font-size: 2.5rem;
             margin-bottom: 1rem;
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
             background-clip: text;
+            font-weight: 700;
         }
 
         .welcome-screen p {
             color: var(--text-secondary);
-            font-size: 1.1rem;
-            margin-bottom: 2rem;
+            font-size: 1.2rem;
+            margin-bottom: 3rem;
+            max-width: 600px;
+            margin-left: auto;
+            margin-right: auto;
         }
 
         .welcome-features {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 1rem;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 1.5rem;
             text-align: left;
             margin-top: 2rem;
+            max-width: 900px;
+            margin-left: auto;
+            margin-right: auto;
         }
 
         .welcome-feature {
-            padding: 1.5rem;
+            padding: 2rem;
             background: var(--bg-main);
-            border-radius: 12px;
+            border-radius: 16px;
             box-shadow: var(--shadow);
+            transition: transform 0.3s ease, box-shadow 0.3s ease;
+            border: 1px solid var(--border);
+        }
+
+        .welcome-feature:hover {
+            transform: translateY(-5px);
+            box-shadow: var(--shadow-lg);
         }
 
         .welcome-feature-icon {
-            font-size: 2rem;
-            margin-bottom: 0.5rem;
+            font-size: 2.5rem;
+            margin-bottom: 1rem;
+            display: block;
         }
 
         .welcome-feature h3 {
-            font-size: 1rem;
+            font-size: 1.1rem;
             margin-bottom: 0.5rem;
+            color: var(--text-primary);
+            font-weight: 600;
         }
 
         .welcome-feature p {
-            font-size: 0.85rem;
+            font-size: 0.9rem;
             color: var(--text-secondary);
             margin: 0;
+            line-height: 1.5;
+        }
+
+        .welcome-cta {
+            margin-top: 3rem;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 1rem;
+        }
+
+        .welcome-cta-text {
+            font-size: 1rem;
+            color: var(--text-light);
+            font-style: italic;
+        }
+
+        .welcome-suggestions {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.75rem;
+            justify-content: center;
+            margin-top: 2rem;
+        }
+
+        .suggestion-chip {
+            padding: 0.75rem 1.25rem;
+            background: linear-gradient(135deg, rgba(102, 126, 234, 0.1) 0%, rgba(118, 75, 162, 0.1) 100%);
+            border: 1px solid rgba(102, 126, 234, 0.3);
+            border-radius: 24px;
+            cursor: pointer;
+            font-size: 0.9rem;
+            transition: all 0.3s ease;
+            color: var(--text-primary);
+        }
+
+        .suggestion-chip:hover {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            transform: scale(1.05);
+            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.3);
         }
 
         /* Messages */
@@ -605,6 +677,9 @@
             background: var(--bg-main);
             border-top: 1px solid var(--border);
             padding: 1rem 1.5rem;
+            box-shadow: 0 -4px 12px rgba(0, 0, 0, 0.05);
+            position: relative;
+            z-index: 10;
         }
 
         .input-wrapper {
@@ -722,14 +797,19 @@
 
             .welcome-screen {
                 padding: 2rem 1rem;
+                min-height: 500px;
             }
 
             .welcome-icon {
-                font-size: 3rem;
+                font-size: 3.5rem;
             }
 
             .welcome-screen h2 {
-                font-size: 1.5rem;
+                font-size: 1.75rem;
+            }
+
+            .welcome-screen p {
+                font-size: 1rem;
             }
         }
 
@@ -841,28 +921,59 @@
                     <div class="welcome-screen" id="welcome-screen">
                         <div class="welcome-icon">🤖</div>
                         <h2>Welcome to Suna-Lite</h2>
-                        <p>Your autonomous AI assistant powered by Gemini 2.5 Flash</p>
+                        <p>Your autonomous AI assistant powered by Gemini 2.5 Flash with advanced multi-step reasoning and tool execution capabilities</p>
                         
                         <div class="welcome-features">
                             <div class="welcome-feature">
                                 <div class="welcome-feature-icon">🔍</div>
                                 <h3>Web Search</h3>
-                                <p>Access real-time information from the web</p>
+                                <p>Access real-time information from the web to answer current questions and find the latest data</p>
                             </div>
                             <div class="welcome-feature">
                                 <div class="welcome-feature-icon">💻</div>
                                 <h3>Code Execution</h3>
-                                <p>Run Python code for calculations and analysis</p>
+                                <p>Run Python code for complex calculations, data analysis, and algorithmic problem solving</p>
                             </div>
                             <div class="welcome-feature">
                                 <div class="welcome-feature-icon">📄</div>
                                 <h3>File Analysis</h3>
-                                <p>Process documents, spreadsheets, PDFs, and more</p>
+                                <p>Process and analyze documents, spreadsheets, PDFs, images, and various data formats</p>
                             </div>
                             <div class="welcome-feature">
                                 <div class="welcome-feature-icon">🔄</div>
                                 <h3>Multi-Step Tasks</h3>
-                                <p>Complex task planning and autonomous execution</p>
+                                <p>Autonomous planning and execution of complex tasks that require multiple steps and tools</p>
+                            </div>
+                            <div class="welcome-feature">
+                                <div class="welcome-feature-icon">👁️</div>
+                                <h3>Vision Analysis</h3>
+                                <p>Understand and analyze images, charts, diagrams, and visual content with AI vision</p>
+                            </div>
+                            <div class="welcome-feature">
+                                <div class="welcome-feature-icon">📊</div>
+                                <h3>Data Processing</h3>
+                                <p>Comprehensive data analysis, visualization, and insights from structured and unstructured data</p>
+                            </div>
+                        </div>
+
+                        <div class="welcome-cta">
+                            <p class="welcome-cta-text">✨ Try asking me something or choose a suggestion below:</p>
+                            <div class="welcome-suggestions">
+                                <div class="suggestion-chip" onclick="useSuggestion(this)">
+                                    What's the current Bitcoin price?
+                                </div>
+                                <div class="suggestion-chip" onclick="useSuggestion(this)">
+                                    Analyze this dataset for trends
+                                </div>
+                                <div class="suggestion-chip" onclick="useSuggestion(this)">
+                                    Calculate compound interest
+                                </div>
+                                <div class="suggestion-chip" onclick="useSuggestion(this)">
+                                    Search latest AI news
+                                </div>
+                                <div class="suggestion-chip" onclick="useSuggestion(this)">
+                                    Explain quantum computing
+                                </div>
                             </div>
                         </div>
                     </div>

@@ -42,7 +42,7 @@ export class Agent {
     this.config = {
       maxHistoryMessages: config.maxHistoryMessages ?? 200,
       maxMessageSize: config.maxMessageSize ?? 100_000,
-      maxTurns: config.maxTurns ?? 8,
+      maxTurns: config.maxTurns ?? 25,
       model: config.model ?? 'gemini-2.5-flash',
       thinkingBudget: config.thinkingBudget ?? 2048, // Doubled for deep CoT
       temperature: config.temperature ?? 0.7,

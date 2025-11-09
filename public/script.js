@@ -1,20 +1,29 @@
 /**
- * Enhanced Orion Frontend with Tailwind/Custom CSS, Markdown, Sidebar, and Full File Support
+ * Fully Adapted Orion Frontend (from provided index.html.txt and styles.css.txt)
+ * - Fixed all DOM ID mismatches.
+ * - Implemented smooth scrolling on streaming chunks.
  */
 
-// DOM elements (Adapted from index.html.txt)
-const chatMessages = document.getElementById("messages-wrapper"); // Changed from 'chat-messages' to 'messages-wrapper'
-const welcomeScreen = document.getElementById("welcome-message"); // Changed from 'welcome-screen' to 'welcome-message'
-const userInput = document.getElementById("chat-input"); // Changed from 'user-input' to 'chat-input'
+// --- DOM elements (CRITICAL FIXES APPLIED) ---
+// The main scrolling container from index.html: <div id="chat-container" class="flex-1 overflow-y-auto custom-scrollbar">
+const chatContainer = document.getElementById("chat-container");
+// The inner wrapper for all messages from index.html: <div id="messages-wrapper" class="max-w-4xl mx-auto pb-4 pt-6">
+const chatMessages = document.getElementById("messages-wrapper");
+// Welcome message container from index.html: <div id="welcome-message" ...>
+const welcomeScreen = document.getElementById("welcome-message"); 
+// Input elements from index.html
+const userInput = document.getElementById("chat-input"); 
 const sendButton = document.getElementById("send-button");
+// Typing indicator container from index.html: <div id="typing-indicator" ...>
 const typingIndicator = document.getElementById("typing-indicator");
 const typingText = document.getElementById("typing-text");
+// File elements
 const fileInput = document.getElementById("file-input");
-const filePreview = document.getElementById("file-preview"); // Added for file chips
+const filePreview = document.getElementById("file-preview"); 
+// Sidebar and mobile controls
 const sidebar = document.getElementById("sidebar");
-const menuBtn = document.getElementById("menu-btn"); // Added for mobile menu
-const overlay = document.getElementById("overlay"); // Added for mobile overlay
-const chatContainer = document.getElementById("chat-container"); // New element for scrolling
+const menuBtn = document.getElementById("menu-btn");
+const overlay = document.getElementById("overlay");
 
 // WebSocket connection
 let ws = null;
@@ -34,7 +43,6 @@ marked.setOptions({
   gfm: true,
   headerIds: false,
   mangle: false,
-  // Highlight function remains the same, relying on loaded highlight.js
   highlight: function(code, lang) {
     if (lang && hljs.getLanguage(lang)) {
       try {
@@ -53,7 +61,7 @@ window.addEventListener('DOMContentLoaded', () => {
   connectWebSocket();
   setupFileUpload();
   setupInputHandlers();
-  setupSidebarToggle(); // New
+  setupSidebarToggle(); 
   checkMobileView();
 });
 
@@ -66,11 +74,9 @@ window.addEventListener('resize', checkMobileView);
 function checkMobileView() {
   const isMobile = window.innerWidth <= 768;
   if (!isMobile) {
-    // Desktop: Ensure sidebar is visible and overlay is hidden
     sidebar.classList.remove('-translate-x-full');
     overlay.classList.add('hidden');
   } else {
-    // Mobile: Ensure sidebar starts hidden
     if (!sidebar.classList.contains('-translate-x-full')) {
        sidebar.classList.add('-translate-x-full');
     }
@@ -82,7 +88,7 @@ function checkMobileView() {
  * Setup mobile sidebar toggle handlers
  */
 function setupSidebarToggle() {
-  // Mobile menu button
+  // Mobile menu button (ID: menu-btn)
   if (menuBtn) {
     menuBtn.addEventListener('click', () => {
       sidebar.classList.toggle('-translate-x-full');
@@ -90,24 +96,36 @@ function setupSidebarToggle() {
     });
   }
   
-  // Overlay click to close
+  // Overlay click to close (ID: overlay)
   if (overlay) {
     overlay.addEventListener('click', () => {
       sidebar.classList.add('-translate-x-full');
       overlay.classList.add('hidden');
     });
   }
+  
+  // New Chat button from sidebar (ID: new-chat-btn)
+  const newChatBtn = document.getElementById('new-chat-btn');
+  if (newChatBtn) {
+      newChatBtn.addEventListener('click', () => {
+          clearChat();
+          // Hide sidebar on mobile after clicking
+          if (window.innerWidth <= 768) {
+              sidebar.classList.add('-translate-x-full');
+              overlay.classList.add('hidden');
+          }
+      });
+  }
 }
 
 /**
- * Setup file upload handler with extended support
+ * Setup file upload handler
  */
 function setupFileUpload() {
   fileInput.addEventListener('change', async (e) => {
     const files = Array.from(e.target.files);
     
     for (const file of files) {
-      // 20MB limit
       if (file.size > 20 * 1024 * 1024) {
         addToast(`File ${file.name} is too large (max 20MB)`, 'error');
         continue;
@@ -137,9 +155,6 @@ function setupFileUpload() {
   });
 }
 
-/**
- * Convert file to base64
- */
 function fileToBase64(file) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -150,7 +165,7 @@ function fileToBase64(file) {
 }
 
 /**
- * Add file chip to UI (Adapted to Tailwind/index.html structure)
+ * Add file chip to UI (ID: file-preview)
  */
 function addFileChip(file) {
   const chip = document.createElement('div');
@@ -161,7 +176,7 @@ function addFileChip(file) {
   
   chip.innerHTML = `
     <span>${icon}</span>
-    <span class="truncate max-w-[150px]">${file.name}</span>
+    <span class="truncate max-w-[150px]">${escapeHtml(file.name)}</span>
     <span class="text-gray-400">(${formatFileSize(file.size)})</span>
     <button type="button" class="text-gray-400 hover:text-white transition-colors ml-1" onclick="removeFileChip('${escapeHtml(file.name)}')" aria-label="Remove file">
         <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-4 h-4">
@@ -173,9 +188,6 @@ function addFileChip(file) {
   filePreview.appendChild(chip);
 }
 
-/**
- * Get appropriate icon for file type
- */
 function getFileIcon(mimeType, fileName) {
   if (mimeType.startsWith('image/')) return '🖼️';
   if (mimeType.includes('pdf')) return '📄';
@@ -187,9 +199,9 @@ function getFileIcon(mimeType, fileName) {
 }
 
 /**
- * Remove file chip
+ * Remove file chip (exposed globally)
  */
-function removeFileChip(fileName) {
+window.removeFileChip = function(fileName) {
   pendingFiles = pendingFiles.filter(f => f.name !== fileName);
   
   const chips = filePreview.querySelectorAll('[data-file-name]');
@@ -202,17 +214,10 @@ function removeFileChip(fileName) {
   updateFilePreview();
 }
 
-/**
- * Update file preview visibility (used for potential future styling, but currently managed by chip presence)
- */
 function updateFilePreview() {
-  // In the current index.html, the visibility is implicit based on content
-  // We'll keep the function for future expansion if the UI needs to react to an empty state
+  // Logic remains for potential future expansion
 }
 
-/**
- * Format file size
- */
 function formatFileSize(bytes) {
   if (bytes < 1024) return bytes + ' B';
   if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
@@ -220,48 +225,57 @@ function formatFileSize(bytes) {
 }
 
 /**
- * Setup input handlers
+ * Setup input handlers (Focus fixed on form submit)
  */
 function setupInputHandlers() {
+  const chatForm = document.getElementById('chat-form'); // ID from index.html
+
   // Auto-resize textarea
   userInput.addEventListener("input", function () {
     this.style.height = "auto";
     this.style.height = Math.min(this.scrollHeight, 200) + "px";
   });
 
-  // Send on Enter (without Shift)
-  userInput.addEventListener("keydown", function (e) {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      sendMessage();
-    }
-  });
+  // Handle form submission (prevents default focus jump)
+  if (chatForm) {
+      chatForm.addEventListener('submit', (e) => {
+          e.preventDefault(); // Prevent default form submission
+          sendMessage();
+      });
+  } else {
+      // Fallback for enter key
+      userInput.addEventListener("keydown", function (e) {
+        if (e.key === "Enter" && !e.shiftKey) {
+          e.preventDefault();
+          sendMessage();
+        }
+      });
+      sendButton.addEventListener("click", sendMessage);
+  }
 
-  // Send button
-  sendButton.addEventListener("click", sendMessage);
-  
   // Tools Button Toggle
   const toolsBtn = document.getElementById('tools-btn');
   const toolsPopup = document.getElementById('tools-popup');
   
-  toolsBtn.addEventListener('click', () => {
-      toolsPopup.classList.toggle('opacity-0');
-      toolsPopup.classList.toggle('scale-95');
-      toolsPopup.classList.toggle('pointer-events-none');
-  });
-  
-  // Close popup on click outside
-  document.addEventListener('click', (e) => {
-      if (!toolsPopup.contains(e.target) && !toolsBtn.contains(e.target) && !toolsPopup.classList.contains('opacity-0')) {
-          toolsPopup.classList.add('opacity-0');
-          toolsPopup.classList.add('scale-95');
-          toolsPopup.classList.add('pointer-events-none');
-      }
-  });
+  if (toolsBtn && toolsPopup) {
+      toolsBtn.addEventListener('click', () => {
+          toolsPopup.classList.toggle('opacity-0');
+          toolsPopup.classList.toggle('scale-95');
+          toolsPopup.classList.toggle('pointer-events-none');
+      });
+      
+      document.addEventListener('click', (e) => {
+          if (!toolsPopup.contains(e.target) && !toolsBtn.contains(e.target) && !toolsPopup.classList.contains('opacity-0')) {
+              toolsPopup.classList.add('opacity-0');
+              toolsPopup.classList.add('scale-95');
+              toolsPopup.classList.add('pointer-events-none');
+          }
+      });
+  }
 }
 
 /**
- * Connect to WebSocket
+ * Connect to WebSocket (Standard logic retained)
  */
 function connectWebSocket() {
   if (ws && ws.readyState === WebSocket.OPEN) return;
@@ -269,13 +283,11 @@ function connectWebSocket() {
 
   isConnecting = true;
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  // Check if running on a custom port for development
   const port = location.port ? `:${location.port}` : '';
   const wsUrl = `${protocol}//${location.hostname}${port}/api/ws`;
 
   console.log('Connecting to WebSocket:', wsUrl);
 
-  // Update status UI
   updateConnectionStatus('Connecting...', 'bg-gray-500');
 
   ws = new WebSocket(wsUrl);
@@ -315,7 +327,7 @@ function connectWebSocket() {
 }
 
 /**
- * Update connection status UI (Adapted to index.html structure)
+ * Update connection status UI (Fixed IDs: status-indicator, status-text)
  */
 function updateConnectionStatus(text, colorClass) {
   const indicator = document.getElementById('status-indicator');
@@ -346,7 +358,7 @@ function handleServerMessage(data) {
         currentMessageElement = createMessageElement('assistant');
       }
       appendToMessage(currentMessageElement, data.content);
-      // Smooth scroll on every chunk
+      // 🔥 CRITICAL UX FIX: Smooth scroll on every chunk
       scrollToBottom(true); 
       break;
 
@@ -363,13 +375,15 @@ function handleServerMessage(data) {
       }
       currentMessageElement = null;
       isProcessing = false;
-      enableInput();
-      // Final smooth scroll
+      // Removed enableInput() focus call here to prevent cursor jump
+      enableInput(false); 
+      
+      // Final smooth scroll after rendering markdown
       scrollToBottom(true);
       
       // Clear pending files after successful send
       pendingFiles = [];
-      filePreview.innerHTML = ''; // Clear file chips
+      filePreview.innerHTML = ''; 
       updateFilePreview();
       break;
 
@@ -378,7 +392,7 @@ function handleServerMessage(data) {
       addToast(`Error: ${data.error}`, 'error');
       currentMessageElement = null;
       isProcessing = false;
-      enableInput();
+      enableInput(true); // Re-focus on error
       break;
 
     default:
@@ -387,7 +401,7 @@ function handleServerMessage(data) {
 }
 
 /**
- * Show tool usage indicator (Adapted to Tailwind/index.html structure)
+ * Show tool usage indicator
  */
 function showToolUse(tools) {
   if (!currentMessageElement) {
@@ -426,20 +440,15 @@ async function sendMessage() {
   isProcessing = true;
   disableInput();
 
-  // Hide welcome screen on first message
   hideWelcome();
 
-  // Add user message to chat
   addUserMessage(message || 'Sent files for analysis.');
 
-  // Clear input
   userInput.value = "";
   userInput.style.height = "auto";
 
-  // Show typing indicator
   showTypingIndicator('Processing your request...');
 
-  // Send via WebSocket with files
   try {
     const payload = {
       type: 'user_message',
@@ -455,14 +464,11 @@ async function sendMessage() {
     console.error('Error sending message:', error);
     addToast('Failed to send message. Please try again.', 'error');
     isProcessing = false;
-    enableInput();
+    enableInput(true);
     hideTypingIndicator();
   }
 }
 
-/**
- * Hide welcome screen
- */
 function hideWelcome() {
   if (!conversationStarted) {
     if (welcomeScreen) {
@@ -473,7 +479,7 @@ function hideWelcome() {
 }
 
 /**
- * Load chat history from server (Remains the same logic)
+ * Load chat history (Standard logic retained)
  */
 async function loadChatHistory() {
   try {
@@ -510,7 +516,7 @@ async function loadChatHistory() {
 }
 
 /**
- * Create a message element (Adapted to Tailwind/index.html structure)
+ * Create a message element (Corrected for Orion/Assistant icon)
  */
 function createMessageElement(role) {
   const isUser = role === 'user';
@@ -521,12 +527,12 @@ function createMessageElement(role) {
   messageEl.className = "flex items-start gap-4 max-w-4xl mx-auto";
   
   const avatarBg = isUser ? 'bg-gray-500' : 'bg-teal-600';
-  const senderText = isUser ? 'You' : 'Orion'; // Changed to Orion
+  const senderText = isUser ? 'You' : 'Orion'; 
   const iconSvg = `<svg class="w-5 h-5" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
       <path stroke-linecap="round" stroke-linejoin="round" d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09z" />
     </svg>`;
     
-  const avatar = isUser ? '👤' : iconSvg; // Use SVG for Orion/Assistant
+  const avatar = isUser ? '👤' : iconSvg; 
 
   messageEl.innerHTML = `
     <div class="w-8 h-8 flex-shrink-0 rounded-full flex items-center justify-center text-white ${avatarBg}">
@@ -538,7 +544,7 @@ function createMessageElement(role) {
     </div>
   `;
   
-  wrapper.appendChild(messageEl);
+  // Append to the wrapper: messages-wrapper
   chatMessages.appendChild(wrapper);
   
   return messageEl;
@@ -550,7 +556,6 @@ function createMessageElement(role) {
 function appendToMessage(element, content) {
   const contentDiv = element.querySelector('.message-content');
   
-  // For streaming, append raw text temporarily
   if (!contentDiv.dataset.streaming) {
     contentDiv.dataset.streaming = 'true';
     contentDiv.dataset.rawContent = '';
@@ -561,13 +566,12 @@ function appendToMessage(element, content) {
 }
 
 /**
- * Finalize message (render markdown)
+ * Finalize message (render markdown and highlight)
  */
 function finalizeMessage(element) {
   const contentDiv = element.querySelector('.message-content');
   const rawContent = contentDiv.dataset.rawContent || contentDiv.textContent;
   
-  // Render markdown
   contentDiv.innerHTML = marked.parse(rawContent);
   
   // Highlight code blocks
@@ -579,9 +583,6 @@ function finalizeMessage(element) {
   delete contentDiv.dataset.rawContent;
 }
 
-/**
- * Add user message
- */
 function addUserMessage(content, scroll = true) {
   const messageEl = createMessageElement('user');
   const contentDiv = messageEl.querySelector('.message-content');
@@ -590,15 +591,11 @@ function addUserMessage(content, scroll = true) {
   if (scroll) scrollToBottom(true);
 }
 
-/**
- * Add assistant message (complete)
- */
 function addAssistantMessage(content, scroll = true) {
   const messageEl = createMessageElement('assistant');
   const contentDiv = messageEl.querySelector('.message-content');
   contentDiv.innerHTML = marked.parse(content);
   
-  // Highlight code blocks
   contentDiv.querySelectorAll('pre code').forEach((block) => {
     hljs.highlightElement(block);
   });
@@ -607,11 +604,11 @@ function addAssistantMessage(content, scroll = true) {
 }
 
 /**
- * Typing indicator functions (Adapted to index.html structure)
+ * Typing indicator functions
  */
 function showTypingIndicator(message = 'Thinking...') {
   typingText.textContent = message;
-  typingIndicator.classList.remove("hidden"); // Use 'hidden' from Tailwind
+  typingIndicator.classList.remove("hidden");
   scrollToBottom(true);
 }
 
@@ -620,25 +617,29 @@ function updateTypingIndicator(message) {
 }
 
 function hideTypingIndicator() {
-  typingIndicator.classList.add("hidden"); // Use 'hidden' from Tailwind
+  typingIndicator.classList.add("hidden");
 }
 
 /**
- * Input control functions
+ * Input control functions (Modified to optionally skip focus)
+ * @param {boolean} focus - Whether to focus the input area. Default is true.
  */
 function disableInput() {
   userInput.disabled = true;
   sendButton.disabled = true;
 }
 
-function enableInput() {
+function enableInput(focus = true) {
   userInput.disabled = false;
   sendButton.disabled = false;
-  userInput.focus();
+  if (focus) {
+    userInput.focus(); // Only focus when explicitly requested (e.g., on error)
+  }
 }
 
 /**
- * Scroll to bottom enhancement
+ * Scroll to bottom enhancement (ID: chat-container)
+ * Uses the dedicated scrolling container.
  * @param {boolean} smooth - Use smooth scrolling
  */
 function scrollToBottom(smooth = false) {
@@ -651,7 +652,7 @@ function scrollToBottom(smooth = false) {
 }
 
 /**
- * Toast notification (Adapted to index.html structure/styles.css)
+ * Toast notification (Standard logic retained)
  */
 function addToast(message, type = 'info') {
   const toastContainer = document.querySelector('body');
@@ -674,14 +675,12 @@ function addToast(message, type = 'info') {
   toast.textContent = message;
   toastContainer.appendChild(toast);
   
-  // Animate in (using manual class manipulation to trigger transition)
   setTimeout(() => {
     toast.classList.remove('opacity-0');
     toast.classList.remove('translate-x-full');
   }, 10);
 
   setTimeout(() => {
-    // Animate out
     toast.classList.add('opacity-0');
     toast.classList.add('translate-x-full');
     setTimeout(() => toast.remove(), 300);
@@ -689,9 +688,9 @@ function addToast(message, type = 'info') {
 }
 
 /**
- * Clear chat history
+ * Clear chat history (exposed globally)
  */
-async function clearChat() {
+window.clearChat = async function() {
   if (!confirm('Start a new chat? This will clear the current conversation.')) {
     return;
   }
@@ -701,11 +700,9 @@ async function clearChat() {
     if (response.ok) {
       chatMessages.innerHTML = '';
       pendingFiles = [];
-      filePreview.innerHTML = ''; // Clear file chips
-      updateFilePreview();
+      filePreview.innerHTML = ''; 
       conversationStarted = false;
       
-      // The original HTML welcome message is simpler, we will use it directly.
       const welcomeHTML = `
         <div id="welcome-message" class="text-center py-20 px-4">
             <div class="inline-block bg-gradient-to-br from-teal-500 to-blue-600 rounded-full p-3 mb-6 shadow-lg">
@@ -735,6 +732,8 @@ async function clearChat() {
       `;
       
       chatMessages.innerHTML = welcomeHTML;
+      // Re-assign welcome screen reference after clearing HTML
+      window.welcomeScreen = document.getElementById('welcome-message');
       
       addToast('Chat cleared successfully', 'success');
     }
@@ -745,21 +744,16 @@ async function clearChat() {
 }
 
 /**
- * Use a suggestion chip (exposed globally as it's in the HTML)
+ * Use a suggestion chip (exposed globally)
  */
 window.useSuggestion = function(element) {
-  const text = element.textContent.trim().replace(/[\d\w\s]+?(\s*?[\uD800-\uDBFF\uDC00-\uDFFF\u2600-\u27BF\u1F600-\u1F64F\u1F300-\u1F5FF\u1F680-\u1F6FF\u1F900-\u1F9FF\u200D])/g, '').trim();
+  // Extract text and remove emojis
+  const text = element.textContent.trim().replace(/[\uD800-\uDBFF\uDC00-\uDFFF].*$/g, '').trim();
   userInput.value = text;
   userInput.style.height = "auto";
   userInput.style.height = Math.min(userInput.scrollHeight, 200) + "px";
   userInput.focus();
 }
-
-/**
- * Clear chat (exposed globally as it's in the HTML)
- */
-window.clearChat = clearChat;
-
 
 /**
  * Escape HTML
@@ -769,7 +763,3 @@ function escapeHtml(text) {
   div.textContent = text;
   return div.innerHTML;
 }
-
-// NOTE: The Tailwind CSS utility classes handle all the required styling (including animations
-// like 'animate-bounce' and 'transition-colors'), so we don't need to manually inject a 
-// <style> tag for the toast animations as in the original chat.js.

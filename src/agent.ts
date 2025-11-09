@@ -1,34 +1,10 @@
-// src/autonomous-agent-simplified.ts - Multi-step autonomous version (Refactored)
+// src/agent.ts - Autonomous Agent Core (Updated with Persistence)
 import type { DurableObjectState } from '@cloudflare/workers-types';
 import GeminiClient from './gemini';
-// Import GenerateOptions
 import type { GenerateOptions } from './gemini';
-import type { Env, AgentState, Message } from './types';
-
-interface SqlStorage {
-  exec(query: string, ...params: any[]): {
-    one(): any;
-    toArray(): any[];
-    [Symbol.iterator](): Iterator<any>;
-  };
-}
-
-interface Tool {
-  name: string;
-  description: string;
-  parameters: Record<string, any>;
-}
-
-interface ToolCall {
-  name: string;
-  args: Record<string, any>;
-}
-
-interface ToolResult {
-  name: string;
-  success: boolean;
-  result: string;
-}
+// Import all necessary types and persistence functions
+import type { Env, AgentState, Message, Tool, ToolCall, ToolResult, SqlStorage } from './types';
+import * as Persistence from './persistence';
 
 export class AutonomousAgent {
   private state: DurableObjectState;
@@ -43,27 +19,13 @@ export class AutonomousAgent {
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
     this.env = env;
+    // Use type assertion for the SQL storage property
     this.sql = (state.storage as unknown as { sql?: SqlStorage }).sql as SqlStorage;
     this.gemini = new GeminiClient({ apiKey: env.GEMINI_API_KEY });
 
-    try {
-      if (this.sql) {
-        this.sql.exec(`
-          CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            role TEXT NOT NULL,
-            parts TEXT NOT NULL,
-            timestamp INTEGER NOT NULL
-          );
-          CREATE TABLE IF NOT EXISTS kv (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-          );
-          CREATE INDEX IF NOT EXISTS idx_msg_ts ON messages(timestamp);
-        `);
-      }
-    } catch (e) {
-      console.error('SQLite init failed:', e);
+    // Initialize the DB using the new persistence module
+    if (this.sql) {
+      Persistence.createTables(this.sql);
     }
   }
 
@@ -97,63 +59,36 @@ ${hasFiles ? '- User has uploaded files available for analysis' : ''}
 Your knowledge cutoff is January 2025. Use tools to access current information when needed.`;
   }
 
-  // ===== Tool Definitions (Refactored) =====
+  // ===== Tool Definitions (Unchanged) =====
 
   private getAvailableTools(state: AgentState): Tool[] {
     const tools: Tool[] = [
-      // REMOVED: 'web_search' - This is a native tool, enabled in the 'process' loop
-      // REMOVED: 'code_execute' - This is a native tool, enabled in the 'process' loop
-      // REMOVED: 'analyze_file' - This is a native tool, enabled by passing files
-      
-      /* EXAMPLE: This is where you would add a *truly* external tool
-      {
-        name: 'post_to_slack',
-        description: 'Posts a message to a Slack channel',
-        parameters: { ... }
-      }
-      */
+      // Only include *truly* external tools here
     ];
-
-    // File analysis is now handled natively, so this logic is no longer needed here.
-    // if ((state.context?.files?.length ?? 0) > 0) { ... }
-
     return tools;
   }
 
-  // ===== Tool Execution (Refactored) =====
+  // ===== Tool Execution (Unchanged) =====
 
   private async executeTools(toolCalls: ToolCall[], state: AgentState): Promise<ToolResult[]> {
     const results: ToolResult[] = [];
 
     for (const call of toolCalls) {
       try {
-        let result: string;
-
         switch (call.name) {
-          // REMOVED: 'web_search' case
-          // REMOVED: 'code_execute' case
-          // REMOVED: 'analyze_file' case
-
-          /*
-          EXAMPLE: This is where you would handle a *truly* external tool
-          case 'post_to_slack':
-            result = await this.mySlackFunction(call.args.channel, call.args.message);
-            results.push({ name: call.name, success: true, result });
-            break;
-          */
-
+          // Add cases for truly external tools here
           default:
             results.push({ 
               name: call.name, 
               success: false, 
-              result: `Unknown tool: ${call.name}` 
+              result: `Unknown external tool: ${call.name}` 
             });
         }
       } catch (e) {
         results.push({
           name: call.name,
           success: false,
-          result: `Tool execution failed: ${String(e)}`
+          result: `External Tool execution failed: ${String(e)}`
         });
       }
     }
@@ -161,11 +96,7 @@ Your knowledge cutoff is January 2025. Use tools to access current information w
     return results;
   }
 
-  // REMOVED: executeWebSearch
-  // REMOVED: executeCode
-  // REMOVED: analyzeFile
-
-  // ===== Main Processing Loop (Refactored) =====
+  // ===== Core Logic and Transaction Wrapper (Updated to use Persistence) =====
 
   private async process(userMsg: string, ws: WebSocket | null): Promise<void> {
     return this.withStateTransaction(async (state) => {
@@ -176,25 +107,19 @@ Your knowledge cutoff is January 2025. Use tools to access current information w
         throw new Error('Message exceeds maximum size');
       }
 
-      // Save user message (unchanged)
-      try {
-        if (this.sql) {
-          this.sql.exec(
-            `INSERT INTO messages (role, parts, timestamp) VALUES (?, ?, ?)`,
-            'user',
-            JSON.stringify([{ text: userMsg }]),
-            Date.now()
-          );
-        }
-      } catch (e) {
-        console.error('Failed to save user message:', e);
-        if (ws) this.send(ws, { type: 'error', error: 'Save failed' });
-        throw e;
+      // Save user message using the persistence module
+      if (this.sql) {
+        Persistence.saveMessage(
+          this.sql,
+          'user',
+          [{ text: userMsg }],
+          Date.now()
+        );
       }
 
-      // Build conversation history (unchanged)
+      // Build conversation history using the persistence module
       const systemPrompt = this.buildSystemPrompt(state);
-      const history = this.buildHistory();
+      const history = Persistence.loadHistory(this.sql, this.maxHistoryMessages);
       
       let conversationHistory: any[] = [
         { role: 'system', content: systemPrompt },
@@ -210,7 +135,6 @@ Your knowledge cutoff is January 2025. Use tools to access current information w
       const batcher = this.createChunkBatcher(ws, 'chunk');
 
       try {
-        // Agentic loop - model decides when to stop
         while (turn < this.MAX_TURNS) {
           turn++;
 
@@ -223,8 +147,6 @@ Your knowledge cutoff is January 2025. Use tools to access current information w
 
           console.log(`[Agent] Turn ${turn}/${this.MAX_TURNS}`);
 
-          // === THIS IS THE KEY CHANGE ===
-          // Define all options for the upgraded generateWithTools call
           const options: GenerateOptions = {
             model: 'gemini-2.5-flash',
             thinkingConfig: { thinkingBudget: 1024 },
@@ -235,16 +157,13 @@ Your knowledge cutoff is January 2025. Use tools to access current information w
             useCodeExecution: true,
 
             // --- Pass File/URL Context ---
-            // Native file analysis is enabled simply by passing the files
             files: state.context?.files ?? [],
-            // urlList: [] // You can add URLs to the state and pass them here
           };
           
-          // Generate response with tool capability
           const response = await this.gemini.generateWithTools(
             conversationHistory,
-            this.getAvailableTools(state), // Passes *external* tools (currently [])
-            options, // Passes all other options (native tools, files, etc.)
+            this.getAvailableTools(state), // External tools
+            options, // Native tools and context
             (chunk: string) => {
               fullResponse += chunk;
               batcher.add(chunk);
@@ -284,37 +203,29 @@ Your knowledge cutoff is January 2025. Use tools to access current information w
               content: `Tool Results:\n${resultsText}`
             });
 
-            // Reset for next turn
             fullResponse = '';
             continue;
           }
 
-          // No *external* tool calls.
-          // Native tools (search, code, file) ran inline.
-          // The loop can now stop.
+          // Native tools ran inline, final answer received.
           console.log('[Agent] Final answer received, stopping loop');
           break;
         }
 
-        // Save final response (unchanged)
+        // Save final response using the persistence module
         if (fullResponse) {
-          try {
-            if (this.sql) {
-              this.sql.exec(
-                `INSERT INTO messages (role, parts, timestamp) VALUES (?, ?, ?)`,
-                'model',
-                JSON.stringify([{ text: fullResponse }]),
-                Date.now()
-              );
-            }
-          } catch (e) {
-            console.error('Failed to save model response:', e);
+          if (this.sql) {
+            Persistence.saveMessage(
+              this.sql,
+              'model',
+              [{ text: fullResponse }],
+              Date.now()
+            );
           }
         }
 
         if (ws) {
           if (!fullResponse) {
-            // If no final response collected, still signal completion
             this.send(ws, { type: 'chunk', content: '[Task completed]' });
           }
           this.send(ws, { type: 'done', turns: turn, totalLength: fullResponse.length });
@@ -327,99 +238,19 @@ Your knowledge cutoff is January 2025. Use tools to access current information w
       }
     });
   }
-
-  // ===== State Management (Unchanged) =====
-
-  private async loadState(): Promise<AgentState> {
-    let state: AgentState | null = null;
-    try {
-      if (this.sql) {
-        const row = this.sql.exec(`SELECT value FROM kv WHERE key = ?`, 'state').one();
-        if (row && typeof row.value === 'string') {
-          state = JSON.parse(row.value);
-        }
-      }
-    } catch (e) {
-      console.error('SQLite read failed:', e);
-    }
-
-    if (!state || !state.sessionId) {
-      state = {
-        conversationHistory: [],
-        context: { files: [], searchResults: [] },
-        sessionId: this.state.id?.toString ? this.state.id.toString() : Date.now().toString(),
-        lastActivityAt: Date.now(),
-      } as AgentState;
-    }
-
-    return state;
-  }
-
-  private async saveState(state: AgentState): Promise<void> {
-    try {
-      const stateStr = JSON.stringify(state);
-      if (this.sql) {
-        this.sql.exec(
-          `INSERT INTO kv (key, value) VALUES (?, ?)
-           ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
-          'state',
-          stateStr
-        );
-      }
-    } catch (e) {
-      console.error('saveState failed:', e);
-    }
-  }
-
+  
+  // Wrapper for concurrency block using Persistence module
   private async withStateTransaction<T>(fn: (state: AgentState) => Promise<T>): Promise<T> {
     return this.state.blockConcurrencyWhile(async () => {
-      const state = await this.loadState();
+      const state = await Persistence.loadState(this.sql, this.state);
       const result = await fn(state);
-      await this.saveState(state);
+      await Persistence.saveState(this.sql, state);
       return result;
     });
   }
 
-  private buildHistory(): Array<{ role: string; parts: Array<{ text: string }> }> {
-    const rows = this.sql
-      ? this.sql
-          .exec(
-            `SELECT role, parts FROM messages ORDER BY timestamp DESC LIMIT ?`,
-            Math.min(this.maxHistoryMessages, 50)
-          )
-          .toArray()
-      : [];
-    
-    const hist: Array<{ role: string; parts: Array<{ text: string }> }> = [];
-
-    for (const r of rows.reverse()) {
-      try {
-        const parts = JSON.parse(r.parts as string);
-        if (parts) {
-          hist.push({
-            role: r.role === 'model' ? 'model' : 'user',
-            parts,
-          });
-        }
-      } catch (e) {
-        console.warn('Failed to parse message:', e);
-      }
-    }
-
-    // Remove consecutive duplicate user messages
-    let i = hist.length - 1;
-    while (i > 0) {
-      if (hist[i].role === 'user' && hist[i - 1].role === 'user') {
-        hist.splice(i, 1);
-      }
-      i--;
-    }
-
-    return hist;
-  }
-
   // ===== WebSocket Management (Unchanged) =====
-
+  
   private send(ws: WebSocket | null, data: unknown): void {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
     try {
@@ -541,7 +372,7 @@ Your knowledge cutoff is January 2025. Use tools to access current information w
     this.activeWebSockets.delete(ws);
   }
 
-  // ===== HTTP Handlers (Unchanged) =====
+  // ===== HTTP Handlers (Refactored to use Persistence) =====
 
   private async handleChat(req: Request): Promise<Response> {
     let message: string;
@@ -571,40 +402,24 @@ Your knowledge cutoff is January 2025. Use tools to access current information w
   }
 
   private getHistory(): Response {
-    const rows = this.sql
-      ? this.sql.exec(`SELECT role, parts, timestamp FROM messages ORDER BY timestamp ASC`).toArray()
-      : [];
-    const msgs: Message[] = [];
-    for (const r of rows) {
-      try {
-        const parts = JSON.parse(r.parts as string);
-        if (parts) {
-          msgs.push({
-            role: r.role as any,
-            parts,
-            timestamp: r.timestamp as number,
-          });
-        }
-      } catch (e) {
-        console.warn('Failed to parse message:', e);
-      }
-    }
-    return new Response(JSON.stringify({ messages: msgs }), {
+    // Uses Persistence module
+    const msgs = Persistence.loadHistory(this.sql, this.maxHistoryMessages);
+    
+    // The loadHistory function returns messages oldest-first. Reverse for API consistency (newest-first).
+    return new Response(JSON.stringify({ messages: msgs.reverse() }), {
       headers: { 'Content-Type': 'application/json' },
     });
   }
 
   private async clearHistory(): Promise<Response> {
     return this.state.blockConcurrencyWhile(async () => {
-      try {
-        if (this.sql) {
-          this.sql.exec('DELETE FROM messages');
-          this.sql.exec('DELETE FROM kv');
-          this.sql.exec('DELETE FROM sqlite_sequence WHERE name IN ("messages")');
-        }
-      } catch (e) {
-        console.error('Clear failed:', e);
-      }
+      // Uses Persistence module
+      Persistence.clearAll(this.sql);
+
+      // Re-load and re-save state to reset to initial
+      const initialState = await Persistence.loadState(this.sql, this.state);
+      await Persistence.saveState(this.sql, initialState);
+
       return new Response(JSON.stringify({ ok: true }), {
         headers: { 'Content-Type': 'application/json' },
       });
@@ -614,10 +429,9 @@ Your knowledge cutoff is January 2025. Use tools to access current information w
   private getStatus(): Response {
     let state: AgentState | null = null;
     try {
-      if (this.sql) {
-        const row = this.sql.exec(`SELECT value FROM kv WHERE key = ?`, 'state').one();
-        state = row ? JSON.parse(row.value as string) : null;
-      }
+      // Load state manually for a quick status check outside a transaction
+      const row = this.sql.exec(`SELECT value FROM kv WHERE key = ?`, 'state').one();
+      state = row ? JSON.parse(row.value as string) : null;
     } catch (e) {
       console.error('getStatus read failed:', e);
     }
@@ -626,10 +440,9 @@ Your knowledge cutoff is January 2025. Use tools to access current information w
       JSON.stringify({
         lastActivity: state?.lastActivityAt,
         sessionId: state?.sessionId,
+        circuitBreakerStatus: this.gemini.getCircuitBreakerStatus(),
       }),
       { headers: { 'Content-Type': 'application/json' } }
     );
   }
 }
-
-export default AutonomousAgent;

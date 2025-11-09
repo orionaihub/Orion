@@ -1,4 +1,4 @@
-// src/agent-core.ts - Core Agent Logic (Refactored)
+// src/agent-core.ts - Core Agent Logic (Gemini 2.5 Flash Optimised, Cloudflare-ready)
 import type { AgentState, Message } from './types';
 import type { GeminiClient, GenerateOptions } from './gemini';
 import type { Tool, ToolCall, ToolResult } from './tools/types';
@@ -15,31 +15,29 @@ export interface AgentConfig {
   useCodeExecution?: boolean;
   useMapsGrounding?: boolean;
   useVision?: boolean;
+  /** Optional: token budget for history pruning (default 50k) */
+  tokenBudget?: number;
 }
 
 export interface ChunkCallback {
   (chunk: string): void;
 }
-
 export interface StatusCallback {
   (message: string): void;
 }
-
 export interface ToolUseCallback {
   (tools: string[]): void;
 }
-
 export interface AgentCallbacks {
   onChunk?: ChunkCallback;
   onStatus?: StatusCallback;
   onToolUse?: ToolUseCallback;
   onError?: (error: string) => void;
-  onDone?: (turns: number, totalLength: number) => void;
+  onDone?: (turns: number, totalLength: number, tokensUsed?: number) => void;
 }
 
 /**
- * Core Agent class - handles conversation logic, tool orchestration, and LLM interaction
- * Separated from Durable Object concerns
+ * Core Agent – autonomous, lightweight, Gemini-2.5-Flash-optimised.
  */
 export class Agent {
   private config: Required<AgentConfig>;
@@ -49,7 +47,7 @@ export class Agent {
   constructor(gemini: GeminiClient, config: AgentConfig = {}) {
     this.gemini = gemini;
     this.toolRegistry = new ToolRegistry();
-    
+
     this.config = {
       maxHistoryMessages: config.maxHistoryMessages ?? 200,
       maxMessageSize: config.maxMessageSize ?? 100_000,
@@ -61,11 +59,11 @@ export class Agent {
       useCodeExecution: config.useCodeExecution ?? true,
       useMapsGrounding: config.useMapsGrounding ?? false,
       useVision: config.useVision ?? false,
+      tokenBudget: config.tokenBudget ?? 50_000,
     };
   }
 
   // ===== Configuration =====
-
   getConfig(): Readonly<Required<AgentConfig>> {
     return { ...this.config };
   }
@@ -75,99 +73,78 @@ export class Agent {
   }
 
   // ===== Tool Registry =====
-
   registerTool(tool: Tool): void {
     this.toolRegistry.register(tool);
   }
-
   unregisterTool(name: string): void {
     this.toolRegistry.unregister(name);
   }
-
   getRegisteredTools(): Tool[] {
     return this.toolRegistry.getAll();
   }
 
-  // ===== System Prompt =====
-
+  // ===== System Prompt (Gemini-2.5-Flash-aware) =====
   private buildSystemPrompt(state: AgentState): string {
     const hasFiles = (state.context?.files?.length ?? 0) > 0;
     const toolNames = this.toolRegistry.getAll().map(t => t.name);
     const hasExternalTools = toolNames.length > 0;
-    
-    return `You are an autonomous AI assistant with tool-use capabilities. Your goal is to help users by breaking down complex tasks and using available tools when needed.
+    const cutoffDate = 'November 2025'; // keep in sync with deployment
 
-# Response Strategy
-1. For simple questions: Answer directly without using tools
-2. For complex tasks: Use available tools iteratively to gather information and complete the task
-3. When you have enough information: Provide a comprehensive final answer
+    return `You are a lightweight, autonomous general intelligence agent powered by Gemini 2.5 Flash. Like Manus or Genspark, turn natural language into executed actions—plan dynamically, reason deeply, act efficiently.
 
-# Available Tools
-You have access to native tools (web search, code execution${hasFiles ? ', file analysis' : ''}) that run automatically.
-${hasExternalTools ? `\nYou also have external tools: ${toolNames.join(', ')}` : ''}
+Gemini 2.5 Flash Strengths:
+- 1M token context → rich chain-of-thought (CoT) reasoning.
+- Native tools (search, code execution, maps grounding, vision) run inline.
+- Low-latency streaming for responsive UX.
+- Precise function calling for external tools.
 
-# Tool Usage Guidelines
-- Use tools when you need current information, need to perform calculations, or analyze data
-- After receiving tool results, decide if you need more information or can provide a final answer
-- Don't use tools unnecessarily for questions you can answer directly
-- You can use multiple tools across multiple steps to accomplish complex tasks
+Autonomous Strategy (Internal Planning First):
+1. **Plan Internally (Tool-Free)**: Use CoT to break the task:
+   • Goal → Sub-tasks → Knowledge gaps.
+   If you can answer with knowledge up to ${cutoffDate}, do so directly. No tools needed.
+2. **Native Tools Only When Required**: Use search for recency, code for calculations, vision/maps for media.
+   Explain: "To verify X, searching Y."
+3. **External Tools**: ${hasExternalTools ? toolNames.join(', ') : 'none'}.
+   Call only for custom actions.
+4. **Finalize**: End with <FINAL_ANSWER>…</FINAL_ANSWER> when complete.
 
-# Important
-- Always explain your reasoning briefly
-- When using tools, tell the user what you're doing
-- Provide clear, actionable final answers
-${hasFiles ? '- User has uploaded files available for analysis' : ''}
+Guidelines:
+- Be concise (200-500 tokens/turn).
+- Self-critique: “Is this sufficient?”
+- Safety: Confirm sensitive actions.
+- Files: ${hasFiles ? 'Analyse uploaded files inline.' : 'None.'}
 
-Your knowledge cutoff is January 2025. Use tools to access current information when needed.`;
+Knowledge cutoff: ${cutoffDate}. Use natives for anything newer. Think aloud briefly.`;
   }
 
   // ===== Main Processing Logic =====
-
-  /**
-   * Process a user message through the agentic loop
-   * @param userMessage - The user's message
-   * @param conversationHistory - Previous conversation history
-   * @param state - Current agent state
-   * @param callbacks - Callbacks for streaming, status, etc.
-   * @returns The final response text and metadata
-   */
   async processMessage(
     userMessage: string,
     conversationHistory: Message[],
     state: AgentState,
-    callbacks: AgentCallbacks = {}
-  ): Promise<{ response: string; turns: number }> {
-    // Validate message size
+    callbacks: AgentCallbacks = {},
+    signal?: AbortSignal
+  ): Promise<{ response: string; turns: number; tokensUsed?: number }> {
     if (userMessage.length > this.config.maxMessageSize) {
       throw new Error('Message exceeds maximum size');
     }
 
-    // Build system prompt and format history
     const systemPrompt = this.buildSystemPrompt(state);
-    const formattedHistory = this.formatHistory(conversationHistory, systemPrompt, userMessage);
+    let history = this.formatHistory(conversationHistory, systemPrompt, userMessage);
+    history = await this.trimHistory(history, this.config.tokenBudget);
 
     let turn = 0;
     let fullResponse = '';
     const batcher = this.createChunkBatcher(callbacks.onChunk);
 
     try {
-      // Agentic loop - model decides when to stop
       while (turn < this.config.maxTurns) {
         turn++;
+        callbacks.onStatus?.(turn === 1 ? 'Planning...' : `Step ${turn}...`);
 
-        // Status callback
-        if (callbacks.onStatus) {
-          callbacks.onStatus(
-            turn === 1 ? 'Thinking...' : `Processing step ${turn}...`
-          );
-        }
-
-        console.log(`[Agent] Turn ${turn}/${this.config.maxTurns}`);
-
-        // Build generation options
         const options: GenerateOptions = {
           model: this.config.model,
-          thinkingConfig: { thinkingBudget: this.config.thinkingBudget },
+          thinkingConfig: { thinkingBudget: this.config.thinkingBudget * 2 }, // boost CoT
           temperature: this.config.temperature,
           stream: true,
           useSearch: this.config.useSearch,
@@ -175,154 +152,182 @@ Your knowledge cutoff is January 2025. Use tools to access current information w
           useMapsGrounding: this.config.useMapsGrounding,
           useVision: this.config.useVision,
           files: state.context?.files ?? [],
+          stopSequences: ['<FINAL_ANSWER>'],
         };
 
-        // Generate response with tool capability
         const response = await this.gemini.generateWithTools(
-          formattedHistory,
+          history,
           this.toolRegistry.getAll(),
           options,
           (chunk: string) => {
             fullResponse += chunk;
             batcher.add(chunk);
-          }
+          },
+          signal
         );
-
         batcher.flush();
 
-        // Handle external tool calls
-        if (response.toolCalls && response.toolCalls.length > 0) {
-          console.log(
-            `[Agent] External tool calls: ${response.toolCalls.map(t => t.name).join(', ')}`
-          );
+        // ---- Final answer detection ----
+        const isFinal =
+          response.finishReason === 'stop' ||
+          fullResponse.includes('<FINAL_ANSWER>') ||
+          (!response.toolCalls?.length && turn > 1);
 
-          if (callbacks.onToolUse) {
-            callbacks.onToolUse(response.toolCalls.map(t => t.name));
-          }
+        if (isFinal) {
+          console.log(`[Agent] Completed autonomously at turn ${turn}`);
+          break;
+        }
 
-          // Execute external tools
-          const toolResults = await this.executeTools(response.toolCalls, state);
+        // ---- External tool calls ----
+        if (response.toolCalls?.length) {
+          callbacks.onToolUse?.(response.toolCalls.map(t => t.name));
+          const toolResults = await this.executeTools(response.toolCalls, state, signal);
 
-          // Add assistant's response with tool calls to history
-          formattedHistory.push({
+          // Append assistant message
+          history.push({
             role: 'assistant',
-            content: response.text || '[used external tools]',
+            content: response.text || '[tool planning]',
             toolCalls: response.toolCalls,
           });
 
-          // Add tool results to history
+          // Append concise results (truncate per-result)
           const resultsText = toolResults
-            .map(r => `${r.name}: ${r.success ? 'Success' : 'Failed'}\n${r.result}`)
+            .map(r => `${r.name}: ${r.success ? 'OK' : 'ERR'}\n${r.result.substring(0, 1500)}`)
             .join('\n\n');
+          history.push({ role: 'user', content: `Tool Results:\n${resultsText}` });
 
-          formattedHistory.push({
-            role: 'user',
-            content: `Tool Results:\n${resultsText}`,
-          });
-
-          // Reset for next turn
+          // Prune again after adding large results
+          history = await this.trimHistory(history, this.config.tokenBudget);
           fullResponse = '';
           continue;
         }
-
-        // No external tool calls - native tools ran inline
-        console.log('[Agent] Final answer received, stopping loop');
-        break;
       }
 
-      // Done callback
-      if (callbacks.onDone) {
-        callbacks.onDone(turn, fullResponse.length);
-      }
+      // Estimate tokens (optional)
+      const tokensUsed =
+        typeof this.gemini.countTokens === 'function'
+          ? await this.gemini.countTokens(history)
+          : Math.ceil(fullResponse.length / 4);
 
-      return { response: fullResponse, turns: turn };
-    } catch (e) {
-      console.error('[Agent] Process error:', e);
-      if (callbacks.onError) {
-        callbacks.onError(String(e));
-      }
+      callbacks.onDone?.(turn, fullResponse.length, tokensUsed);
+      return { response: fullResponse, turns: turn, tokensUsed };
+    } catch (e: any) {
+      console.error('[Agent] Fatal error:', e);
+      callbacks.onError?.(String(e));
       throw e;
     }
   }
 
-  // ===== Tool Execution =====
-
+  // ===== Parallel + Timeout Tool Execution =====
   private async executeTools(
     toolCalls: ToolCall[],
-    state: AgentState
+    state: AgentState,
+    signal?: AbortSignal
   ): Promise<ToolResult[]> {
-    const results: ToolResult[] = [];
+    const TOOL_TIMEOUT_MS = 15_000;
+    const MAX_RETRIES = 1;
 
-    for (const call of toolCalls) {
-      try {
-        const result = await this.toolRegistry.execute(call.name, call.args, state);
-        results.push(result);
-      } catch (e) {
-        results.push({
-          name: call.name,
-          success: false,
-          result: `Tool execution failed: ${String(e)}`,
-        });
+    const tasks = toolCalls.map(async call => {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), TOOL_TIMEOUT_MS);
+      const abort = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+
+      for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+        try {
+          const result = await this.toolRegistry.execute(call.name, call.args, state, abort);
+          clearTimeout(timeout);
+          return result;
+        } catch (err: any) {
+          if (attempt === MAX_RETRIES || abort.aborted) {
+            clearTimeout(timeout);
+            return {
+              name: call.name,
+              success: false,
+              result: `Tool failed: ${err.message ?? String(err)}`,
+            };
+          }
+          // simple back-off
+          await new Promise(r => self.setTimeout(r, 300));
+        }
       }
-    }
+      return { name: call.name, success: false, result: 'Tool timed out' };
+    });
 
-    return results;
+    const settled = await Promise.allSettled(tasks);
+    return settled.map(r =>
+      r.status === 'fulfilled' ? r.value : { name: 'unknown', success: false, result: `Rejected: ${r.reason}` }
+    );
   }
 
   // ===== History Formatting =====
-
   private formatHistory(
     messages: Message[],
     systemPrompt: string,
     currentUserMessage: string
   ): any[] {
-    const formatted: any[] = [
-      { role: 'system', content: systemPrompt },
-    ];
+    const formatted: any[] = [{ role: 'system', content: systemPrompt }];
 
-    // Add previous messages
     for (const msg of messages) {
+      const text = Array.isArray(msg.parts)
+        ? msg.parts.map((p: any) => p.text ?? '').join('\n')
+        : msg.content ?? '';
       formatted.push({
         role: msg.role === 'model' ? 'model' : 'user',
-        content: msg.parts.map((p: any) => p.text).join('\n'),
+        content: text,
       });
     }
 
-    // Add current user message
-    formatted.push({
-      role: 'user',
-      content: currentUserMessage,
-    });
-
+    formatted.push({ role: 'user', content: currentUserMessage });
     return formatted;
   }
 
-  // ===== Chunk Batching =====
+  // ===== Token-aware History Pruning =====
+  private async trimHistory(history: any[], tokenBudget: number): Promise<any[]> {
+    // If Gemini provides countTokens, use it
+    if (typeof this.gemini.countTokens === 'function') {
+      const system = history[0];
+      let used = await this.gemini.countTokens([system]);
+      const kept = [system];
 
+      for (let i = history.length - 1; i > 0; i--) {
+        const msgTokens = await this.gemini.countTokens([history[i]]);
+        if (used + msgTokens > tokenBudget) break;
+        used += msgTokens;
+        kept.unshift(history[i]);
+      }
+      return kept;
+    }
+
+    // Fallback: message count
+    const max = this.config.maxHistoryMessages;
+    return history.slice(-max);
+  }
+
+  // ===== Cloudflare-compatible Chunk Batcher =====
   private createChunkBatcher(
     onChunk?: ChunkCallback,
     flushInterval = 50
   ): { add: (chunk: string) => void; flush: () => void } {
     let buffer = '';
-    let timer: ReturnType<typeof setTimeout> | null = null;
+    let handle: number | null = null;
 
     const flush = () => {
       if (buffer && onChunk) {
         try {
           onChunk(buffer);
-          buffer = '';
         } catch (e) {
           console.error('[Agent] Chunk callback error:', e);
         }
       }
-      timer = null;
+      buffer = '';
+      handle = null;
     };
 
     return {
-      add: (chunk: string) => {
+      add(chunk: string) {
         buffer += chunk;
-        if (!timer) {
-          timer = setTimeout(flush, flushInterval);
+        if (!handle) {
+          handle = self.setTimeout(flush, flushInterval);
         }
       },
       flush,

@@ -1,8 +1,8 @@
 /**
- * Enhanced Suna-Lite Frontend with Markdown, Sidebar, and Full File Support
+ * Modern Suna-Lite Frontend - ChatGPT-like UI
  */
 
-// DOM elements
+// DOM Elements
 const chatMessages = document.getElementById("chat-messages");
 const welcomeScreen = document.getElementById("welcome-screen");
 const userInput = document.getElementById("user-input");
@@ -10,25 +10,24 @@ const sendButton = document.getElementById("send-button");
 const typingIndicator = document.getElementById("typing-indicator");
 const typingText = document.getElementById("typing-text");
 const fileInput = document.getElementById("file-input");
-const fileUploadArea = document.getElementById("file-upload-area");
-const uploadedFilesContainer = document.getElementById("uploaded-files");
+const filePreview = document.getElementById("file-preview");
 const sidebar = document.getElementById("sidebar");
-const sidebarOverlay = document.getElementById("sidebar-overlay");
-const mainContent = document.getElementById("main-content");
+const overlay = document.getElementById("overlay");
+const menuToggle = document.getElementById("menu-toggle");
 
-// WebSocket connection
+// WebSocket
 let ws = null;
 let isConnecting = false;
 let reconnectAttempts = 0;
 const MAX_RECONNECT_DELAY = 30000;
 
-// Chat state
+// State
 let isProcessing = false;
 let currentMessageElement = null;
 let pendingFiles = [];
 let conversationStarted = false;
 
-// Configure marked.js for better markdown rendering
+// Configure marked.js
 marked.setOptions({
   breaks: true,
   gfm: true,
@@ -46,83 +45,116 @@ marked.setOptions({
   }
 });
 
-// Load chat history on page load
+// Initialize
 window.addEventListener('DOMContentLoaded', () => {
   loadChatHistory();
   connectWebSocket();
-  setupFileUpload();
-  setupInputHandlers();
-  checkMobileView();
+  setupEventListeners();
 });
 
-// Window resize handler
-window.addEventListener('resize', checkMobileView);
-
 /**
- * Check if mobile view and adjust sidebar
+ * Setup Event Listeners
  */
-function checkMobileView() {
-  if (window.innerWidth <= 768) {
-    sidebar.classList.add('hidden');
-    mainContent.classList.add('expanded');
-  } else {
-    sidebar.classList.remove('hidden');
-    mainContent.classList.remove('expanded');
-    sidebarOverlay.classList.remove('visible');
-  }
-}
-
-/**
- * Toggle sidebar (mobile)
- */
-function toggleSidebar() {
-  if (window.innerWidth <= 768) {
-    sidebar.classList.toggle('hidden');
-    sidebar.classList.toggle('visible');
-    sidebarOverlay.classList.toggle('visible');
-  }
-}
-
-/**
- * Setup file upload handler with extended support
- */
-function setupFileUpload() {
-  fileInput.addEventListener('change', async (e) => {
-    const files = Array.from(e.target.files);
-    
-    for (const file of files) {
-      // 20MB limit
-      if (file.size > 20 * 1024 * 1024) {
-        addToast(`File ${file.name} is too large (max 20MB)`, 'error');
-        continue;
-      }
-
-      try {
-        const base64 = await fileToBase64(file);
-        const fileData = {
-          data: base64.split(',')[1],
-          mimeType: file.type,
-          name: file.name,
-          size: file.size
-        };
-        
-        pendingFiles.push(fileData);
-        addFileChip(file);
-        
-        addToast(`Added: ${file.name}`, 'success');
-      } catch (error) {
-        console.error('File reading failed:', error);
-        addToast(`Failed to read ${file.name}`, 'error');
-      }
+function setupEventListeners() {
+  // Hamburger menu
+  menuToggle.addEventListener('click', toggleSidebar);
+  
+  // Overlay click
+  overlay.addEventListener('click', closeSidebar);
+  
+  // File input
+  fileInput.addEventListener('change', handleFileSelect);
+  
+  // User input
+  userInput.addEventListener('input', autoResizeTextarea);
+  userInput.addEventListener('keydown', handleInputKeydown);
+  
+  // Send button
+  sendButton.addEventListener('click', sendMessage);
+  
+  // Close sidebar on ESC
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && sidebar.classList.contains('active')) {
+      closeSidebar();
     }
-
-    fileInput.value = '';
-    updateFileUploadArea();
   });
 }
 
 /**
- * Convert file to base64
+ * Sidebar Toggle
+ */
+function toggleSidebar() {
+  const isActive = sidebar.classList.toggle('active');
+  menuToggle.classList.toggle('active');
+  overlay.classList.toggle('active');
+  
+  // Prevent body scroll when sidebar is open on mobile
+  if (window.innerWidth < 768) {
+    document.body.style.overflow = isActive ? 'hidden' : '';
+  }
+}
+
+function closeSidebar() {
+  sidebar.classList.remove('active');
+  menuToggle.classList.remove('active');
+  overlay.classList.remove('active');
+  document.body.style.overflow = '';
+}
+
+/**
+ * Auto-resize textarea
+ */
+function autoResizeTextarea() {
+  userInput.style.height = 'auto';
+  userInput.style.height = Math.min(userInput.scrollHeight, 200) + 'px';
+}
+
+/**
+ * Handle input keydown
+ */
+function handleInputKeydown(e) {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    sendMessage();
+  }
+}
+
+/**
+ * File Selection Handler
+ */
+async function handleFileSelect(e) {
+  const files = Array.from(e.target.files);
+  
+  for (const file of files) {
+    // 20MB limit
+    if (file.size > 20 * 1024 * 1024) {
+      showToast(`File ${file.name} is too large (max 20MB)`, 'error');
+      continue;
+    }
+
+    try {
+      const base64 = await fileToBase64(file);
+      const fileData = {
+        data: base64.split(',')[1],
+        mimeType: file.type,
+        name: file.name,
+        size: file.size
+      };
+      
+      pendingFiles.push(fileData);
+      addFileChip(file);
+      showToast(`Added: ${file.name}`, 'success');
+    } catch (error) {
+      console.error('File reading failed:', error);
+      showToast(`Failed to read ${file.name}`, 'error');
+    }
+  }
+
+  fileInput.value = '';
+}
+
+/**
+ * File to Base64
  */
 function fileToBase64(file) {
   return new Promise((resolve, reject) => {
@@ -134,7 +166,7 @@ function fileToBase64(file) {
 }
 
 /**
- * Add file chip to UI
+ * Add File Chip
  */
 function addFileChip(file) {
   const chip = document.createElement('div');
@@ -149,11 +181,11 @@ function addFileChip(file) {
     <span class="file-chip-remove" onclick="removeFileChip('${escapeHtml(file.name)}')">✕</span>
   `;
   
-  uploadedFilesContainer.appendChild(chip);
+  filePreview.appendChild(chip);
 }
 
 /**
- * Get appropriate icon for file type
+ * Get File Icon
  */
 function getFileIcon(mimeType, fileName) {
   if (mimeType.startsWith('image/')) return '🖼️';
@@ -166,34 +198,21 @@ function getFileIcon(mimeType, fileName) {
 }
 
 /**
- * Remove file chip
+ * Remove File Chip
  */
 function removeFileChip(fileName) {
   pendingFiles = pendingFiles.filter(f => f.name !== fileName);
   
-  const chips = uploadedFilesContainer.querySelectorAll('.file-chip');
+  const chips = filePreview.querySelectorAll('.file-chip');
   chips.forEach(chip => {
     if (chip.dataset.fileName === fileName) {
       chip.remove();
     }
   });
-  
-  updateFileUploadArea();
 }
 
 /**
- * Update file upload area visibility
- */
-function updateFileUploadArea() {
-  if (pendingFiles.length > 0) {
-    fileUploadArea.classList.add('has-files');
-  } else {
-    fileUploadArea.classList.remove('has-files');
-  }
-}
-
-/**
- * Format file size
+ * Format File Size
  */
 function formatFileSize(bytes) {
   if (bytes < 1024) return bytes + ' B';
@@ -202,29 +221,7 @@ function formatFileSize(bytes) {
 }
 
 /**
- * Setup input handlers
- */
-function setupInputHandlers() {
-  // Auto-resize textarea
-  userInput.addEventListener("input", function () {
-    this.style.height = "auto";
-    this.style.height = Math.min(this.scrollHeight, 200) + "px";
-  });
-
-  // Send on Enter (without Shift)
-  userInput.addEventListener("keydown", function (e) {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      sendMessage();
-    }
-  });
-
-  // Send button
-  sendButton.addEventListener("click", sendMessage);
-}
-
-/**
- * Connect to WebSocket
+ * WebSocket Connection
  */
 function connectWebSocket() {
   if (ws && ws.readyState === WebSocket.OPEN) return;
@@ -270,7 +267,7 @@ function connectWebSocket() {
 }
 
 /**
- * Handle messages from the server
+ * Handle Server Messages
  */
 function handleServerMessage(data) {
   console.log('Received:', data.type, data);
@@ -304,15 +301,14 @@ function handleServerMessage(data) {
       isProcessing = false;
       enableInput();
       
-      // Clear pending files after successful send
+      // Clear files
       pendingFiles = [];
-      uploadedFilesContainer.innerHTML = '';
-      updateFileUploadArea();
+      filePreview.innerHTML = '';
       break;
 
     case 'error':
       hideTypingIndicator();
-      addToast(`Error: ${data.error}`, 'error');
+      showToast(`Error: ${data.error}`, 'error');
       currentMessageElement = null;
       isProcessing = false;
       enableInput();
@@ -324,7 +320,7 @@ function handleServerMessage(data) {
 }
 
 /**
- * Show tool usage indicator
+ * Show Tool Use
  */
 function showToolUse(tools) {
   if (!currentMessageElement) {
@@ -334,7 +330,7 @@ function showToolUse(tools) {
   
   const toolIndicator = document.createElement('div');
   toolIndicator.className = 'tool-use-indicator';
-  toolIndicator.innerHTML = `🔧 Using tools: ${tools.join(', ')}`;
+  toolIndicator.innerHTML = `🔧 Using: ${tools.join(', ')}`;
   
   const content = currentMessageElement.querySelector('.message-content');
   content.appendChild(toolIndicator);
@@ -342,7 +338,7 @@ function showToolUse(tools) {
 }
 
 /**
- * Send message to the agent
+ * Send Message
  */
 async function sendMessage() {
   const message = userInput.value.trim();
@@ -350,7 +346,7 @@ async function sendMessage() {
   if (message === "" || isProcessing) return;
 
   if (!ws || ws.readyState !== WebSocket.OPEN) {
-    addToast('Connecting to server...', 'info');
+    showToast('Connecting to server...', 'info');
     connectWebSocket();
     setTimeout(() => {
       if (ws && ws.readyState === WebSocket.OPEN) {
@@ -362,21 +358,24 @@ async function sendMessage() {
 
   isProcessing = true;
   disableInput();
-
-  // Hide welcome screen on first message
   hideWelcome();
 
-  // Add user message to chat
+  // Close sidebar on mobile after sending
+  if (window.innerWidth < 768) {
+    closeSidebar();
+  }
+
+  // Add user message
   addUserMessage(message);
 
   // Clear input
   userInput.value = "";
   userInput.style.height = "auto";
 
-  // Show typing indicator
-  showTypingIndicator('Processing your request...');
+  // Show typing
+  showTypingIndicator('Thinking...');
 
-  // Send via WebSocket with files
+  // Send via WebSocket
   try {
     const payload = {
       type: 'user_message',
@@ -390,7 +389,7 @@ async function sendMessage() {
     ws.send(JSON.stringify(payload));
   } catch (error) {
     console.error('Error sending message:', error);
-    addToast('Failed to send message. Please try again.', 'error');
+    showToast('Failed to send message', 'error');
     isProcessing = false;
     enableInput();
     hideTypingIndicator();
@@ -398,7 +397,7 @@ async function sendMessage() {
 }
 
 /**
- * Hide welcome screen
+ * Hide Welcome
  */
 function hideWelcome() {
   if (!conversationStarted) {
@@ -408,7 +407,7 @@ function hideWelcome() {
 }
 
 /**
- * Load chat history from server
+ * Load Chat History
  */
 async function loadChatHistory() {
   try {
@@ -445,7 +444,7 @@ async function loadChatHistory() {
 }
 
 /**
- * Create a message element
+ * Create Message Element
  */
 function createMessageElement(role) {
   const wrapper = document.createElement("div");
@@ -458,11 +457,13 @@ function createMessageElement(role) {
   const sender = role === 'user' ? 'You' : 'Suna-Lite';
   
   messageEl.innerHTML = `
-    <div class="message-header">
-      <div class="message-avatar">${avatar}</div>
-      <span class="message-sender">${sender}</span>
+    <div class="message-avatar">${avatar}</div>
+    <div style="flex: 1;">
+      <div class="message-header">
+        <span class="message-sender">${sender}</span>
+      </div>
+      <div class="message-content"></div>
     </div>
-    <div class="message-content"></div>
   `;
   
   wrapper.appendChild(messageEl);
@@ -472,12 +473,11 @@ function createMessageElement(role) {
 }
 
 /**
- * Append content to a message (streaming)
+ * Append to Message (streaming)
  */
 function appendToMessage(element, content) {
   const contentDiv = element.querySelector('.message-content');
   
-  // For streaming, append raw text temporarily
   if (!contentDiv.dataset.streaming) {
     contentDiv.dataset.streaming = 'true';
     contentDiv.dataset.rawContent = '';
@@ -488,7 +488,7 @@ function appendToMessage(element, content) {
 }
 
 /**
- * Finalize message (render markdown)
+ * Finalize Message
  */
 function finalizeMessage(element) {
   const contentDiv = element.querySelector('.message-content');
@@ -497,7 +497,7 @@ function finalizeMessage(element) {
   // Render markdown
   contentDiv.innerHTML = marked.parse(rawContent);
   
-  // Highlight code blocks
+  // Highlight code
   contentDiv.querySelectorAll('pre code').forEach((block) => {
     hljs.highlightElement(block);
   });
@@ -507,7 +507,7 @@ function finalizeMessage(element) {
 }
 
 /**
- * Add user message
+ * Add User Message
  */
 function addUserMessage(content, scroll = true) {
   const messageEl = createMessageElement('user');
@@ -518,14 +518,13 @@ function addUserMessage(content, scroll = true) {
 }
 
 /**
- * Add assistant message (complete)
+ * Add Assistant Message
  */
 function addAssistantMessage(content, scroll = true) {
   const messageEl = createMessageElement('assistant');
   const contentDiv = messageEl.querySelector('.message-content');
   contentDiv.innerHTML = marked.parse(content);
   
-  // Highlight code blocks
   contentDiv.querySelectorAll('pre code').forEach((block) => {
     hljs.highlightElement(block);
   });
@@ -534,7 +533,7 @@ function addAssistantMessage(content, scroll = true) {
 }
 
 /**
- * Typing indicator functions
+ * Typing Indicator
  */
 function showTypingIndicator(message = 'Thinking...') {
   typingText.textContent = message;
@@ -551,7 +550,7 @@ function hideTypingIndicator() {
 }
 
 /**
- * Input control functions
+ * Input Control
  */
 function disableInput() {
   userInput.disabled = true;
@@ -565,41 +564,42 @@ function enableInput() {
 }
 
 /**
- * Scroll to bottom
+ * Scroll to Bottom
  */
 function scrollToBottom() {
-  chatMessages.scrollTop = chatMessages.scrollHeight;
+  requestAnimationFrame(() => {
+    chatMessages.scrollTop = chatMessages.scrollHeight;
+  });
 }
 
 /**
- * Toast notification
+ * Toast Notification
  */
-function addToast(message, type = 'info') {
+function showToast(message, type = 'info') {
+  const container = document.getElementById('toast-container') || createToastContainer();
+  
   const toast = document.createElement('div');
-  toast.style.cssText = `
-    position: fixed;
-    bottom: 2rem;
-    right: 2rem;
-    padding: 1rem 1.5rem;
-    background: ${type === 'error' ? '#ef4444' : type === 'success' ? '#10b981' : '#3b82f6'};
-    color: white;
-    border-radius: 8px;
-    box-shadow: 0 4px 12px rgba(0,0,0,0.2);
-    z-index: 10000;
-    animation: slideInRight 0.3s ease;
-    max-width: 300px;
-  `;
+  toast.className = `toast ${type}`;
   toast.textContent = message;
-  document.body.appendChild(toast);
+  
+  container.appendChild(toast);
   
   setTimeout(() => {
-    toast.style.animation = 'slideOutRight 0.3s ease';
+    toast.style.animation = 'toastSlideOut 0.3s ease';
     setTimeout(() => toast.remove(), 300);
   }, 3000);
 }
 
+function createToastContainer() {
+  const container = document.createElement('div');
+  container.id = 'toast-container';
+  container.className = 'toast-container';
+  document.body.appendChild(container);
+  return container;
+}
+
 /**
- * Clear chat history
+ * Clear Chat
  */
 async function clearChat() {
   if (!confirm('Start a new chat? This will clear the current conversation.')) {
@@ -611,95 +611,31 @@ async function clearChat() {
     if (response.ok) {
       chatMessages.innerHTML = '';
       pendingFiles = [];
-      uploadedFilesContainer.innerHTML = '';
-      updateFileUploadArea();
+      filePreview.innerHTML = '';
       conversationStarted = false;
+      welcomeScreen.classList.remove('hidden');
       
-      // Re-add welcome screen with full content
-      const welcomeHTML = `
-        <div class="welcome-screen" id="welcome-screen">
-          <div class="welcome-icon">🤖</div>
-          <h2>Welcome to Suna-Lite</h2>
-          <p>Your autonomous AI assistant powered by Gemini 2.5 Flash with advanced multi-step reasoning and tool execution capabilities</p>
-          
-          <div class="welcome-features">
-            <div class="welcome-feature">
-              <div class="welcome-feature-icon">🔍</div>
-              <h3>Web Search</h3>
-              <p>Access real-time information from the web to answer current questions and find the latest data</p>
-            </div>
-            <div class="welcome-feature">
-              <div class="welcome-feature-icon">💻</div>
-              <h3>Code Execution</h3>
-              <p>Run Python code for complex calculations, data analysis, and algorithmic problem solving</p>
-            </div>
-            <div class="welcome-feature">
-              <div class="welcome-feature-icon">📄</div>
-              <h3>File Analysis</h3>
-              <p>Process and analyze documents, spreadsheets, PDFs, images, and various data formats</p>
-            </div>
-            <div class="welcome-feature">
-              <div class="welcome-feature-icon">🔄</div>
-              <h3>Multi-Step Tasks</h3>
-              <p>Autonomous planning and execution of complex tasks that require multiple steps and tools</p>
-            </div>
-            <div class="welcome-feature">
-              <div class="welcome-feature-icon">👁️</div>
-              <h3>Vision Analysis</h3>
-              <p>Understand and analyze images, charts, diagrams, and visual content with AI vision</p>
-            </div>
-            <div class="welcome-feature">
-              <div class="welcome-feature-icon">📊</div>
-              <h3>Data Processing</h3>
-              <p>Comprehensive data analysis, visualization, and insights from structured and unstructured data</p>
-            </div>
-          </div>
-
-          <div class="welcome-cta">
-            <p class="welcome-cta-text">✨ Try asking me something or choose a suggestion below:</p>
-            <div class="welcome-suggestions">
-              <div class="suggestion-chip" onclick="useSuggestion(this)">
-                What's the current Bitcoin price?
-              </div>
-              <div class="suggestion-chip" onclick="useSuggestion(this)">
-                Analyze this dataset for trends
-              </div>
-              <div class="suggestion-chip" onclick="useSuggestion(this)">
-                Calculate compound interest
-              </div>
-              <div class="suggestion-chip" onclick="useSuggestion(this)">
-                Search latest AI news
-              </div>
-              <div class="suggestion-chip" onclick="useSuggestion(this)">
-                Explain quantum computing
-              </div>
-            </div>
-          </div>
-        </div>
-      `;
+      showToast('Chat cleared', 'success');
       
-      chatMessages.innerHTML = welcomeHTML;
-      
-      // Re-assign welcome screen reference
-      window.welcomeScreen = document.getElementById('welcome-screen');
-      
-      addToast('Chat cleared successfully', 'success');
+      // Close sidebar on mobile
+      if (window.innerWidth < 768) {
+        closeSidebar();
+      }
     }
   } catch (error) {
     console.error('Error clearing chat:', error);
-    addToast('Failed to clear chat', 'error');
+    showToast('Failed to clear chat', 'error');
   }
 }
 
 /**
- * Use a suggestion chip
+ * Use Suggestion
  */
 function useSuggestion(element) {
   const text = element.textContent.trim();
   userInput.value = text;
   userInput.focus();
-  // Optionally auto-send
-  // sendMessage();
+  autoResizeTextarea();
 }
 
 /**
@@ -711,29 +647,12 @@ function escapeHtml(text) {
   return div.innerHTML;
 }
 
-// Add CSS animations
+// Add toast slideout animation
 const style = document.createElement('style');
 style.textContent = `
-  @keyframes slideInRight {
-    from {
-      transform: translateX(100%);
-      opacity: 0;
-    }
-    to {
-      transform: translateX(0);
-      opacity: 1;
-    }
-  }
-  
-  @keyframes slideOutRight {
-    from {
-      transform: translateX(0);
-      opacity: 1;
-    }
-    to {
-      transform: translateX(100%);
-      opacity: 0;
-    }
+  @keyframes toastSlideOut {
+    from { opacity: 1; transform: translateY(0); }
+    to { opacity: 0; transform: translateY(16px); }
   }
 `;
 document.head.appendChild(style);

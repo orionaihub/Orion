@@ -1,472 +1,775 @@
-import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
-import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
-import { getFirestore, setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+/**
+ * Enhanced Orion Frontend with Tailwind/Custom CSS, Markdown, Sidebar, and Full File Support
+ */
 
-// DOM Elements
-const chatForm = document.getElementById('chat-form');
-const chatInput = document.getElementById('chat-input');
-const chatContainer = document.getElementById('chat-container');
-const messagesWrapper = document.getElementById('messages-wrapper');
-const welcomeMessage = document.getElementById('welcome-message');
-const typingIndicator = document.getElementById('typing-indicator');
-const typingText = document.getElementById('typing-text');
-const menuBtn = document.getElementById('menu-btn');
-const sidebar = document.getElementById('sidebar');
-const overlay = document.getElementById('overlay');
-const toolsBtn = document.getElementById('tools-btn');
-const toolsPopup = document.getElementById('tools-popup');
-const fileInput = document.getElementById('file-input');
-const filePreview = document.getElementById('file-preview');
-const sendButton = document.getElementById('send-button');
-const statusIndicator = document.getElementById('status-indicator');
-const statusText = document.getElementById('status-text');
-const userInfo = document.getElementById('user-info');
-const attachFileButton = document.getElementById('attach-file-button');
+// DOM elements (Adapted from index.html.txt)
+const chatMessages = document.getElementById("messages-wrapper"); // Changed from 'chat-messages' to 'messages-wrapper'
+const welcomeScreen = document.getElementById("welcome-message"); // Changed from 'welcome-screen' to 'welcome-message'
+const userInput = document.getElementById("chat-input"); // Changed from 'user-input' to 'chat-input'
+const sendButton = document.getElementById("send-button");
+const typingIndicator = document.getElementById("typing-indicator");
+const typingText = document.getElementById("typing-text");
+const fileInput = document.getElementById("file-input");
+const filePreview = document.getElementById("file-preview"); // Added for file chips
+const sidebar = document.getElementById("sidebar");
+const menuBtn = document.getElementById("menu-btn"); // Added for mobile menu
+const overlay = document.getElementById("overlay"); // Added for mobile overlay
+const chatContainer = document.getElementById("chat-container"); // New element for scrolling
 
-// WebSocket (Mock/Stub for actual connection)
+// WebSocket connection
 let ws = null;
 let isConnecting = false;
 let reconnectAttempts = 0;
 const MAX_RECONNECT_DELAY = 30000;
 
-// State
+// Chat state
 let isProcessing = false;
 let currentMessageElement = null;
 let pendingFiles = [];
 let conversationStarted = false;
-let db = null;
-let auth = null;
-let userId = null;
 
-// --- MANDATORY ENVIRONMENT SETUP ---
-const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
-const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
-
-// Initialize Firebase
-if (Object.keys(firebaseConfig).length > 0) {
-    try {
-        const app = initializeApp(firebaseConfig);
-        db = getFirestore(app);
-        auth = getAuth(app);
-        setLogLevel('Debug');
-        
-        // Handle Auth
-        onAuthStateChanged(auth, async (user) => {
-            if (user) {
-                userId = user.uid;
-                userInfo.textContent = userId;
-                // Once authenticated, you can start listening to Firestore data here if needed.
-            } else {
-                // Sign in anonymously if no token is available
-                userId = crypto.randomUUID(); // Fallback ID for display
-                userInfo.textContent = userId;
-                try {
-                    if (typeof __initial_auth_token !== 'undefined') {
-                        await signInWithCustomToken(auth, __initial_auth_token);
-                    } else {
-                        await signInAnonymously(auth);
-                    }
-                } catch (error) {
-                    console.error("Firebase Auth Error:", error);
-                    // This error is usually handled by the onAuthStateChanged listener failing to return a user.
-                }
-            }
-        });
-
-    } catch (e) {
-        console.error("Failed to initialize Firebase:", e);
-    }
-} else {
-    console.error("Firebase configuration is missing.");
-    userId = crypto.randomUUID();
-    userInfo.textContent = userId;
-}
-// --- END MANDATORY SETUP ---
-
-// Configure marked.js
+// Configure marked.js for better markdown rendering
 marked.setOptions({
   breaks: true,
   gfm: true,
   headerIds: false,
   mangle: false,
+  // Highlight function remains the same, relying on loaded highlight.js
   highlight: function(code, lang) {
     if (lang && hljs.getLanguage(lang)) {
-      return hljs.highlight(code, { language: lang }).value;
+      try {
+        return hljs.highlight(code, { language: lang }).value;
+      } catch (err) {
+        console.error('Highlight error:', err);
+      }
     }
     return hljs.highlightAuto(code).value;
   }
 });
 
-// Helper: Scroll to Bottom
-function scrollToBottom() {
-  const messagesArea = document.getElementById('messages-area');
-  // Use a small timeout to ensure the DOM has finished rendering the new message
-  setTimeout(() => {
-    messagesArea.scrollTop = messagesArea.scrollHeight;
-  }, 10);
+// Load chat history on page load
+window.addEventListener('DOMContentLoaded', () => {
+  loadChatHistory();
+  connectWebSocket();
+  setupFileUpload();
+  setupInputHandlers();
+  setupSidebarToggle(); // New
+  checkMobileView();
+});
+
+// Window resize handler
+window.addEventListener('resize', checkMobileView);
+
+/**
+ * Check if mobile view and adjust sidebar
+ */
+function checkMobileView() {
+  const isMobile = window.innerWidth <= 768;
+  if (!isMobile) {
+    // Desktop: Ensure sidebar is visible and overlay is hidden
+    sidebar.classList.remove('-translate-x-full');
+    overlay.classList.add('hidden');
+  } else {
+    // Mobile: Ensure sidebar starts hidden
+    if (!sidebar.classList.contains('-translate-x-full')) {
+       sidebar.classList.add('-translate-x-full');
+    }
+    overlay.classList.add('hidden');
+  }
 }
 
-// Helper: Toast Notification
-function showToast(message, type = 'info') {
-  const colors = {
-    success: 'bg-green-600',
-    error: 'bg-red-600',
-    info: 'bg-blue-600'
+/**
+ * Setup mobile sidebar toggle handlers
+ */
+function setupSidebarToggle() {
+  // Mobile menu button
+  if (menuBtn) {
+    menuBtn.addEventListener('click', () => {
+      sidebar.classList.toggle('-translate-x-full');
+      overlay.classList.toggle('hidden');
+    });
+  }
+  
+  // Overlay click to close
+  if (overlay) {
+    overlay.addEventListener('click', () => {
+      sidebar.classList.add('-translate-x-full');
+      overlay.classList.add('hidden');
+    });
+  }
+}
+
+/**
+ * Setup file upload handler with extended support
+ */
+function setupFileUpload() {
+  fileInput.addEventListener('change', async (e) => {
+    const files = Array.from(e.target.files);
+    
+    for (const file of files) {
+      // 20MB limit
+      if (file.size > 20 * 1024 * 1024) {
+        addToast(`File ${file.name} is too large (max 20MB)`, 'error');
+        continue;
+      }
+
+      try {
+        const base64 = await fileToBase64(file);
+        const fileData = {
+          data: base64.split(',')[1],
+          mimeType: file.type,
+          name: file.name,
+          size: file.size
+        };
+        
+        pendingFiles.push(fileData);
+        addFileChip(file);
+        
+        addToast(`Added: ${file.name}`, 'success');
+      } catch (error) {
+        console.error('File reading failed:', error);
+        addToast(`Failed to read ${file.name}`, 'error');
+      }
+    }
+
+    fileInput.value = '';
+    updateFilePreview();
+  });
+}
+
+/**
+ * Convert file to base64
+ */
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+/**
+ * Add file chip to UI (Adapted to Tailwind/index.html structure)
+ */
+function addFileChip(file) {
+  const chip = document.createElement('div');
+  chip.className = 'flex items-center gap-2 px-3 py-1 rounded-full bg-white/10 text-xs text-white';
+  chip.dataset.fileName = file.name;
+  
+  const icon = getFileIcon(file.type, file.name);
+  
+  chip.innerHTML = `
+    <span>${icon}</span>
+    <span class="truncate max-w-[150px]">${file.name}</span>
+    <span class="text-gray-400">(${formatFileSize(file.size)})</span>
+    <button type="button" class="text-gray-400 hover:text-white transition-colors ml-1" onclick="removeFileChip('${escapeHtml(file.name)}')" aria-label="Remove file">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-4 h-4">
+            <path d="M6.28 5.22a.75.75 0 00-1.06 1.06L8.94 10l-3.72 3.72a.75.75 0 101.06 1.06L10 11.06l3.72 3.72a.75.75 0 101.06-1.06L11.06 10l3.72-3.72a.75.75 0 00-1.06-1.06L10 8.94 6.28 5.22z" />
+        </svg>
+    </button>
+  `;
+  
+  filePreview.appendChild(chip);
+}
+
+/**
+ * Get appropriate icon for file type
+ */
+function getFileIcon(mimeType, fileName) {
+  if (mimeType.startsWith('image/')) return '🖼️';
+  if (mimeType.includes('pdf')) return '📄';
+  if (mimeType.includes('word') || fileName.endsWith('.doc') || fileName.endsWith('.docx')) return '📝';
+  if (mimeType.includes('sheet') || fileName.endsWith('.csv') || fileName.endsWith('.xlsx')) return '📊';
+  if (mimeType.includes('json')) return '📋';
+  if (mimeType.includes('text')) return '📃';
+  return '📎';
+}
+
+/**
+ * Remove file chip
+ */
+function removeFileChip(fileName) {
+  pendingFiles = pendingFiles.filter(f => f.name !== fileName);
+  
+  const chips = filePreview.querySelectorAll('[data-file-name]');
+  chips.forEach(chip => {
+    if (chip.dataset.fileName === fileName) {
+      chip.remove();
+    }
+  });
+  
+  updateFilePreview();
+}
+
+/**
+ * Update file preview visibility (used for potential future styling, but currently managed by chip presence)
+ */
+function updateFilePreview() {
+  // In the current index.html, the visibility is implicit based on content
+  // We'll keep the function for future expansion if the UI needs to react to an empty state
+}
+
+/**
+ * Format file size
+ */
+function formatFileSize(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+  return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+}
+
+/**
+ * Setup input handlers
+ */
+function setupInputHandlers() {
+  // Auto-resize textarea
+  userInput.addEventListener("input", function () {
+    this.style.height = "auto";
+    this.style.height = Math.min(this.scrollHeight, 200) + "px";
+  });
+
+  // Send on Enter (without Shift)
+  userInput.addEventListener("keydown", function (e) {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      sendMessage();
+    }
+  });
+
+  // Send button
+  sendButton.addEventListener("click", sendMessage);
+  
+  // Tools Button Toggle
+  const toolsBtn = document.getElementById('tools-btn');
+  const toolsPopup = document.getElementById('tools-popup');
+  
+  toolsBtn.addEventListener('click', () => {
+      toolsPopup.classList.toggle('opacity-0');
+      toolsPopup.classList.toggle('scale-95');
+      toolsPopup.classList.toggle('pointer-events-none');
+  });
+  
+  // Close popup on click outside
+  document.addEventListener('click', (e) => {
+      if (!toolsPopup.contains(e.target) && !toolsBtn.contains(e.target) && !toolsPopup.classList.contains('opacity-0')) {
+          toolsPopup.classList.add('opacity-0');
+          toolsPopup.classList.add('scale-95');
+          toolsPopup.classList.add('pointer-events-none');
+      }
+  });
+}
+
+/**
+ * Connect to WebSocket
+ */
+function connectWebSocket() {
+  if (ws && ws.readyState === WebSocket.OPEN) return;
+  if (isConnecting) return;
+
+  isConnecting = true;
+  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  // Check if running on a custom port for development
+  const port = location.port ? `:${location.port}` : '';
+  const wsUrl = `${protocol}//${location.hostname}${port}/api/ws`;
+
+  console.log('Connecting to WebSocket:', wsUrl);
+
+  // Update status UI
+  updateConnectionStatus('Connecting...', 'bg-gray-500');
+
+  ws = new WebSocket(wsUrl);
+
+  ws.onopen = () => {
+    console.log('WebSocket connected');
+    isConnecting = false;
+    reconnectAttempts = 0;
+    updateConnectionStatus('Connected', 'bg-teal-500');
   };
+
+  ws.onmessage = (event) => {
+    try {
+      const data = JSON.parse(event.data);
+      handleServerMessage(data);
+    } catch (error) {
+      console.error('Error parsing WebSocket message:', error);
+    }
+  };
+
+  ws.onclose = (event) => {
+    console.log('WebSocket closed:', event.code, event.reason);
+    isConnecting = false;
+    updateConnectionStatus('Disconnected', 'bg-red-500');
+    
+    reconnectAttempts++;
+    const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), MAX_RECONNECT_DELAY);
+    console.log(`Reconnecting in ${delay}ms...`);
+    setTimeout(connectWebSocket, delay);
+  };
+
+  ws.onerror = (error) => {
+    console.error('WebSocket error:', error);
+    isConnecting = false;
+    updateConnectionStatus('Error', 'bg-red-500');
+  };
+}
+
+/**
+ * Update connection status UI (Adapted to index.html structure)
+ */
+function updateConnectionStatus(text, colorClass) {
+  const indicator = document.getElementById('status-indicator');
+  const statusText = document.getElementById('status-text');
+  
+  if (indicator) {
+    indicator.className = `w-2 h-2 rounded-full ${colorClass}`;
+  }
+  if (statusText) {
+    statusText.textContent = text;
+  }
+}
+
+/**
+ * Handle messages from the server
+ */
+function handleServerMessage(data) {
+  console.log('Received:', data.type, data);
+
+  switch (data.type) {
+    case 'status':
+      updateTypingIndicator(data.message);
+      break;
+
+    case 'chunk':
+      if (!currentMessageElement) {
+        hideWelcome();
+        currentMessageElement = createMessageElement('assistant');
+      }
+      appendToMessage(currentMessageElement, data.content);
+      // Smooth scroll on every chunk
+      scrollToBottom(true); 
+      break;
+
+    case 'tool_use':
+      if (data.tools && data.tools.length > 0) {
+        showToolUse(data.tools);
+      }
+      break;
+
+    case 'done':
+      hideTypingIndicator();
+      if (currentMessageElement) {
+        finalizeMessage(currentMessageElement);
+      }
+      currentMessageElement = null;
+      isProcessing = false;
+      enableInput();
+      // Final smooth scroll
+      scrollToBottom(true);
+      
+      // Clear pending files after successful send
+      pendingFiles = [];
+      filePreview.innerHTML = ''; // Clear file chips
+      updateFilePreview();
+      break;
+
+    case 'error':
+      hideTypingIndicator();
+      addToast(`Error: ${data.error}`, 'error');
+      currentMessageElement = null;
+      isProcessing = false;
+      enableInput();
+      break;
+
+    default:
+      console.log('Unknown message type:', data.type);
+  }
+}
+
+/**
+ * Show tool usage indicator (Adapted to Tailwind/index.html structure)
+ */
+function showToolUse(tools) {
+  if (!currentMessageElement) {
+    hideWelcome();
+    currentMessageElement = createMessageElement('assistant');
+  }
+  
+  const toolIndicator = document.createElement('div');
+  toolIndicator.className = 'text-xs text-gray-400 mt-2 p-2 bg-white/5 rounded-lg border border-white/10';
+  toolIndicator.innerHTML = `🔧 Using tools: **${tools.join(', ')}**`;
+  
+  const content = currentMessageElement.querySelector('.message-content');
+  content.appendChild(toolIndicator);
+  scrollToBottom(true);
+}
+
+/**
+ * Send message to the agent
+ */
+async function sendMessage() {
+  const message = userInput.value.trim();
+
+  if (message === "" && pendingFiles.length === 0 || isProcessing) return;
+
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    addToast('Connecting to server...', 'info');
+    connectWebSocket();
+    setTimeout(() => {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        sendMessage();
+      }
+    }, 1000);
+    return;
+  }
+
+  isProcessing = true;
+  disableInput();
+
+  // Hide welcome screen on first message
+  hideWelcome();
+
+  // Add user message to chat
+  addUserMessage(message || 'Sent files for analysis.');
+
+  // Clear input
+  userInput.value = "";
+  userInput.style.height = "auto";
+
+  // Show typing indicator
+  showTypingIndicator('Processing your request...');
+
+  // Send via WebSocket with files
+  try {
+    const payload = {
+      type: 'user_message',
+      content: message
+    };
+
+    if (pendingFiles.length > 0) {
+      payload.files = pendingFiles;
+    }
+
+    ws.send(JSON.stringify(payload));
+  } catch (error) {
+    console.error('Error sending message:', error);
+    addToast('Failed to send message. Please try again.', 'error');
+    isProcessing = false;
+    enableInput();
+    hideTypingIndicator();
+  }
+}
+
+/**
+ * Hide welcome screen
+ */
+function hideWelcome() {
+  if (!conversationStarted) {
+    if (welcomeScreen) {
+        welcomeScreen.classList.add('hidden');
+    }
+    conversationStarted = true;
+  }
+}
+
+/**
+ * Load chat history from server (Remains the same logic)
+ */
+async function loadChatHistory() {
+  try {
+    const response = await fetch('/api/history');
+    if (response.ok) {
+      const data = await response.json();
+      
+      if (data.messages && data.messages.length > 0) {
+        hideWelcome();
+        
+        data.messages.forEach(msg => {
+          const role = msg.role === 'model' ? 'assistant' : 'user';
+          if (msg.parts && msg.parts.length > 0) {
+            const textParts = msg.parts
+              .filter(p => p.text)
+              .map(p => p.text)
+              .join('\n');
+            if (textParts) {
+              if (role === 'user') {
+                addUserMessage(textParts, false);
+              } else {
+                addAssistantMessage(textParts, false);
+              }
+            }
+          }
+        });
+        
+        scrollToBottom(false);
+      }
+    }
+  } catch (error) {
+    console.error('Error loading chat history:', error);
+  }
+}
+
+/**
+ * Create a message element (Adapted to Tailwind/index.html structure)
+ */
+function createMessageElement(role) {
+  const isUser = role === 'user';
+  const wrapper = document.createElement("div");
+  wrapper.className = "p-4 md:p-6";
+  
+  const messageEl = document.createElement("div");
+  messageEl.className = "flex items-start gap-4 max-w-4xl mx-auto";
+  
+  const avatarBg = isUser ? 'bg-gray-500' : 'bg-teal-600';
+  const senderText = isUser ? 'You' : 'Orion'; // Changed to Orion
+  const iconSvg = `<svg class="w-5 h-5" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
+      <path stroke-linecap="round" stroke-linejoin="round" d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09z" />
+    </svg>`;
+    
+  const avatar = isUser ? '👤' : iconSvg; // Use SVG for Orion/Assistant
+
+  messageEl.innerHTML = `
+    <div class="w-8 h-8 flex-shrink-0 rounded-full flex items-center justify-center text-white ${avatarBg}">
+      ${avatar}
+    </div>
+    <div class="flex-1 min-w-0">
+      <h3 class="font-semibold mb-2">${senderText}</h3>
+      <div class="message-content text-gray-200"></div>
+    </div>
+  `;
+  
+  wrapper.appendChild(messageEl);
+  chatMessages.appendChild(wrapper);
+  
+  return messageEl;
+}
+
+/**
+ * Append content to a message (streaming)
+ */
+function appendToMessage(element, content) {
+  const contentDiv = element.querySelector('.message-content');
+  
+  // For streaming, append raw text temporarily
+  if (!contentDiv.dataset.streaming) {
+    contentDiv.dataset.streaming = 'true';
+    contentDiv.dataset.rawContent = '';
+  }
+  
+  contentDiv.dataset.rawContent += content;
+  contentDiv.textContent = contentDiv.dataset.rawContent;
+}
+
+/**
+ * Finalize message (render markdown)
+ */
+function finalizeMessage(element) {
+  const contentDiv = element.querySelector('.message-content');
+  const rawContent = contentDiv.dataset.rawContent || contentDiv.textContent;
+  
+  // Render markdown
+  contentDiv.innerHTML = marked.parse(rawContent);
+  
+  // Highlight code blocks
+  contentDiv.querySelectorAll('pre code').forEach((block) => {
+    hljs.highlightElement(block);
+  });
+  
+  delete contentDiv.dataset.streaming;
+  delete contentDiv.dataset.rawContent;
+}
+
+/**
+ * Add user message
+ */
+function addUserMessage(content, scroll = true) {
+  const messageEl = createMessageElement('user');
+  const contentDiv = messageEl.querySelector('.message-content');
+  contentDiv.textContent = content;
+  
+  if (scroll) scrollToBottom(true);
+}
+
+/**
+ * Add assistant message (complete)
+ */
+function addAssistantMessage(content, scroll = true) {
+  const messageEl = createMessageElement('assistant');
+  const contentDiv = messageEl.querySelector('.message-content');
+  contentDiv.innerHTML = marked.parse(content);
+  
+  // Highlight code blocks
+  contentDiv.querySelectorAll('pre code').forEach((block) => {
+    hljs.highlightElement(block);
+  });
+  
+  if (scroll) scrollToBottom(false);
+}
+
+/**
+ * Typing indicator functions (Adapted to index.html structure)
+ */
+function showTypingIndicator(message = 'Thinking...') {
+  typingText.textContent = message;
+  typingIndicator.classList.remove("hidden"); // Use 'hidden' from Tailwind
+  scrollToBottom(true);
+}
+
+function updateTypingIndicator(message) {
+  typingText.textContent = message;
+}
+
+function hideTypingIndicator() {
+  typingIndicator.classList.add("hidden"); // Use 'hidden' from Tailwind
+}
+
+/**
+ * Input control functions
+ */
+function disableInput() {
+  userInput.disabled = true;
+  sendButton.disabled = true;
+}
+
+function enableInput() {
+  userInput.disabled = false;
+  sendButton.disabled = false;
+  userInput.focus();
+}
+
+/**
+ * Scroll to bottom enhancement
+ * @param {boolean} smooth - Use smooth scrolling
+ */
+function scrollToBottom(smooth = false) {
+  if (chatContainer) {
+    chatContainer.scrollTo({
+      top: chatContainer.scrollHeight,
+      behavior: smooth ? 'smooth' : 'auto'
+    });
+  }
+}
+
+/**
+ * Toast notification (Adapted to index.html structure/styles.css)
+ */
+function addToast(message, type = 'info') {
+  const toastContainer = document.querySelector('body');
+  const baseClasses = 'fixed bottom-5 right-5 p-3 rounded-lg shadow-xl z-50 transition-all duration-300';
+  
+  let colorClasses;
+  switch(type) {
+    case 'error':
+      colorClasses = 'bg-red-600';
+      break;
+    case 'success':
+      colorClasses = 'bg-teal-600';
+      break;
+    default:
+      colorClasses = 'bg-blue-600';
+  }
   
   const toast = document.createElement('div');
-  toast.className = `fixed bottom-20 right-4 ${colors[type]} text-white px-4 py-3 rounded-xl shadow-xl z-50 animate-slide-in text-sm`;
+  toast.className = `${baseClasses} ${colorClasses} opacity-0 translate-x-full text-white text-sm`;
   toast.textContent = message;
+  toastContainer.appendChild(toast);
   
-  document.body.appendChild(toast);
-  
+  // Animate in (using manual class manipulation to trigger transition)
   setTimeout(() => {
-    toast.classList.add('animate-slide-out');
+    toast.classList.remove('opacity-0');
+    toast.classList.remove('translate-x-full');
+  }, 10);
+
+  setTimeout(() => {
+    // Animate out
+    toast.classList.add('opacity-0');
+    toast.classList.add('translate-x-full');
     setTimeout(() => toast.remove(), 300);
   }, 3000);
 }
 
-// Helper: Message Element Creation (IMPROVED for responsiveness)
 /**
- * Creates the HTML structure for a single chat message.
- * @param {string} role - 'user' or 'agent'
- * @param {string} content - The message content (will be parsed as Markdown)
- * @param {Object[]} [files=[]] - Array of file objects for the user message
+ * Clear chat history
  */
-function createMessageElement(role, content, files = []) {
-  const container = document.createElement('div');
-  container.className = `message-container w-full py-4 px-4 md:px-6 transition-colors duration-300 
-    ${role === 'user' ? 'bg-[#2a2a2a] border-b border-gray-800' : 'bg-[#1e1e1e] border-b border-gray-800'}`;
-
-  // Content wrapper: max-w-4xl for readability, centered
-  const wrapper = document.createElement('div');
-  
-  // CRITICAL CHANGE: Agent response uses flex-col for avatar-on-top layout
-  const flexClass = role === 'agent' ? 'flex-col' : 'items-start gap-4';
-  wrapper.className = `max-w-4xl mx-auto flex ${flexClass}`;
-
-  // AVATAR/ICON AREA
-  const avatarWrapper = document.createElement('div');
-  
-  if (role === 'agent') {
-    avatarWrapper.className = 'flex items-center space-x-3 mb-2';
-    avatarWrapper.innerHTML = `
-      <div class="w-8 h-8 flex-shrink-0 bg-teal-600 rounded-full flex items-center justify-center text-white">
-        <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
-            <path stroke-linecap="round" stroke-linejoin="round" d="M9.663 17h4.673M12 3v13m-3-8h6m-3 4h.01" />
-        </svg>
-      </div>
-      <span class="font-bold text-teal-400">Orion</span>
-    `;
-  } else {
-    avatarWrapper.className = 'w-8 h-8 flex-shrink-0 bg-white rounded-full flex items-center justify-center text-gray-900 font-bold text-sm mt-1';
-    avatarWrapper.textContent = 'Y'; // Placeholder for 'You'
-  }
-  
-  // CONTENT AREA
-  const contentWrapper = document.createElement('div');
-  // For agent, content is full width. For user, it takes remaining space.
-  contentWrapper.className = `message-content ${role === 'agent' ? 'w-full' : 'flex-1'} min-w-0`; 
-  
-  // Assemble the message
-  wrapper.appendChild(avatarWrapper);
-  
-  // Render Markdown content (Initial load or stream placeholder)
-  const htmlContent = marked.parse(content);
-  contentWrapper.innerHTML = htmlContent;
-
-  if (role === 'user') {
-      // Add files below content for user message
-      if (files.length > 0) {
-          const filesDiv = document.createElement('div');
-          filesDiv.className = 'mt-3 pt-3 border-t border-gray-700/50 flex flex-wrap gap-2';
-          files.forEach(file => {
-              filesDiv.innerHTML += `<span class="bg-teal-800/20 text-teal-300 px-3 py-1 rounded-full text-xs flex items-center gap-1">
-                  <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M15.172 7l-6.586 6.586a2 2 0 01-2.828 0 2 2 0 010-2.828l6.586-6.586m5.656 5.656l-6.586 6.586a2 2 0 01-2.828 0 2 2 0 010-2.828l6.586-6.586m-2.828-2.828l.707-.707A1 1 0 0017 4a1 1 0 00-1-1v1a1 1 0 01-1 1h1a1 1 0 00.707.293z" /></svg>
-                  ${file.name}
-              </span>`;
-          });
-          contentWrapper.appendChild(filesDiv);
-      }
-      wrapper.appendChild(contentWrapper);
-  } else {
-      // For agent message, avatar is already first in flex-col, content second
-      wrapper.appendChild(contentWrapper);
-  }
-
-  container.appendChild(wrapper);
-  return container;
-}
-
-// Function to inject a message into the UI
-function appendMessage(element) {
-  welcomeMessage.style.display = 'none';
-  messagesWrapper.appendChild(element);
-  scrollToBottom();
-}
-
-// Function to generate the user's message
-function generateUserMessage(prompt) {
-    // Create a copy of pendingFiles for the message element before clearing global state
-    const filesSnapshot = [...pendingFiles]; 
-    const userMessage = createMessageElement('user', prompt, filesSnapshot);
-    appendMessage(userMessage);
-
-    // Clear pending files and preview after sending
-    pendingFiles = [];
-    filePreview.innerHTML = '';
-}
-
-// Function to start the agent's response
-function startAgentResponse() {
-    typingIndicator.style.display = 'flex';
-    currentMessageElement = createMessageElement('agent', '', []); 
-    appendMessage(currentMessageElement);
-    scrollToBottom();
-}
-
-// Function to stream content (Mock implementation)
-function streamAgentContent(chunk) {
-    if (currentMessageElement) {
-        const contentDiv = currentMessageElement.querySelector('.message-content');
-        // Simple append for streaming mock
-        contentDiv.textContent += chunk; 
-        scrollToBottom();
-    }
-}
-
-// Function to finish response
-function finishAgentResponse() {
-    typingIndicator.style.display = 'none';
-    if (currentMessageElement) {
-        const contentDiv = currentMessageElement.querySelector('.message-content');
-        const rawContent = contentDiv.textContent; 
-        contentDiv.innerHTML = marked.parse(rawContent); // Final render
-        addSuggestions(currentMessageElement);
-        hljs.highlightAll(); // Highlight code blocks
-    }
-    isProcessing = false;
-    currentMessageElement = null;
-    scrollToBottom();
-}
-
-// Mock function for adding suggestions
-function addSuggestions(messageElement) {
-  const suggestions = [
-    "What are the best practices for Tailwind CSS?",
-    "Explain the event loop in JavaScript.",
-    "Draft a short email to my manager."
-  ];
-
-  const suggestionArea = document.createElement('div');
-  suggestionArea.className = 'mt-4 pt-4 border-t border-gray-700/50';
-  suggestionArea.innerHTML = '<p class="text-sm font-semibold mb-2 text-gray-400">Suggestions:</p>';
-  
-  const tags = document.createElement('div');
-  tags.className = 'flex flex-wrap gap-2';
-
-  suggestions.forEach(text => {
-    const tag = document.createElement('button');
-    tag.type = 'button';
-    tag.className = 'use-suggestion bg-gray-700/50 text-white text-sm px-3 py-1.5 rounded-full hover:bg-gray-700 transition-colors';
-    tag.textContent = text;
-    tag.onclick = () => useSuggestion(tag); 
-    tags.appendChild(tag);
-  });
-
-  suggestionArea.appendChild(tags);
-  // Find the message wrapper inside the container and append suggestions to it
-  messageElement.querySelector('.max-w-4xl').appendChild(suggestionArea);
-}
-
-
-// Use Suggestion
-function useSuggestion(element) {
-  const text = element.textContent;
-  chatInput.value = text;
-  // Auto-resize the textarea
-  chatInput.style.height = 'auto';
-  chatInput.style.height = chatInput.scrollHeight + 'px';
-  chatInput.focus();
-}
-
-
-// File Handling
-function handleFileSelect(e) {
-  const files = Array.from(e.target.files);
-  pendingFiles = files.map(file => ({
-    name: file.name,
-    type: file.type,
-    size: file.size,
-    data: null // In a real app, you'd convert to Base64 here
-  }));
-  renderFilePreview();
-  e.target.value = ''; // Clear file input
-}
-
-function renderFilePreview() {
-  filePreview.innerHTML = '';
-  pendingFiles.forEach((file, index) => {
-    const fileTag = document.createElement('span');
-    fileTag.className = 'bg-gray-700 text-white px-3 py-1 rounded-full text-sm flex items-center gap-2';
-    fileTag.innerHTML = `
-      <svg class="w-4 h-4 text-teal-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
-          <path stroke-linecap="round" stroke-linejoin="round" d="M15.172 7l-6.586 6.586a2 2 0 01-2.828 0 2 2 0 010-2.828l6.586-6.586m5.656 5.656l-6.586 6.586a2 2 0 01-2.828 0 2 2 0 010-2.828l6.586-6.586m-2.828-2.828l.707-.707A1 1 0 0017 4a1 1 0 00-1-1v1a1 1 0 01-1 1h1a1 1 0 00.707.293z" />
-      </svg>
-      ${file.name}
-      <button type="button" class="ml-1 text-gray-400 hover:text-white" onclick="removeFile(${index})">
-        <svg class="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
-      </button>
-    `;
-    filePreview.appendChild(fileTag);
-  });
-}
-
-function removeFile(index) {
-  pendingFiles.splice(index, 1);
-  renderFilePreview();
-}
-
-
-// Clear Chat (Updated to use Toast instead of confirm)
 async function clearChat() {
-  showToast('Starting a new chat...', 'info');
+  if (!confirm('Start a new chat? This will clear the current conversation.')) {
+    return;
+  }
+
   try {
-    // Mock API call to clear conversation history
-    const response = await fetch('/api/clear', { method: 'POST' }); 
+    const response = await fetch('/api/clear', { method: 'POST' });
     if (response.ok) {
-      messagesWrapper.innerHTML = '';
+      chatMessages.innerHTML = '';
       pendingFiles = [];
-      filePreview.innerHTML = '';
+      filePreview.innerHTML = ''; // Clear file chips
+      updateFilePreview();
       conversationStarted = false;
-      welcomeMessage.style.display = 'flex'; // Show welcome message again
       
-      showToast('New chat started. Conversation cleared.', 'success');
+      // The original HTML welcome message is simpler, we will use it directly.
+      const welcomeHTML = `
+        <div id="welcome-message" class="text-center py-20 px-4">
+            <div class="inline-block bg-gradient-to-br from-teal-500 to-blue-600 rounded-full p-3 mb-6 shadow-lg">
+                <svg class="w-10 h-10 text-white" xmlns="http://www.w3.org/2000/svg" 
+                    fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09z" />
+                </svg>
+            </div>
+            <h2 class="text-3xl md:text-4xl font-bold text-white mb-4">How can I help you today?</h2>
+            <p class="text-gray-400 mb-8">I can search the web, execute code, analyze files, and help with complex tasks</p>
+            
+            <div class="flex flex-wrap gap-2 justify-center max-w-2xl mx-auto">
+                <button onclick="useSuggestion(this)" class="px-4 py-2 bg-white/5 hover:bg-white/10 rounded-full text-sm transition-colors">
+                    What's Bitcoin's price? 💰
+                </button>
+                <button onclick="useSuggestion(this)" class="px-4 py-2 bg-white/5 hover:bg-white/10 rounded-full text-sm transition-colors">
+                    Analyze this dataset 📊
+                </button>
+                <button onclick="useSuggestion(this)" class="px-4 py-2 bg-white/5 hover:bg-white/10 rounded-full text-sm transition-colors">
+                    Write Python code 💻
+                </button>
+                <button onclick="useSuggestion(this)" class="px-4 py-2 bg-white/5 hover:bg-white/10 rounded-full text-sm transition-colors">
+                    Latest AI news 🔍
+                </button>
+            </div>
+        </div>
+      `;
+      
+      chatMessages.innerHTML = welcomeHTML;
+      
+      addToast('Chat cleared successfully', 'success');
     }
   } catch (error) {
     console.error('Error clearing chat:', error);
-    showToast('Failed to clear chat', 'error');
+    addToast('Failed to clear chat', 'error');
   }
 }
 
-
-// Core Logic: Send Message
-async function handleFormSubmit(e) {
-  e.preventDefault();
-  const prompt = chatInput.value.trim();
-
-  if (!prompt && pendingFiles.length === 0) return;
-  if (isProcessing) return;
-
-  isProcessing = true;
-  chatInput.value = '';
-  chatInput.style.height = 'auto'; // Reset textarea size
-
-  // 1. Generate User Message UI
-  generateUserMessage(prompt);
-  
-  // 2. Start Agent Response UI
-  startAgentResponse();
-  
-  // 3. Mock the Agent's Response (Replace with actual WebSocket/API call)
-  const mockResponse = `Hello there! I see you asked about: **${prompt || 'a file upload'}**
-    
-As a large language model, I can now respond to your query.
-    
-Here is a sample code block:
-    
-\`\`\`javascript
-function calculateSum(a, b) {
-  return a + b; // Always returns the sum
-}
-\`\`\`
-    
-* I've updated the layout for better mobile responsiveness.
-* The header and input area are now fixed.
-* My avatar is placed above the response for improved readability on small screens.
-    
-How else can I assist you today?`;
-
-  const words = mockResponse.split(' ');
-  let charIndex = 0;
-
-  const typeChunk = () => {
-    if (charIndex < mockResponse.length) {
-      const chunk = mockResponse.substring(charIndex, charIndex + 5); // Stream 5 characters at a time
-      streamAgentContent(chunk);
-      charIndex += 5;
-      setTimeout(typeChunk, 15); // Adjust typing speed here
-    } else {
-      finishAgentResponse();
-    }
-  };
-
-  typeChunk();
+/**
+ * Use a suggestion chip (exposed globally as it's in the HTML)
+ */
+window.useSuggestion = function(element) {
+  const text = element.textContent.trim().replace(/[\d\w\s]+?(\s*?[\uD800-\uDBFF\uDC00-\uDFFF\u2600-\u27BF\u1F600-\u1F64F\u1F300-\u1F5FF\u1F680-\u1F6FF\u1F900-\u1F9FF\u200D])/g, '').trim();
+  userInput.value = text;
+  userInput.style.height = "auto";
+  userInput.style.height = Math.min(userInput.scrollHeight, 200) + "px";
+  userInput.focus();
 }
 
-
-// Sidebar & Tools UI Handlers
-function toggleSidebar() {
-  const isHidden = sidebar.classList.contains('-translate-x-full');
-  sidebar.classList.toggle('-translate-x-full', !isHidden);
-  overlay.classList.toggle('hidden', !isHidden);
-}
-
-function toggleToolsPopup() {
-    const isHidden = toolsPopup.classList.contains('opacity-0');
-    if (isHidden) {
-        toolsPopup.classList.remove('opacity-0', 'translate-y-2', 'pointer-events-none');
-    } else {
-        toolsPopup.classList.add('opacity-0', 'translate-y-2', 'pointer-events-none');
-    }
-}
-
-// Textarea Auto-Resize
-function autoResizeTextarea() {
-  this.style.height = 'auto';
-  this.style.height = this.scrollHeight + 'px';
-}
-
-
-// Event Listeners
-document.addEventListener('DOMContentLoaded', () => {
-    // Initial welcome message check
-    if (messagesWrapper.children.length === 0) {
-        welcomeMessage.style.display = 'flex';
-    }
-
-    // Attach form submit handler
-    chatForm.addEventListener('submit', handleFormSubmit);
-
-    // Attach tools button handler
-    toolsBtn.addEventListener('click', toggleToolsPopup);
-
-    // Attach file button handler
-    attachFileButton.addEventListener('click', () => {
-        fileInput.click();
-        toggleToolsPopup(); // Close popup after clicking
-    });
-
-    // Attach file input handler
-    fileInput.addEventListener('change', handleFileSelect);
-
-    // Textarea resize handler
-    chatInput.addEventListener('input', autoResizeTextarea);
-
-    // Sidebar handlers
-    menuBtn.addEventListener('click', toggleSidebar);
-    overlay.addEventListener('click', toggleSidebar);
-
-    // Close tools popup when clicking outside (simple approach)
-    document.addEventListener('click', (e) => {
-        if (!toolsPopup.contains(e.target) && !toolsBtn.contains(e.target)) {
-            toolsPopup.classList.add('opacity-0', 'translate-y-2', 'pointer-events-none');
-        }
-    });
-});
-
-// Expose functions globally for HTML calls (e.g., clearChat, removeFile)
+/**
+ * Clear chat (exposed globally as it's in the HTML)
+ */
 window.clearChat = clearChat;
-window.removeFile = removeFile;
-window.useSuggestion = useSuggestion;
 
+
+/**
+ * Escape HTML
+ */
+function escapeHtml(text) {
+  const div = document.createElement('div');
+  div.textContent = text;
+  return div.innerHTML;
+}
+
+// NOTE: The Tailwind CSS utility classes handle all the required styling (including animations
+// like 'animate-bounce' and 'transition-colors'), so we don't need to manually inject a 
+// <style> tag for the toast animations as in the original chat.js.

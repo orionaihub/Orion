@@ -1,131 +1,1018 @@
-<!DOCTYPE html>
-<html lang="en" class="h-full">
+<!doctype html>
+<html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <title>Orion Chat</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Suna-Lite - Autonomous AI Agent</title>
+    
+    <!-- Marked.js for Markdown rendering -->
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <!-- Highlight.js for code syntax highlighting -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    
+    <style>
+        :root {
+            --primary: #667eea;
+            --primary-dark: #5a67d8;
+            --secondary: #764ba2;
+            --bg-main: #ffffff;
+            --bg-secondary: #f8f9fa;
+            --bg-sidebar: #1a1a2e;
+            --text-primary: #1f2937;
+            --text-secondary: #6b7280;
+            --text-light: #9ca3af;
+            --border: #e5e7eb;
+            --user-msg: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            --assistant-msg: #ffffff;
+            --shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            --shadow-lg: 0 10px 25px rgba(0, 0, 0, 0.15);
+        }
 
-  <!-- Tailwind -->
-  <script src="https://cdn.tailwindcss.com"></script>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
 
-  <!-- Highlight.js -->
-  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css" />
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            line-height: 1.6;
+            color: var(--text-primary);
+            background: var(--bg-secondary);
+            height: 100vh;
+            overflow: hidden;
+        }
 
-  <!-- Marked -->
-  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+        /* Layout */
+        .app-container {
+            display: flex;
+            height: 100vh;
+            position: relative;
+        }
 
-  <!-- Fixed script -->
-  <script src="orion-chat.js" defer></script>
+        /* Sidebar */
+        .sidebar {
+            width: 280px;
+            background: var(--bg-sidebar);
+            color: white;
+            display: flex;
+            flex-direction: column;
+            position: fixed;
+            left: 0;
+            top: 0;
+            bottom: 0;
+            z-index: 1000;
+            transform: translateX(0);
+            transition: transform 0.3s ease;
+        }
+
+        .sidebar.hidden {
+            transform: translateX(-100%);
+        }
+
+        .sidebar-header {
+            padding: 1.5rem;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .sidebar-header h2 {
+            font-size: 1.25rem;
+            margin-bottom: 0.5rem;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .sidebar-subtitle {
+            font-size: 0.8rem;
+            color: var(--text-light);
+        }
+
+        .sidebar-content {
+            flex: 1;
+            overflow-y: auto;
+            padding: 1rem;
+        }
+
+        .sidebar-section {
+            margin-bottom: 2rem;
+        }
+
+        .sidebar-section h3 {
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--text-light);
+            margin-bottom: 0.75rem;
+        }
+
+        .capability-list {
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+        }
+
+        .capability-item {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            padding: 0.75rem;
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 8px;
+            font-size: 0.85rem;
+        }
+
+        .capability-icon {
+            font-size: 1.2rem;
+        }
+
+        .new-chat-btn {
+            width: 100%;
+            padding: 0.75rem;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: 600;
+            margin-bottom: 1rem;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+
+        .new-chat-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+        }
+
+        .history-list {
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+        }
+
+        .history-item {
+            padding: 0.75rem;
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 6px;
+            font-size: 0.85rem;
+            cursor: pointer;
+            transition: background 0.2s;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .history-item:hover {
+            background: rgba(255, 255, 255, 0.1);
+        }
+
+        /* Main Content */
+        .main-content {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            margin-left: 280px;
+            transition: margin-left 0.3s ease;
+        }
+
+        .main-content.expanded {
+            margin-left: 0;
+        }
+
+        /* Header */
+        .header {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+            padding: 1rem 1.5rem;
+            background: var(--bg-main);
+            border-bottom: 1px solid var(--border);
+            box-shadow: var(--shadow);
+        }
+
+        .hamburger {
+            display: none;
+            flex-direction: column;
+            gap: 4px;
+            cursor: pointer;
+            padding: 0.5rem;
+        }
+
+        .hamburger span {
+            width: 24px;
+            height: 2px;
+            background: var(--text-primary);
+            transition: all 0.3s;
+        }
+
+        .header-title {
+            flex: 1;
+        }
+
+        .header-title h1 {
+            font-size: 1.25rem;
+            font-weight: 600;
+        }
+
+        .header-actions {
+            display: flex;
+            gap: 0.5rem;
+        }
+
+        .icon-btn {
+            padding: 0.5rem;
+            background: var(--bg-secondary);
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 1.2rem;
+            transition: background 0.2s;
+        }
+
+        .icon-btn:hover {
+            background: var(--border);
+        }
+
+        /* Chat Area */
+        .chat-area {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        .chat-messages {
+            flex: 1;
+            overflow-y: auto;
+            padding: 2rem;
+            background: var(--bg-secondary);
+        }
+
+        .chat-messages::-webkit-scrollbar {
+            width: 8px;
+        }
+
+        .chat-messages::-webkit-scrollbar-track {
+            background: transparent;
+        }
+
+        .chat-messages::-webkit-scrollbar-thumb {
+            background: var(--border);
+            border-radius: 4px;
+        }
+
+        .chat-messages::-webkit-scrollbar-thumb:hover {
+            background: var(--text-secondary);
+        }
+
+        /* Welcome Screen */
+        .welcome-screen {
+            max-width: 1000px;
+            margin: 0 auto;
+            padding: 4rem 2rem;
+            text-align: center;
+            animation: fadeIn 0.6s ease;
+            min-height: 600px;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+        }
+
+        @keyframes fadeIn {
+            from {
+                opacity: 0;
+                transform: translateY(30px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .welcome-screen.hidden {
+            display: none;
+        }
+
+        .welcome-icon {
+            font-size: 5rem;
+            margin-bottom: 2rem;
+            animation: bounce 2s infinite;
+        }
+
+        @keyframes bounce {
+            0%, 100% {
+                transform: translateY(0);
+            }
+            50% {
+                transform: translateY(-10px);
+            }
+        }
+
+        .welcome-screen h2 {
+            font-size: 2.5rem;
+            margin-bottom: 1rem;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            font-weight: 700;
+        }
+
+        .welcome-screen p {
+            color: var(--text-secondary);
+            font-size: 1.2rem;
+            margin-bottom: 3rem;
+            max-width: 600px;
+            margin-left: auto;
+            margin-right: auto;
+        }
+
+        .welcome-features {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 1.5rem;
+            text-align: left;
+            margin-top: 2rem;
+            max-width: 900px;
+            margin-left: auto;
+            margin-right: auto;
+        }
+
+        .welcome-feature {
+            padding: 2rem;
+            background: var(--bg-main);
+            border-radius: 16px;
+            box-shadow: var(--shadow);
+            transition: transform 0.3s ease, box-shadow 0.3s ease;
+            border: 1px solid var(--border);
+        }
+
+        .welcome-feature:hover {
+            transform: translateY(-5px);
+            box-shadow: var(--shadow-lg);
+        }
+
+        .welcome-feature-icon {
+            font-size: 2.5rem;
+            margin-bottom: 1rem;
+            display: block;
+        }
+
+        .welcome-feature h3 {
+            font-size: 1.1rem;
+            margin-bottom: 0.5rem;
+            color: var(--text-primary);
+            font-weight: 600;
+        }
+
+        .welcome-feature p {
+            font-size: 0.9rem;
+            color: var(--text-secondary);
+            margin: 0;
+            line-height: 1.5;
+        }
+
+        .welcome-cta {
+            margin-top: 3rem;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 1rem;
+        }
+
+        .welcome-cta-text {
+            font-size: 1rem;
+            color: var(--text-light);
+            font-style: italic;
+        }
+
+        .welcome-suggestions {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.75rem;
+            justify-content: center;
+            margin-top: 2rem;
+        }
+
+        .suggestion-chip {
+            padding: 0.75rem 1.25rem;
+            background: linear-gradient(135deg, rgba(102, 126, 234, 0.1) 0%, rgba(118, 75, 162, 0.1) 100%);
+            border: 1px solid rgba(102, 126, 234, 0.3);
+            border-radius: 24px;
+            cursor: pointer;
+            font-size: 0.9rem;
+            transition: all 0.3s ease;
+            color: var(--text-primary);
+        }
+
+        .suggestion-chip:hover {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            transform: scale(1.05);
+            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.3);
+        }
+
+        /* Messages */
+        .message-wrapper {
+            max-width: 900px;
+            margin: 0 auto 1.5rem auto;
+            animation: slideUp 0.3s ease;
+        }
+
+        @keyframes slideUp {
+            from {
+                opacity: 0;
+                transform: translateY(10px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .message {
+            padding: 1.25rem;
+            border-radius: 12px;
+            box-shadow: var(--shadow);
+        }
+
+        .message-header {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            margin-bottom: 0.75rem;
+        }
+
+        .message-avatar {
+            width: 32px;
+            height: 32px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.2rem;
+        }
+
+        .message-sender {
+            font-weight: 600;
+            font-size: 0.9rem;
+        }
+
+        .user-message {
+            background: var(--user-msg);
+            color: white;
+            margin-left: auto;
+            max-width: 85%;
+        }
+
+        .user-message .message-avatar {
+            background: rgba(255, 255, 255, 0.2);
+        }
+
+        .assistant-message {
+            background: var(--assistant-msg);
+            max-width: 100%;
+        }
+
+        .assistant-message .message-avatar {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        }
+
+        /* Markdown Content Styling */
+        .message-content {
+            line-height: 1.7;
+        }
+
+        .message-content h1, 
+        .message-content h2, 
+        .message-content h3 {
+            margin-top: 1.5rem;
+            margin-bottom: 0.75rem;
+        }
+
+        .message-content h1 { font-size: 1.75rem; }
+        .message-content h2 { font-size: 1.5rem; }
+        .message-content h3 { font-size: 1.25rem; }
+
+        .message-content p {
+            margin-bottom: 1rem;
+        }
+
+        .message-content ul, 
+        .message-content ol {
+            margin-left: 1.5rem;
+            margin-bottom: 1rem;
+        }
+
+        .message-content li {
+            margin-bottom: 0.5rem;
+        }
+
+        .message-content code {
+            background: rgba(0, 0, 0, 0.05);
+            padding: 0.2rem 0.4rem;
+            border-radius: 4px;
+            font-family: 'Monaco', 'Courier New', monospace;
+            font-size: 0.9em;
+        }
+
+        .user-message .message-content code {
+            background: rgba(255, 255, 255, 0.2);
+        }
+
+        .message-content pre {
+            background: #1e1e1e;
+            padding: 1rem;
+            border-radius: 8px;
+            overflow-x: auto;
+            margin-bottom: 1rem;
+        }
+
+        .message-content pre code {
+            background: none;
+            padding: 0;
+            color: #d4d4d4;
+            font-size: 0.85rem;
+        }
+
+        .message-content blockquote {
+            border-left: 4px solid var(--primary);
+            padding-left: 1rem;
+            margin: 1rem 0;
+            color: var(--text-secondary);
+            font-style: italic;
+        }
+
+        .message-content table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-bottom: 1rem;
+        }
+
+        .message-content th,
+        .message-content td {
+            padding: 0.75rem;
+            border: 1px solid var(--border);
+            text-align: left;
+        }
+
+        .message-content th {
+            background: var(--bg-secondary);
+            font-weight: 600;
+        }
+
+        .message-content a {
+            color: var(--primary);
+            text-decoration: none;
+        }
+
+        .message-content a:hover {
+            text-decoration: underline;
+        }
+
+        /* Tool Usage */
+        .tool-use-indicator {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.5rem 0.75rem;
+            background: rgba(102, 126, 234, 0.1);
+            border-radius: 6px;
+            font-size: 0.85rem;
+            margin-bottom: 0.75rem;
+        }
+
+        /* Typing Indicator */
+        .typing-indicator {
+            display: none;
+            max-width: 900px;
+            margin: 0 auto 1.5rem auto;
+            padding: 1rem;
+            background: var(--bg-main);
+            border-radius: 12px;
+            box-shadow: var(--shadow);
+        }
+
+        .typing-indicator.visible {
+            display: block;
+        }
+
+        .typing-dots {
+            display: flex;
+            gap: 0.5rem;
+            align-items: center;
+        }
+
+        .typing-dots span {
+            width: 8px;
+            height: 8px;
+            background: var(--primary);
+            border-radius: 50%;
+            animation: typing 1.4s infinite;
+        }
+
+        .typing-dots span:nth-child(2) {
+            animation-delay: 0.2s;
+        }
+
+        .typing-dots span:nth-child(3) {
+            animation-delay: 0.4s;
+        }
+
+        @keyframes typing {
+            0%, 60%, 100% {
+                transform: translateY(0);
+                opacity: 0.7;
+            }
+            30% {
+                transform: translateY(-10px);
+                opacity: 1;
+            }
+        }
+
+        /* File Upload Area */
+        .file-upload-area {
+            background: var(--bg-main);
+            border-bottom: 1px solid var(--border);
+            padding: 1rem 1.5rem;
+            display: none;
+        }
+
+        .file-upload-area.has-files {
+            display: block;
+        }
+
+        .uploaded-files {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.5rem;
+        }
+
+        .file-chip {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.5rem 0.75rem;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            font-size: 0.85rem;
+        }
+
+        .file-chip-icon {
+            font-size: 1.2rem;
+        }
+
+        .file-chip-remove {
+            cursor: pointer;
+            color: #ef4444;
+            font-weight: bold;
+            margin-left: 0.5rem;
+        }
+
+        /* Input Area */
+        .input-area {
+            background: var(--bg-main);
+            border-top: 1px solid var(--border);
+            padding: 1rem 1.5rem;
+            box-shadow: 0 -4px 12px rgba(0, 0, 0, 0.05);
+            position: relative;
+            z-index: 10;
+        }
+
+        .input-wrapper {
+            max-width: 900px;
+            margin: 0 auto;
+            display: flex;
+            gap: 0.75rem;
+            align-items: flex-end;
+        }
+
+        .input-actions {
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+        }
+
+        .attach-btn {
+            padding: 0.75rem;
+            background: var(--bg-secondary);
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 1.2rem;
+            transition: all 0.2s;
+        }
+
+        .attach-btn:hover {
+            background: var(--border);
+            transform: scale(1.05);
+        }
+
+        #user-input {
+            flex: 1;
+            padding: 0.875rem 1rem;
+            border: 2px solid var(--border);
+            border-radius: 12px;
+            font-family: inherit;
+            font-size: 0.95rem;
+            resize: none;
+            min-height: 50px;
+            max-height: 200px;
+            transition: border-color 0.2s, box-shadow 0.2s;
+        }
+
+        #user-input:focus {
+            outline: none;
+            border-color: var(--primary);
+            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+        }
+
+        #send-button {
+            padding: 0.875rem 1.5rem;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 12px;
+            cursor: pointer;
+            font-weight: 600;
+            transition: transform 0.2s, box-shadow 0.2s;
+            min-width: 100px;
+            font-size: 0.95rem;
+        }
+
+        #send-button:hover:not(:disabled) {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(102, 126, 234, 0.4);
+        }
+
+        #send-button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        #file-input {
+            display: none;
+        }
+
+        /* Mobile Responsive */
+        @media (max-width: 768px) {
+            .sidebar {
+                transform: translateX(-100%);
+            }
+
+            .sidebar.visible {
+                transform: translateX(0);
+            }
+
+            .main-content {
+                margin-left: 0;
+            }
+
+            .hamburger {
+                display: flex;
+            }
+
+            .chat-messages {
+                padding: 1rem;
+            }
+
+            .message-wrapper {
+                margin-bottom: 1rem;
+            }
+
+            .user-message {
+                max-width: 90%;
+            }
+
+            .input-area {
+                padding: 0.75rem;
+            }
+
+            .welcome-features {
+                grid-template-columns: 1fr;
+            }
+
+            .welcome-screen {
+                padding: 2rem 1rem;
+                min-height: 500px;
+            }
+
+            .welcome-icon {
+                font-size: 3.5rem;
+            }
+
+            .welcome-screen h2 {
+                font-size: 1.75rem;
+            }
+
+            .welcome-screen p {
+                font-size: 1rem;
+            }
+        }
+
+        /* Overlay for mobile sidebar */
+        .sidebar-overlay {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.5);
+            z-index: 999;
+        }
+
+        .sidebar-overlay.visible {
+            display: block;
+        }
+    </style>
 </head>
+<body>
+    <div class="app-container">
+        <!-- Sidebar Overlay (mobile) -->
+        <div class="sidebar-overlay" id="sidebar-overlay" onclick="toggleSidebar()"></div>
 
-<body class="h-full bg-gray-900 text-gray-100 flex flex-col md:flex-row">
-  <!-- ========= SIDEBAR (unchanged) ========= -->
-  <aside id="sidebar" class="w-64 bg-gray-800/50 backdrop-blur border-r border-white/10 flex flex-col shrink-0 transition-transform md:translate-x-0 -translate-x-full fixed md:relative z-30 h-full">
-    <div class="p-4 border-b border-white/10 flex items-center justify-between">
-      <h1 class="text-lg font-bold">Orion</h1>
-      <button id="menu-btn" class="md:hidden text-gray-300 hover:text-white">
-        <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg>
-      </button>
+        <!-- Sidebar -->
+        <aside class="sidebar" id="sidebar">
+            <div class="sidebar-header">
+                <h2>🤖 Suna-Lite</h2>
+                <p class="sidebar-subtitle">Autonomous AI Agent</p>
+            </div>
+            
+            <div class="sidebar-content">
+                <button class="new-chat-btn" onclick="clearChat()">
+                    ✨ New Chat
+                </button>
+
+                <div class="sidebar-section">
+                    <h3>Capabilities</h3>
+                    <div class="capability-list" id="capabilities">
+                        <div class="capability-item">
+                            <span class="capability-icon">🔍</span>
+                            <span>Web Search</span>
+                        </div>
+                        <div class="capability-item">
+                            <span class="capability-icon">💻</span>
+                            <span>Code Execution</span>
+                        </div>
+                        <div class="capability-item">
+                            <span class="capability-icon">📄</span>
+                            <span>File Analysis</span>
+                        </div>
+                        <div class="capability-item">
+                            <span class="capability-icon">👁️</span>
+                            <span>Vision</span>
+                        </div>
+                        <div class="capability-item">
+                            <span class="capability-icon">📊</span>
+                            <span>Data Analysis</span>
+                        </div>
+                        <div class="capability-item">
+                            <span class="capability-icon">🔄</span>
+                            <span>Multi-Step Tasks</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- History section (placeholder) -->
+                <!--
+                <div class="sidebar-section">
+                    <h3>Recent Chats</h3>
+                    <div class="history-list" id="history-list">
+                        <div class="history-item">Previous conversation...</div>
+                    </div>
+                </div>
+                -->
+            </div>
+        </aside>
+
+        <!-- Main Content -->
+        <main class="main-content" id="main-content">
+            <!-- Header -->
+            <header class="header">
+                <div class="hamburger" id="hamburger" onclick="toggleSidebar()">
+                    <span></span>
+                    <span></span>
+                    <span></span>
+                </div>
+                <div class="header-title">
+                    <h1>Suna-Lite Agent</h1>
+                </div>
+                <div class="header-actions">
+                    <button class="icon-btn" onclick="clearChat()" title="New Chat">
+                        ✨
+                    </button>
+                </div>
+            </header>
+
+            <!-- Chat Area -->
+            <div class="chat-area">
+                <!-- File Upload Area -->
+                <div class="file-upload-area" id="file-upload-area">
+                    <div class="uploaded-files" id="uploaded-files"></div>
+                </div>
+
+                <!-- Messages -->
+                <div class="chat-messages" id="chat-messages">
+                    <!-- Welcome Screen -->
+                    <div class="welcome-screen" id="welcome-screen">
+                        <div class="welcome-icon">🤖</div>
+                        <h2>Welcome to Suna-Lite</h2>
+                        <p>Your autonomous AI assistant powered by Gemini 2.5 Flash with advanced multi-step reasoning and tool execution capabilities</p>
+                        
+                        <div class="welcome-features">
+                            <div class="welcome-feature">
+                                <div class="welcome-feature-icon">🔍</div>
+                                <h3>Web Search</h3>
+                                <p>Access real-time information from the web to answer current questions and find the latest data</p>
+                            </div>
+                            <div class="welcome-feature">
+                                <div class="welcome-feature-icon">💻</div>
+                                <h3>Code Execution</h3>
+                                <p>Run Python code for complex calculations, data analysis, and algorithmic problem solving</p>
+                            </div>
+                            <div class="welcome-feature">
+                                <div class="welcome-feature-icon">📄</div>
+                                <h3>File Analysis</h3>
+                                <p>Process and analyze documents, spreadsheets, PDFs, images, and various data formats</p>
+                            </div>
+                            <div class="welcome-feature">
+                                <div class="welcome-feature-icon">🔄</div>
+                                <h3>Multi-Step Tasks</h3>
+                                <p>Autonomous planning and execution of complex tasks that require multiple steps and tools</p>
+                            </div>
+                            <div class="welcome-feature">
+                                <div class="welcome-feature-icon">👁️</div>
+                                <h3>Vision Analysis</h3>
+                                <p>Understand and analyze images, charts, diagrams, and visual content with AI vision</p>
+                            </div>
+                            <div class="welcome-feature">
+                                <div class="welcome-feature-icon">📊</div>
+                                <h3>Data Processing</h3>
+                                <p>Comprehensive data analysis, visualization, and insights from structured and unstructured data</p>
+                            </div>
+                        </div>
+
+                        <div class="welcome-cta">
+                            <p class="welcome-cta-text">✨ Try asking me something or choose a suggestion below:</p>
+                            <div class="welcome-suggestions">
+                                <div class="suggestion-chip" onclick="useSuggestion(this)">
+                                    What's the current Bitcoin price?
+                                </div>
+                                <div class="suggestion-chip" onclick="useSuggestion(this)">
+                                    Analyze this dataset for trends
+                                </div>
+                                <div class="suggestion-chip" onclick="useSuggestion(this)">
+                                    Calculate compound interest
+                                </div>
+                                <div class="suggestion-chip" onclick="useSuggestion(this)">
+                                    Search latest AI news
+                                </div>
+                                <div class="suggestion-chip" onclick="useSuggestion(this)">
+                                    Explain quantum computing
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Typing Indicator -->
+                <div class="typing-indicator" id="typing-indicator">
+                    <div class="typing-dots">
+                        <span></span>
+                        <span></span>
+                        <span></span>
+                        <span style="margin-left: 0.5rem;" id="typing-text">Thinking...</span>
+                    </div>
+                </div>
+
+                <!-- Input Area -->
+                <div class="input-area">
+                    <div class="input-wrapper">
+                        <input type="file" id="file-input" multiple 
+                               accept=".pdf,.doc,.docx,.txt,.csv,.xlsx,.xls,.json,.png,.jpg,.jpeg,.gif,.webp">
+                        <div class="input-actions">
+                            <button class="attach-btn" onclick="document.getElementById('file-input').click()" 
+                                    title="Attach files">
+                                📎
+                            </button>
+                        </div>
+                        <textarea
+                            id="user-input"
+                            placeholder="Ask me anything, upload files, or request multi-step analysis..."
+                            rows="1"
+                            autofocus
+                        ></textarea>
+                        <button id="send-button">Send</button>
+                    </div>
+                </div>
+            </div>
+        </main>
     </div>
 
-    <nav class="flex-1 px-4 py-4 space-y-2">
-      <button id="new-chat-btn" class="w-full flex items-center gap-2 px-3 py-2 rounded-lg bg-white/5 hover:bg-white/10 transition">
-        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/></svg>
-        New chat
-      </button>
-    </nav>
-
-    <div class="p-4 border-t border-white/10 text-xs text-gray-400 flex items-center gap-2">
-      <span id="status-indicator" class="w-2 h-2 rounded-full bg-gray-500"></span>
-      <span id="status-text">Disconnected</span>
-    </div>
-  </aside>
-
-  <!-- Mobile overlay -->
-  <div id="overlay" class="fixed inset-0 bg-black/60 z-20 hidden md:hidden"></div>
-
-  <!-- ========= MAIN CHAT AREA ========= -->
-  <main class="flex-1 flex flex-col h-full">
-    <!-- Messages viewport -->
-    <div id="chat-container" class="flex-1 overflow-y-auto custom-scrollbar">
-      <div id="messages-wrapper" class="max-w-5xl mx-auto pb-4 pt-6">
-        <!-- Welcome screen -->
-        <div id="welcome-message" class="text-center py-20 px-4">
-          <div class="inline-block bg-gradient-to-br from-teal-500 to-blue-600 rounded-full p-3 mb-6 shadow-lg">
-            <svg class="w-10 h-10 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
-              <path stroke-linecap="round" stroke-linejoin="round" d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09z"/>
-            </svg>
-          </div>
-          <h2 class="text-3xl md:text-4xl font-bold text-white mb-4">How can I help you today?</h2>
-          <p class="text-gray-400 mb-8">I can search the web, execute code, analyze files, and help with complex tasks</p>
-          <div class="flex flex-wrap gap-2 justify-center max-w-2xl mx-auto">
-            <button onclick="useSuggestion(this)" class="px-4 py-2 bg-white/5 hover:bg-white/10 rounded-full text-sm transition-colors">What's Bitcoin's price? 💰</button>
-            <button onclick="useSuggestion(this)" class="px-4 py-2 bg-white/5 hover:bg-white/10 rounded-full text-sm transition-colors">Analyze this dataset 📊</button>
-            <button onclick="useSuggestion(this)" class="px-4 py-2 bg-white/5 hover:bg-white/10 rounded-full text-sm transition-colors">Write Python code 💻</button>
-            <button onclick="useSuggestion(this)" class="px-4 py-2 bg-white/5 hover:bg-white/10 rounded-full text-sm transition-colors">Latest AI news 🔍</button>
-          </div>
-        </div>
-      </div>
-
-      <!-- Typing indicator -->
-      <div id="typing-indicator" class="hidden p-4 md:p-6">
-        <div class="max-w-5xl mx-auto flex items-center gap-4">
-          <div class="w-8 h-8 rounded-full bg-teal-600 flex items-center justify-center text-white">
-            <svg class="w-5 h-5" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
-              <path stroke-linecap="round" stroke-linejoin="round" d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09z"/>
-            </svg>
-          </div>
-          <div class="flex-1">
-            <h3 class="font-semibold mb-1">Orion</h3>
-            <p id="typing-text" class="text-gray-400 text-sm">Thinking…</p>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <!-- ========= INPUT AREA ========= -->
-    <footer class="bg-gray-900/70 backdrop-blur border-t border-white/10">
-      <div class="max-w-5xl mx-auto p-4">
-        <!-- File preview chips -->
-        <div id="file-preview" class="flex flex-wrap gap-2 mb-2"></div>
-
-        <form id="chat-form" class="flex gap-3 items-end">
-          <!-- File attachment -->
-          <input id="file-input" type="file" multiple class="hidden" accept="*/*" />
-          <label for="file-input" class="cursor-pointer text-gray-400 hover:text-white transition" title="Attach files">
-            <svg class="w-6 h-6" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
-              <path stroke-linecap="round" stroke-linejoin="round" d="M18.375 12.739l-7.693 7.693a4.5 4.5 0 01-6.364-6.364l10.94-10.94A3 3 0 1119.5 7.372L8.552 18.32m.009-.01l-.01.01m5.699-9.941l-7.81 7.81a1.5 1.5 0 002.122 2.122l7.81-7.81"/>
-            </svg>
-          </label>
-
-          <!-- Text input -->
-          <textarea
-            id="chat-input"
-            rows="1"
-            placeholder="Type your message…"
-            class="flex-1 resize-none rounded-2xl bg-white/5 px-4 py-3 text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-teal-500 max-h-[200px]"></textarea>
-
-          <!-- Send button -->
-          <button id="send-button" type="submit" class="shrink-0 w-10 h-10 grid place-items-center rounded-full bg-teal-600 text-white hover:bg-teal-500 transition disabled:opacity-50 disabled:cursor-not-allowed" title="Send">
-            <svg class="w-6 h-6" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
-              <path stroke-linecap="round" stroke-linejoin="round" d="M6 12L3.269 3.126A59.768 59.768 0 0121.485 12 59.77 59.77 0 013.27 20.876L5.999 12zm0 0h7.5"/>
-            </svg>
-          </button>
-        </form>
-      </div>
-    </footer>
-  </main>
-
-  <!-- ========= INLINE STYLES (optional tweaks) ========= -->
-  <style>
-    /* Optional: thin scrollbar */
-    .custom-scrollbar::-webkit-scrollbar { width: 6px; }
-    .custom-scrollbar::-webkit-scrollbar-thumb { @apply bg-gray-600 rounded; }
-    /* Agent message full-width card */
-    .agent-card {
-      @apply w-full bg-white/5 rounded-2xl border border-white/10 p-4 md:p-6;
-    }
-  </style>
+    <script src="chat.js"></script>
 </body>
 </html>

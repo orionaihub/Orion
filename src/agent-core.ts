@@ -1,4 +1,4 @@
-// src/agent-core.ts - Core Agent Logic (Gemini 2.5 Flash Optimised, Cloudflare-ready)
+// src/agent-core.ts - Lightweight Autonomous Agent (Gemini 2.5 Flash Optimized)
 import type { AgentState, Message } from './types';
 import type { GeminiClient, GenerateOptions } from './gemini';
 import type { Tool, ToolCall, ToolResult } from './tools/types';
@@ -15,19 +15,13 @@ export interface AgentConfig {
   useCodeExecution?: boolean;
   useMapsGrounding?: boolean;
   useVision?: boolean;
-  /** Optional: token budget for history pruning (default 50k) */
-  tokenBudget?: number;
+  tokenBudget?: number; // NEW: soft limit for context
 }
 
-export interface ChunkCallback {
-  (chunk: string): void;
-}
-export interface StatusCallback {
-  (message: string): void;
-}
-export interface ToolUseCallback {
-  (tools: string[]): void;
-}
+export interface ChunkCallback { (chunk: string): void; }
+export interface StatusCallback { (message: string): void; }
+export interface ToolUseCallback { (tools: string[]): void; }
+
 export interface AgentCallbacks {
   onChunk?: ChunkCallback;
   onStatus?: StatusCallback;
@@ -36,9 +30,6 @@ export interface AgentCallbacks {
   onDone?: (turns: number, totalLength: number, tokensUsed?: number) => void;
 }
 
-/**
- * Core Agent – autonomous, lightweight, Gemini-2.5-Flash-optimised.
- */
 export class Agent {
   private config: Required<AgentConfig>;
   private gemini: GeminiClient;
@@ -53,13 +44,13 @@ export class Agent {
       maxMessageSize: config.maxMessageSize ?? 100_000,
       maxTurns: config.maxTurns ?? 8,
       model: config.model ?? 'gemini-2.5-flash',
-      thinkingBudget: config.thinkingBudget ?? 1024,
+      thinkingBudget: config.thinkingBudget ?? 2048, // Doubled for deep CoT
       temperature: config.temperature ?? 0.7,
       useSearch: config.useSearch ?? true,
       useCodeExecution: config.useCodeExecution ?? true,
       useMapsGrounding: config.useMapsGrounding ?? false,
       useVision: config.useVision ?? false,
-      tokenBudget: config.tokenBudget ?? 50_000,
+      tokenBudget: config.tokenBudget ?? 50_000, // Safe under 1M
     };
   }
 
@@ -76,45 +67,59 @@ export class Agent {
   registerTool(tool: Tool): void {
     this.toolRegistry.register(tool);
   }
+
   unregisterTool(name: string): void {
     this.toolRegistry.unregister(name);
   }
+
   getRegisteredTools(): Tool[] {
     return this.toolRegistry.getAll();
   }
 
-  // ===== System Prompt (Gemini-2.5-Flash-aware) =====
+  // ===== System Prompt (Gemini 2.5 Flash Autonomous Edition) =====
   private buildSystemPrompt(state: AgentState): string {
     const hasFiles = (state.context?.files?.length ?? 0) > 0;
     const toolNames = this.toolRegistry.getAll().map(t => t.name);
     const hasExternalTools = toolNames.length > 0;
-    const cutoffDate = 'November 2025'; // keep in sync with deployment
+    const cutoffDate = 'November 2025';
 
-    return `You are a lightweight, autonomous general intelligence agent powered by Gemini 2.5 Flash. Like Manus or Genspark, turn natural language into executed actions—plan dynamically, reason deeply, act efficiently.
+    return `You are a lightweight autonomous general intelligence agent powered by Gemini 2.5 Flash — designed for speed, precision, and true independence like Manus, Genspark, or LemonAI.
 
-Gemini 2.5 Flash Strengths:
-- 1M token context → rich chain-of-thought (CoT) reasoning.
-- Native tools (search, code execution, maps grounding, vision) run inline.
-- Low-latency streaming for responsive UX.
-- Precise function calling for external tools.
+GEMINI 2.5 FLASH SUPERPOWERS:
+- 1 million token context → perfect for deep chain-of-thought
+- Native tools (search, code, vision, maps) run inline instantly
+- Lightning-fast streaming & structured reasoning
 
-Autonomous Strategy (Internal Planning First):
-1. **Plan Internally (Tool-Free)**: Use CoT to break the task:
-   • Goal → Sub-tasks → Knowledge gaps.
-   If you can answer with knowledge up to ${cutoffDate}, do so directly. No tools needed.
-2. **Native Tools Only When Required**: Use search for recency, code for calculations, vision/maps for media.
-   Explain: "To verify X, searching Y."
-3. **External Tools**: ${hasExternalTools ? toolNames.join(', ') : 'none'}.
-   Call only for custom actions.
-4. **Finalize**: End with <FINAL_ANSWER>…</FINAL_ANSWER> when complete.
+AUTONOMOUS WORKFLOW (PRIORITIZE INTERNAL THINKING):
+1. PLAN FIRST — ALWAYS use step-by-step CoT in <thinking> tags:
+   <thinking>
+   • Goal: [restate user intent]
+   • Subtasks: [1. ..., 2. ..., 3. ...]
+   • Knowledge gaps: [list only real unknowns]
+   </thinking>
 
-Guidelines:
-- Be concise (200-500 tokens/turn).
-- Self-critique: “Is this sufficient?”
-- Safety: Confirm sensitive actions.
-- Files: ${hasFiles ? 'Analyse uploaded files inline.' : 'None.'}
+2. SOLVE TOOL-FREE IF POSSIBLE — 70% of tasks don’t need tools. Use your up-to-date knowledge (cutoff: ${cutoffDate}) and reasoning.
 
-Knowledge cutoff: ${cutoffDate}. Use natives for anything newer. Think aloud briefly.`;
+3. USE NATIVE TOOLS ONLY WHEN NECESSARY:
+   - Current events → search
+   - Math/data → code execution
+   - Images/files → vision
+   - Location → maps grounding
+
+4. EXTERNAL TOOLS (${hasExternalTools ? toolNames.join(', ') : 'none'}) → only for custom actions.
+
+5. FINALIZE:
+   - Wrap complete answer in <FINAL_ANSWER> ... </FINAL_ANSWER>
+   - If incomplete, use <EVOLVE>Reason for refinement...</EVOLVE>
+
+GUIDELINES:
+- Be concise yet thorough (200–600 tokens/turn)
+- Self-critique: "Do I really need a tool?"
+- Confirm dangerous actions
+- Files available: ${hasFiles ? 'Yes → analyze inline' : 'No'}
+- Never hallucinate dates or facts — use tools for recency
+
+Think aloud. Act decisively. Deliver value fast.`;
   }
 
   // ===== Main Processing Logic =====
@@ -131,7 +136,7 @@ Knowledge cutoff: ${cutoffDate}. Use natives for anything newer. Think aloud bri
 
     const systemPrompt = this.buildSystemPrompt(state);
     let history = this.formatHistory(conversationHistory, systemPrompt, userMessage);
-    history = await this.trimHistory(history, this.config.tokenBudget);
+    history = await this.trimHistory(history);
 
     let turn = 0;
     let fullResponse = '';
@@ -140,11 +145,13 @@ Knowledge cutoff: ${cutoffDate}. Use natives for anything newer. Think aloud bri
     try {
       while (turn < this.config.maxTurns) {
         turn++;
-        callbacks.onStatus?.(turn === 1 ? 'Planning...' : `Step ${turn}...`);
+        callbacks.onStatus?.(turn === 1 ? 'Planning autonomously...' : `Step ${turn}...`);
+
+        console.log(`%c[Agent] Turn ${turn}/${this.config.maxTurns}`, 'color: #00ff88');
 
         const options: GenerateOptions = {
           model: this.config.model,
-          thinkingConfig: { thinkingBudget: this.config.thinkingBudget * 2 }, // boost CoT
+          thinkingConfig: { thinkingBudget: this.config.thinkingBudget },
           temperature: this.config.temperature,
           stream: true,
           useSearch: this.config.useSearch,
@@ -152,7 +159,7 @@ Knowledge cutoff: ${cutoffDate}. Use natives for anything newer. Think aloud bri
           useMapsGrounding: this.config.useMapsGrounding,
           useVision: this.config.useVision,
           files: state.context?.files ?? [],
-          stopSequences: ['<FINAL_ANSWER>'],
+          stopSequences: ['</FINAL_ANSWER>'],
         };
 
         const response = await this.gemini.generateWithTools(
@@ -165,98 +172,125 @@ Knowledge cutoff: ${cutoffDate}. Use natives for anything newer. Think aloud bri
           },
           signal
         );
+
         batcher.flush();
 
-        // ---- Final answer detection ----
-        const isFinal =
-          response.finishReason === 'stop' ||
-          fullResponse.includes('<FINAL_ANSWER>') ||
-          (!response.toolCalls?.length && turn > 1);
+        // === FINAL ANSWER DETECTION ===
+        const hasFinalTag = /<FINAL_ANSWER>[\s\S]*<\/FINAL_ANSWER>/i.test(fullResponse);
+        const hasEvolveTag = /<EVOLVE>/.test(fullResponse);
+        const noToolCalls = !response.toolCalls?.length;
 
-        if (isFinal) {
-          console.log(`[Agent] Completed autonomously at turn ${turn}`);
+        if (hasFinalTag || (noToolCalls && turn > 1)) {
+          console.log('%c[Agent] Final answer delivered', 'color: gold');
+          fullResponse = fullResponse.replace(/<\/?FINAL_ANSWER>/gi, '').trim();
           break;
         }
 
-        // ---- External tool calls ----
+        // === TOOL CALLS ===
         if (response.toolCalls?.length) {
           callbacks.onToolUse?.(response.toolCalls.map(t => t.name));
+
           const toolResults = await this.executeTools(response.toolCalls, state, signal);
 
-          // Append assistant message
           history.push({
             role: 'assistant',
             content: response.text || '[tool planning]',
             toolCalls: response.toolCalls,
           });
 
-          // Append concise results (truncate per-result)
           const resultsText = toolResults
-            .map(r => `${r.name}: ${r.success ? 'OK' : 'ERR'}\n${r.result.substring(0, 1500)}`)
+            .map(r => `${r.name}: ${r.success ? 'Success' : 'Failed'}\n${r.result.substring(0, 1500)}`)
             .join('\n\n');
-          history.push({ role: 'user', content: `Tool Results:\n${resultsText}` });
 
-          // Prune again after adding large results
-          history = await this.trimHistory(history, this.config.tokenBudget);
+          history.push({
+            role: 'user',
+            content: `Tool Results:\n${resultsText}`,
+          });
+
+          history = await this.trimHistory(history);
+          fullResponse = '';
+          continue;
+        }
+
+        // === SELF-EVOLUTION ===
+        if (hasEvolveTag) {
+          history.push({
+            role: 'user',
+            content: 'Continue evolving the solution based on your <EVOLVE> feedback.',
+          });
           fullResponse = '';
           continue;
         }
       }
 
-      // Estimate tokens (optional)
-      const tokensUsed =
-        typeof this.gemini.countTokens === 'function'
-          ? await this.gemini.countTokens(history)
-          : Math.ceil(fullResponse.length / 4);
+      const tokensUsed = await this.gemini.countTokens?.(history) ?? Math.ceil(fullResponse.length / 4);
 
       callbacks.onDone?.(turn, fullResponse.length, tokensUsed);
-      return { response: fullResponse, turns: turn, tokensUsed };
+      return { response: fullResponse.trim(), turns: turn, tokensUsed };
     } catch (e: any) {
       console.error('[Agent] Fatal error:', e);
-      callbacks.onError?.(String(e));
+      callbacks.onError?.(e.message || String(e));
       throw e;
     }
   }
 
-  // ===== Parallel + Timeout Tool Execution =====
+  // ===== Parallel Tool Execution (Cloudflare-safe) =====
   private async executeTools(
     toolCalls: ToolCall[],
     state: AgentState,
     signal?: AbortSignal
   ): Promise<ToolResult[]> {
-    const TOOL_TIMEOUT_MS = 15_000;
-    const MAX_RETRIES = 1;
+    const controller = new AbortController();
+    const timeoutMs = 14_000;
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
 
-    const tasks = toolCalls.map(async call => {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), TOOL_TIMEOUT_MS);
-      const abort = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
-
-      for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    const tasks = toolCalls.map(async (call) => {
+      for (let attempt = 1; attempt <= 2; attempt++) {
         try {
-          const result = await this.toolRegistry.execute(call.name, call.args, state, abort);
-          clearTimeout(timeout);
+          const result = await this.toolRegistry.execute(call.name, call.args, state);
           return result;
-        } catch (err: any) {
-          if (attempt === MAX_RETRIES || abort.aborted) {
-            clearTimeout(timeout);
+        } catch (e) {
+          if (attempt === 2) {
             return {
               name: call.name,
               success: false,
-              result: `Tool failed: ${err.message ?? String(err)}`,
+              result: `Failed after retry: ${String(e)}`,
             };
           }
-          // simple back-off
-          await new Promise(r => self.setTimeout(r, 300));
+          await new Promise(r => setTimeout(r, 600));
         }
       }
-      return { name: call.name, success: false, result: 'Tool timed out' };
+      return { name: call.name, success: false, result: 'Unknown error' };
     });
 
     const settled = await Promise.allSettled(tasks);
-    return settled.map(r =>
-      r.status === 'fulfilled' ? r.value : { name: 'unknown', success: false, result: `Rejected: ${r.reason}` }
+    clearTimeout(timer);
+
+    return settled.map((r, i) =>
+      r.status === 'fulfilled'
+        ? r.value
+        : { name: toolCalls[i].name, success: false, result: `Rejected: ${String(r.reason)}` }
     );
+  }
+
+  // ===== Token-Aware History Trimming =====
+  private async trimHistory(history: any[]): Promise<any[]> {
+    if (!this.gemini.countTokens) {
+      return history.slice(-this.config.maxHistoryMessages);
+    }
+
+    const system = history[0];
+    let used = await this.gemini.countTokens([system]);
+    const kept = [system];
+
+    for (let i = history.length - 1; i > 0; i--) {
+      const msgTokens = await this.gemini.countTokens([history[i]]);
+      if (used + msgTokens > this.config.tokenBudget) break;
+      used += msgTokens;
+      kept.unshift(history[i]);
+    }
+
+    return kept;
   }
 
   // ===== History Formatting =====
@@ -269,8 +303,8 @@ Knowledge cutoff: ${cutoffDate}. Use natives for anything newer. Think aloud bri
 
     for (const msg of messages) {
       const text = Array.isArray(msg.parts)
-        ? msg.parts.map((p: any) => p.text ?? '').join('\n')
-        : msg.content ?? '';
+        ? msg.parts.map((p: any) => p.text || '').join('\n')
+        : msg.content || '';
       formatted.push({
         role: msg.role === 'model' ? 'model' : 'user',
         content: text,
@@ -281,35 +315,13 @@ Knowledge cutoff: ${cutoffDate}. Use natives for anything newer. Think aloud bri
     return formatted;
   }
 
-  // ===== Token-aware History Pruning =====
-  private async trimHistory(history: any[], tokenBudget: number): Promise<any[]> {
-    // If Gemini provides countTokens, use it
-    if (typeof this.gemini.countTokens === 'function') {
-      const system = history[0];
-      let used = await this.gemini.countTokens([system]);
-      const kept = [system];
-
-      for (let i = history.length - 1; i > 0; i--) {
-        const msgTokens = await this.gemini.countTokens([history[i]]);
-        if (used + msgTokens > tokenBudget) break;
-        used += msgTokens;
-        kept.unshift(history[i]);
-      }
-      return kept;
-    }
-
-    // Fallback: message count
-    const max = this.config.maxHistoryMessages;
-    return history.slice(-max);
-  }
-
-  // ===== Cloudflare-compatible Chunk Batcher =====
+  // ===== Cloudflare Workers-Compatible Chunk Batcher =====
   private createChunkBatcher(
     onChunk?: ChunkCallback,
     flushInterval = 50
   ): { add: (chunk: string) => void; flush: () => void } {
     let buffer = '';
-    let handle: number | null = null;
+    let handle: any = null;
 
     const flush = () => {
       if (buffer && onChunk) {
@@ -324,7 +336,7 @@ Knowledge cutoff: ${cutoffDate}. Use natives for anything newer. Think aloud bri
     };
 
     return {
-      add(chunk: string) {
+      add: (chunk: string) => {
         buffer += chunk;
         if (!handle) {
           handle = self.setTimeout(flush, flushInterval);

@@ -1,20 +1,29 @@
 /**
- * Enhanced Suna-Lite Frontend with Markdown, Sidebar, and Full File Support
+ * Fully Adapted Orion Frontend (from provided index.html.txt and styles.css.txt)
+ * - Fixed all DOM ID mismatches.
+ * - Implemented smooth scrolling on streaming chunks.
  */
 
-// DOM elements
-const chatMessages = document.getElementById("chat-messages");
-const welcomeScreen = document.getElementById("welcome-screen");
-const userInput = document.getElementById("user-input");
+// --- DOM elements (CRITICAL FIXES APPLIED) ---
+// The main scrolling container from index.html: <div id="chat-container" class="flex-1 overflow-y-auto custom-scrollbar">
+const chatContainer = document.getElementById("chat-container");
+// The inner wrapper for all messages from index.html: <div id="messages-wrapper" class="max-w-4xl mx-auto pb-4 pt-6">
+const chatMessages = document.getElementById("messages-wrapper");
+// Welcome message container from index.html: <div id="welcome-message" ...>
+const welcomeScreen = document.getElementById("welcome-message"); 
+// Input elements from index.html
+const userInput = document.getElementById("chat-input"); 
 const sendButton = document.getElementById("send-button");
+// Typing indicator container from index.html: <div id="typing-indicator" ...>
 const typingIndicator = document.getElementById("typing-indicator");
 const typingText = document.getElementById("typing-text");
+// File elements
 const fileInput = document.getElementById("file-input");
-const fileUploadArea = document.getElementById("file-upload-area");
-const uploadedFilesContainer = document.getElementById("uploaded-files");
+const filePreview = document.getElementById("file-preview"); 
+// Sidebar and mobile controls
 const sidebar = document.getElementById("sidebar");
-const sidebarOverlay = document.getElementById("sidebar-overlay");
-const mainContent = document.getElementById("main-content");
+const menuBtn = document.getElementById("menu-btn");
+const overlay = document.getElementById("overlay");
 
 // WebSocket connection
 let ws = null;
@@ -52,6 +61,7 @@ window.addEventListener('DOMContentLoaded', () => {
   connectWebSocket();
   setupFileUpload();
   setupInputHandlers();
+  setupSidebarToggle(); 
   checkMobileView();
 });
 
@@ -62,36 +72,60 @@ window.addEventListener('resize', checkMobileView);
  * Check if mobile view and adjust sidebar
  */
 function checkMobileView() {
-  if (window.innerWidth <= 768) {
-    sidebar.classList.add('hidden');
-    mainContent.classList.add('expanded');
+  const isMobile = window.innerWidth <= 768;
+  if (!isMobile) {
+    sidebar.classList.remove('-translate-x-full');
+    overlay.classList.add('hidden');
   } else {
-    sidebar.classList.remove('hidden');
-    mainContent.classList.remove('expanded');
-    sidebarOverlay.classList.remove('visible');
+    if (!sidebar.classList.contains('-translate-x-full')) {
+       sidebar.classList.add('-translate-x-full');
+    }
+    overlay.classList.add('hidden');
   }
 }
 
 /**
- * Toggle sidebar (mobile)
+ * Setup mobile sidebar toggle handlers
  */
-function toggleSidebar() {
-  if (window.innerWidth <= 768) {
-    sidebar.classList.toggle('hidden');
-    sidebar.classList.toggle('visible');
-    sidebarOverlay.classList.toggle('visible');
+function setupSidebarToggle() {
+  // Mobile menu button (ID: menu-btn)
+  if (menuBtn) {
+    menuBtn.addEventListener('click', () => {
+      sidebar.classList.toggle('-translate-x-full');
+      overlay.classList.toggle('hidden');
+    });
+  }
+  
+  // Overlay click to close (ID: overlay)
+  if (overlay) {
+    overlay.addEventListener('click', () => {
+      sidebar.classList.add('-translate-x-full');
+      overlay.classList.add('hidden');
+    });
+  }
+  
+  // New Chat button from sidebar (ID: new-chat-btn)
+  const newChatBtn = document.getElementById('new-chat-btn');
+  if (newChatBtn) {
+      newChatBtn.addEventListener('click', () => {
+          clearChat();
+          // Hide sidebar on mobile after clicking
+          if (window.innerWidth <= 768) {
+              sidebar.classList.add('-translate-x-full');
+              overlay.classList.add('hidden');
+          }
+      });
   }
 }
 
 /**
- * Setup file upload handler with extended support
+ * Setup file upload handler
  */
 function setupFileUpload() {
   fileInput.addEventListener('change', async (e) => {
     const files = Array.from(e.target.files);
     
     for (const file of files) {
-      // 20MB limit
       if (file.size > 20 * 1024 * 1024) {
         addToast(`File ${file.name} is too large (max 20MB)`, 'error');
         continue;
@@ -117,13 +151,10 @@ function setupFileUpload() {
     }
 
     fileInput.value = '';
-    updateFileUploadArea();
+    updateFilePreview();
   });
 }
 
-/**
- * Convert file to base64
- */
 function fileToBase64(file) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -134,27 +165,29 @@ function fileToBase64(file) {
 }
 
 /**
- * Add file chip to UI
+ * Add file chip to UI (ID: file-preview)
  */
 function addFileChip(file) {
   const chip = document.createElement('div');
-  chip.className = 'file-chip';
+  chip.className = 'flex items-center gap-2 px-3 py-1 rounded-full bg-white/10 text-xs text-white';
   chip.dataset.fileName = file.name;
   
   const icon = getFileIcon(file.type, file.name);
   
   chip.innerHTML = `
-    <span class="file-chip-icon">${icon}</span>
-    <span>${file.name} (${formatFileSize(file.size)})</span>
-    <span class="file-chip-remove" onclick="removeFileChip('${escapeHtml(file.name)}')">✕</span>
+    <span>${icon}</span>
+    <span class="truncate max-w-[150px]">${escapeHtml(file.name)}</span>
+    <span class="text-gray-400">(${formatFileSize(file.size)})</span>
+    <button type="button" class="text-gray-400 hover:text-white transition-colors ml-1" onclick="removeFileChip('${escapeHtml(file.name)}')" aria-label="Remove file">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-4 h-4">
+            <path d="M6.28 5.22a.75.75 0 00-1.06 1.06L8.94 10l-3.72 3.72a.75.75 0 101.06 1.06L10 11.06l3.72 3.72a.75.75 0 101.06-1.06L11.06 10l3.72-3.72a.75.75 0 00-1.06-1.06L10 8.94 6.28 5.22z" />
+        </svg>
+    </button>
   `;
   
-  uploadedFilesContainer.appendChild(chip);
+  filePreview.appendChild(chip);
 }
 
-/**
- * Get appropriate icon for file type
- */
 function getFileIcon(mimeType, fileName) {
   if (mimeType.startsWith('image/')) return '🖼️';
   if (mimeType.includes('pdf')) return '📄';
@@ -166,35 +199,25 @@ function getFileIcon(mimeType, fileName) {
 }
 
 /**
- * Remove file chip
+ * Remove file chip (exposed globally)
  */
-function removeFileChip(fileName) {
+window.removeFileChip = function(fileName) {
   pendingFiles = pendingFiles.filter(f => f.name !== fileName);
   
-  const chips = uploadedFilesContainer.querySelectorAll('.file-chip');
+  const chips = filePreview.querySelectorAll('[data-file-name]');
   chips.forEach(chip => {
     if (chip.dataset.fileName === fileName) {
       chip.remove();
     }
   });
   
-  updateFileUploadArea();
+  updateFilePreview();
 }
 
-/**
- * Update file upload area visibility
- */
-function updateFileUploadArea() {
-  if (pendingFiles.length > 0) {
-    fileUploadArea.classList.add('has-files');
-  } else {
-    fileUploadArea.classList.remove('has-files');
-  }
+function updateFilePreview() {
+  // Logic remains for potential future expansion
 }
 
-/**
- * Format file size
- */
 function formatFileSize(bytes) {
   if (bytes < 1024) return bytes + ' B';
   if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
@@ -202,29 +225,57 @@ function formatFileSize(bytes) {
 }
 
 /**
- * Setup input handlers
+ * Setup input handlers (Focus fixed on form submit)
  */
 function setupInputHandlers() {
+  const chatForm = document.getElementById('chat-form'); // ID from index.html
+
   // Auto-resize textarea
   userInput.addEventListener("input", function () {
     this.style.height = "auto";
     this.style.height = Math.min(this.scrollHeight, 200) + "px";
   });
 
-  // Send on Enter (without Shift)
-  userInput.addEventListener("keydown", function (e) {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      sendMessage();
-    }
-  });
+  // Handle form submission (prevents default focus jump)
+  if (chatForm) {
+      chatForm.addEventListener('submit', (e) => {
+          e.preventDefault(); // Prevent default form submission
+          sendMessage();
+      });
+  } else {
+      // Fallback for enter key
+      userInput.addEventListener("keydown", function (e) {
+        if (e.key === "Enter" && !e.shiftKey) {
+          e.preventDefault();
+          sendMessage();
+        }
+      });
+      sendButton.addEventListener("click", sendMessage);
+  }
 
-  // Send button
-  sendButton.addEventListener("click", sendMessage);
+  // Tools Button Toggle
+  const toolsBtn = document.getElementById('tools-btn');
+  const toolsPopup = document.getElementById('tools-popup');
+  
+  if (toolsBtn && toolsPopup) {
+      toolsBtn.addEventListener('click', () => {
+          toolsPopup.classList.toggle('opacity-0');
+          toolsPopup.classList.toggle('scale-95');
+          toolsPopup.classList.toggle('pointer-events-none');
+      });
+      
+      document.addEventListener('click', (e) => {
+          if (!toolsPopup.contains(e.target) && !toolsBtn.contains(e.target) && !toolsPopup.classList.contains('opacity-0')) {
+              toolsPopup.classList.add('opacity-0');
+              toolsPopup.classList.add('scale-95');
+              toolsPopup.classList.add('pointer-events-none');
+          }
+      });
+  }
 }
 
 /**
- * Connect to WebSocket
+ * Connect to WebSocket (Standard logic retained)
  */
 function connectWebSocket() {
   if (ws && ws.readyState === WebSocket.OPEN) return;
@@ -232,9 +283,12 @@ function connectWebSocket() {
 
   isConnecting = true;
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const wsUrl = `${protocol}//${location.host}/api/ws`;
+  const port = location.port ? `:${location.port}` : '';
+  const wsUrl = `${protocol}//${location.hostname}${port}/api/ws`;
 
   console.log('Connecting to WebSocket:', wsUrl);
+
+  updateConnectionStatus('Connecting...', 'bg-gray-500');
 
   ws = new WebSocket(wsUrl);
 
@@ -242,6 +296,7 @@ function connectWebSocket() {
     console.log('WebSocket connected');
     isConnecting = false;
     reconnectAttempts = 0;
+    updateConnectionStatus('Connected', 'bg-teal-500');
   };
 
   ws.onmessage = (event) => {
@@ -256,6 +311,7 @@ function connectWebSocket() {
   ws.onclose = (event) => {
     console.log('WebSocket closed:', event.code, event.reason);
     isConnecting = false;
+    updateConnectionStatus('Disconnected', 'bg-red-500');
     
     reconnectAttempts++;
     const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), MAX_RECONNECT_DELAY);
@@ -266,7 +322,23 @@ function connectWebSocket() {
   ws.onerror = (error) => {
     console.error('WebSocket error:', error);
     isConnecting = false;
+    updateConnectionStatus('Error', 'bg-red-500');
   };
+}
+
+/**
+ * Update connection status UI (Fixed IDs: status-indicator, status-text)
+ */
+function updateConnectionStatus(text, colorClass) {
+  const indicator = document.getElementById('status-indicator');
+  const statusText = document.getElementById('status-text');
+  
+  if (indicator) {
+    indicator.className = `w-2 h-2 rounded-full ${colorClass}`;
+  }
+  if (statusText) {
+    statusText.textContent = text;
+  }
 }
 
 /**
@@ -286,7 +358,8 @@ function handleServerMessage(data) {
         currentMessageElement = createMessageElement('assistant');
       }
       appendToMessage(currentMessageElement, data.content);
-      scrollToBottom();
+      // 🔥 CRITICAL UX FIX: Smooth scroll on every chunk
+      scrollToBottom(true); 
       break;
 
     case 'tool_use':
@@ -302,12 +375,16 @@ function handleServerMessage(data) {
       }
       currentMessageElement = null;
       isProcessing = false;
-      enableInput();
+      // Removed enableInput() focus call here to prevent cursor jump
+      enableInput(false); 
+      
+      // Final smooth scroll after rendering markdown
+      scrollToBottom(true);
       
       // Clear pending files after successful send
       pendingFiles = [];
-      uploadedFilesContainer.innerHTML = '';
-      updateFileUploadArea();
+      filePreview.innerHTML = ''; 
+      updateFilePreview();
       break;
 
     case 'error':
@@ -315,7 +392,7 @@ function handleServerMessage(data) {
       addToast(`Error: ${data.error}`, 'error');
       currentMessageElement = null;
       isProcessing = false;
-      enableInput();
+      enableInput(true); // Re-focus on error
       break;
 
     default:
@@ -333,12 +410,12 @@ function showToolUse(tools) {
   }
   
   const toolIndicator = document.createElement('div');
-  toolIndicator.className = 'tool-use-indicator';
-  toolIndicator.innerHTML = `🔧 Using tools: ${tools.join(', ')}`;
+  toolIndicator.className = 'text-xs text-gray-400 mt-2 p-2 bg-white/5 rounded-lg border border-white/10';
+  toolIndicator.innerHTML = `🔧 Using tools: **${tools.join(', ')}**`;
   
   const content = currentMessageElement.querySelector('.message-content');
   content.appendChild(toolIndicator);
-  scrollToBottom();
+  scrollToBottom(true);
 }
 
 /**
@@ -347,7 +424,7 @@ function showToolUse(tools) {
 async function sendMessage() {
   const message = userInput.value.trim();
 
-  if (message === "" || isProcessing) return;
+  if (message === "" && pendingFiles.length === 0 || isProcessing) return;
 
   if (!ws || ws.readyState !== WebSocket.OPEN) {
     addToast('Connecting to server...', 'info');
@@ -363,20 +440,15 @@ async function sendMessage() {
   isProcessing = true;
   disableInput();
 
-  // Hide welcome screen on first message
   hideWelcome();
 
-  // Add user message to chat
-  addUserMessage(message);
+  addUserMessage(message || 'Sent files for analysis.');
 
-  // Clear input
   userInput.value = "";
   userInput.style.height = "auto";
 
-  // Show typing indicator
   showTypingIndicator('Processing your request...');
 
-  // Send via WebSocket with files
   try {
     const payload = {
       type: 'user_message',
@@ -392,23 +464,22 @@ async function sendMessage() {
     console.error('Error sending message:', error);
     addToast('Failed to send message. Please try again.', 'error');
     isProcessing = false;
-    enableInput();
+    enableInput(true);
     hideTypingIndicator();
   }
 }
 
-/**
- * Hide welcome screen
- */
 function hideWelcome() {
   if (!conversationStarted) {
-    welcomeScreen.classList.add('hidden');
+    if (welcomeScreen) {
+        welcomeScreen.classList.add('hidden');
+    }
     conversationStarted = true;
   }
 }
 
 /**
- * Load chat history from server
+ * Load chat history (Standard logic retained)
  */
 async function loadChatHistory() {
   try {
@@ -436,7 +507,7 @@ async function loadChatHistory() {
           }
         });
         
-        scrollToBottom();
+        scrollToBottom(false);
       }
     }
   } catch (error) {
@@ -445,27 +516,35 @@ async function loadChatHistory() {
 }
 
 /**
- * Create a message element
+ * Create a message element (Corrected for Orion/Assistant icon)
  */
 function createMessageElement(role) {
+  const isUser = role === 'user';
   const wrapper = document.createElement("div");
-  wrapper.className = "message-wrapper";
+  wrapper.className = "p-4 md:p-6";
   
   const messageEl = document.createElement("div");
-  messageEl.className = `message ${role}-message`;
+  messageEl.className = "flex items-start gap-4 max-w-4xl mx-auto";
   
-  const avatar = role === 'user' ? '👤' : '🤖';
-  const sender = role === 'user' ? 'You' : 'Suna-Lite';
-  
+  const avatarBg = isUser ? 'bg-gray-500' : 'bg-teal-600';
+  const senderText = isUser ? 'You' : 'Orion'; 
+  const iconSvg = `<svg class="w-5 h-5" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
+      <path stroke-linecap="round" stroke-linejoin="round" d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09z" />
+    </svg>`;
+    
+  const avatar = isUser ? '👤' : iconSvg; 
+
   messageEl.innerHTML = `
-    <div class="message-header">
-      <div class="message-avatar">${avatar}</div>
-      <span class="message-sender">${sender}</span>
+    <div class="w-8 h-8 flex-shrink-0 rounded-full flex items-center justify-center text-white ${avatarBg}">
+      ${avatar}
     </div>
-    <div class="message-content"></div>
+    <div class="flex-1 min-w-0">
+      <h3 class="font-semibold mb-2">${senderText}</h3>
+      <div class="message-content text-gray-200"></div>
+    </div>
   `;
   
-  wrapper.appendChild(messageEl);
+  // Append to the wrapper: messages-wrapper
   chatMessages.appendChild(wrapper);
   
   return messageEl;
@@ -477,7 +556,6 @@ function createMessageElement(role) {
 function appendToMessage(element, content) {
   const contentDiv = element.querySelector('.message-content');
   
-  // For streaming, append raw text temporarily
   if (!contentDiv.dataset.streaming) {
     contentDiv.dataset.streaming = 'true';
     contentDiv.dataset.rawContent = '';
@@ -488,13 +566,12 @@ function appendToMessage(element, content) {
 }
 
 /**
- * Finalize message (render markdown)
+ * Finalize message (render markdown and highlight)
  */
 function finalizeMessage(element) {
   const contentDiv = element.querySelector('.message-content');
   const rawContent = contentDiv.dataset.rawContent || contentDiv.textContent;
   
-  // Render markdown
   contentDiv.innerHTML = marked.parse(rawContent);
   
   // Highlight code blocks
@@ -506,31 +583,24 @@ function finalizeMessage(element) {
   delete contentDiv.dataset.rawContent;
 }
 
-/**
- * Add user message
- */
 function addUserMessage(content, scroll = true) {
   const messageEl = createMessageElement('user');
   const contentDiv = messageEl.querySelector('.message-content');
   contentDiv.textContent = content;
   
-  if (scroll) scrollToBottom();
+  if (scroll) scrollToBottom(true);
 }
 
-/**
- * Add assistant message (complete)
- */
 function addAssistantMessage(content, scroll = true) {
   const messageEl = createMessageElement('assistant');
   const contentDiv = messageEl.querySelector('.message-content');
   contentDiv.innerHTML = marked.parse(content);
   
-  // Highlight code blocks
   contentDiv.querySelectorAll('pre code').forEach((block) => {
     hljs.highlightElement(block);
   });
   
-  if (scroll) scrollToBottom();
+  if (scroll) scrollToBottom(false);
 }
 
 /**
@@ -538,8 +608,8 @@ function addAssistantMessage(content, scroll = true) {
  */
 function showTypingIndicator(message = 'Thinking...') {
   typingText.textContent = message;
-  typingIndicator.classList.add("visible");
-  scrollToBottom();
+  typingIndicator.classList.remove("hidden");
+  scrollToBottom(true);
 }
 
 function updateTypingIndicator(message) {
@@ -547,61 +617,80 @@ function updateTypingIndicator(message) {
 }
 
 function hideTypingIndicator() {
-  typingIndicator.classList.remove("visible");
+  typingIndicator.classList.add("hidden");
 }
 
 /**
- * Input control functions
+ * Input control functions (Modified to optionally skip focus)
+ * @param {boolean} focus - Whether to focus the input area. Default is true.
  */
 function disableInput() {
   userInput.disabled = true;
   sendButton.disabled = true;
 }
 
-function enableInput() {
+function enableInput(focus = true) {
   userInput.disabled = false;
   sendButton.disabled = false;
-  userInput.focus();
+  if (focus) {
+    userInput.focus(); // Only focus when explicitly requested (e.g., on error)
+  }
 }
 
 /**
- * Scroll to bottom
+ * Scroll to bottom enhancement (ID: chat-container)
+ * Uses the dedicated scrolling container.
+ * @param {boolean} smooth - Use smooth scrolling
  */
-function scrollToBottom() {
-  chatMessages.scrollTop = chatMessages.scrollHeight;
+function scrollToBottom(smooth = false) {
+  if (chatContainer) {
+    chatContainer.scrollTo({
+      top: chatContainer.scrollHeight,
+      behavior: smooth ? 'smooth' : 'auto'
+    });
+  }
 }
 
 /**
- * Toast notification
+ * Toast notification (Standard logic retained)
  */
 function addToast(message, type = 'info') {
+  const toastContainer = document.querySelector('body');
+  const baseClasses = 'fixed bottom-5 right-5 p-3 rounded-lg shadow-xl z-50 transition-all duration-300';
+  
+  let colorClasses;
+  switch(type) {
+    case 'error':
+      colorClasses = 'bg-red-600';
+      break;
+    case 'success':
+      colorClasses = 'bg-teal-600';
+      break;
+    default:
+      colorClasses = 'bg-blue-600';
+  }
+  
   const toast = document.createElement('div');
-  toast.style.cssText = `
-    position: fixed;
-    bottom: 2rem;
-    right: 2rem;
-    padding: 1rem 1.5rem;
-    background: ${type === 'error' ? '#ef4444' : type === 'success' ? '#10b981' : '#3b82f6'};
-    color: white;
-    border-radius: 8px;
-    box-shadow: 0 4px 12px rgba(0,0,0,0.2);
-    z-index: 10000;
-    animation: slideInRight 0.3s ease;
-    max-width: 300px;
-  `;
+  toast.className = `${baseClasses} ${colorClasses} opacity-0 translate-x-full text-white text-sm`;
   toast.textContent = message;
-  document.body.appendChild(toast);
+  toastContainer.appendChild(toast);
   
   setTimeout(() => {
-    toast.style.animation = 'slideOutRight 0.3s ease';
+    toast.classList.remove('opacity-0');
+    toast.classList.remove('translate-x-full');
+  }, 10);
+
+  setTimeout(() => {
+    toast.classList.add('opacity-0');
+    toast.classList.add('translate-x-full');
     setTimeout(() => toast.remove(), 300);
   }, 3000);
 }
 
 /**
- * Clear chat history
+ * Clear chat history (exposed globally)
  */
-async function clearChat() {
+window.clearChat = async function() {
   if (!confirm('Start a new chat? This will clear the current conversation.')) {
     return;
   }
@@ -611,77 +700,40 @@ async function clearChat() {
     if (response.ok) {
       chatMessages.innerHTML = '';
       pendingFiles = [];
-      uploadedFilesContainer.innerHTML = '';
-      updateFileUploadArea();
+      filePreview.innerHTML = ''; 
       conversationStarted = false;
       
-      // Re-add welcome screen with full content
       const welcomeHTML = `
-        <div class="welcome-screen" id="welcome-screen">
-          <div class="welcome-icon">🤖</div>
-          <h2>Welcome to Suna-Lite</h2>
-          <p>Your autonomous AI assistant powered by Gemini 2.5 Flash with advanced multi-step reasoning and tool execution capabilities</p>
-          
-          <div class="welcome-features">
-            <div class="welcome-feature">
-              <div class="welcome-feature-icon">🔍</div>
-              <h3>Web Search</h3>
-              <p>Access real-time information from the web to answer current questions and find the latest data</p>
+        <div id="welcome-message" class="text-center py-20 px-4">
+            <div class="inline-block bg-gradient-to-br from-teal-500 to-blue-600 rounded-full p-3 mb-6 shadow-lg">
+                <svg class="w-10 h-10 text-white" xmlns="http://www.w3.org/2000/svg" 
+                    fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09z" />
+                </svg>
             </div>
-            <div class="welcome-feature">
-              <div class="welcome-feature-icon">💻</div>
-              <h3>Code Execution</h3>
-              <p>Run Python code for complex calculations, data analysis, and algorithmic problem solving</p>
+            <h2 class="text-3xl md:text-4xl font-bold text-white mb-4">How can I help you today?</h2>
+            <p class="text-gray-400 mb-8">I can search the web, execute code, analyze files, and help with complex tasks</p>
+            
+            <div class="flex flex-wrap gap-2 justify-center max-w-2xl mx-auto">
+                <button onclick="useSuggestion(this)" class="px-4 py-2 bg-white/5 hover:bg-white/10 rounded-full text-sm transition-colors">
+                    What's Bitcoin's price? 💰
+                </button>
+                <button onclick="useSuggestion(this)" class="px-4 py-2 bg-white/5 hover:bg-white/10 rounded-full text-sm transition-colors">
+                    Analyze this dataset 📊
+                </button>
+                <button onclick="useSuggestion(this)" class="px-4 py-2 bg-white/5 hover:bg-white/10 rounded-full text-sm transition-colors">
+                    Write Python code 💻
+                </button>
+                <button onclick="useSuggestion(this)" class="px-4 py-2 bg-white/5 hover:bg-white/10 rounded-full text-sm transition-colors">
+                    Latest AI news 🔍
+                </button>
             </div>
-            <div class="welcome-feature">
-              <div class="welcome-feature-icon">📄</div>
-              <h3>File Analysis</h3>
-              <p>Process and analyze documents, spreadsheets, PDFs, images, and various data formats</p>
-            </div>
-            <div class="welcome-feature">
-              <div class="welcome-feature-icon">🔄</div>
-              <h3>Multi-Step Tasks</h3>
-              <p>Autonomous planning and execution of complex tasks that require multiple steps and tools</p>
-            </div>
-            <div class="welcome-feature">
-              <div class="welcome-feature-icon">👁️</div>
-              <h3>Vision Analysis</h3>
-              <p>Understand and analyze images, charts, diagrams, and visual content with AI vision</p>
-            </div>
-            <div class="welcome-feature">
-              <div class="welcome-feature-icon">📊</div>
-              <h3>Data Processing</h3>
-              <p>Comprehensive data analysis, visualization, and insights from structured and unstructured data</p>
-            </div>
-          </div>
-
-          <div class="welcome-cta">
-            <p class="welcome-cta-text">✨ Try asking me something or choose a suggestion below:</p>
-            <div class="welcome-suggestions">
-              <div class="suggestion-chip" onclick="useSuggestion(this)">
-                What's the current Bitcoin price?
-              </div>
-              <div class="suggestion-chip" onclick="useSuggestion(this)">
-                Analyze this dataset for trends
-              </div>
-              <div class="suggestion-chip" onclick="useSuggestion(this)">
-                Calculate compound interest
-              </div>
-              <div class="suggestion-chip" onclick="useSuggestion(this)">
-                Search latest AI news
-              </div>
-              <div class="suggestion-chip" onclick="useSuggestion(this)">
-                Explain quantum computing
-              </div>
-            </div>
-          </div>
         </div>
       `;
       
       chatMessages.innerHTML = welcomeHTML;
-      
-      // Re-assign welcome screen reference
-      window.welcomeScreen = document.getElementById('welcome-screen');
+      // Re-assign welcome screen reference after clearing HTML
+      window.welcomeScreen = document.getElementById('welcome-message');
       
       addToast('Chat cleared successfully', 'success');
     }
@@ -692,14 +744,15 @@ async function clearChat() {
 }
 
 /**
- * Use a suggestion chip
+ * Use a suggestion chip (exposed globally)
  */
-function useSuggestion(element) {
-  const text = element.textContent.trim();
+window.useSuggestion = function(element) {
+  // Extract text and remove emojis
+  const text = element.textContent.trim().replace(/[\uD800-\uDBFF\uDC00-\uDFFF].*$/g, '').trim();
   userInput.value = text;
+  userInput.style.height = "auto";
+  userInput.style.height = Math.min(userInput.scrollHeight, 200) + "px";
   userInput.focus();
-  // Optionally auto-send
-  // sendMessage();
 }
 
 /**
@@ -710,30 +763,3 @@ function escapeHtml(text) {
   div.textContent = text;
   return div.innerHTML;
 }
-
-// Add CSS animations
-const style = document.createElement('style');
-style.textContent = `
-  @keyframes slideInRight {
-    from {
-      transform: translateX(100%);
-      opacity: 0;
-    }
-    to {
-      transform: translateX(0);
-      opacity: 1;
-    }
-  }
-  
-  @keyframes slideOutRight {
-    from {
-      transform: translateX(0);
-      opacity: 1;
-    }
-    to {
-      transform: translateX(100%);
-      opacity: 0;
-    }
-  }
-`;
-document.head.appendChild(style);

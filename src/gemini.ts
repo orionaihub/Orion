@@ -1,22 +1,9 @@
-// src/utils/gemini.ts - Multi-step autonomous version
+// src/utils/gemini.ts - Multi-step autonomous version (Refactored)
 import { GoogleGenAI } from '@google/genai';
 import type { TaskComplexity, ExecutionPlan, FileMetadata } from '../types';
 
-export interface ExecutionConfig {
-  model?: string;
-  stream?: boolean;
-  timeoutMs?: number;
-  thinkingConfig?: { thinkingBudget: number };
-  files?: FileMetadata[];
-  urlList?: string[];
-  useSearch?: boolean;
-  useCodeExecution?: boolean;
-  useMapsGrounding?: boolean;
-  useUrlContext?: boolean;
-  allowComputerUse?: boolean;
-  useVision?: boolean;
-  stepAction?: string;
-}
+// This interface is gone, as its properties are merged into GenerateOptions
+// export interface ExecutionConfig { ... }
 
 export interface Tool {
   name: string;
@@ -30,6 +17,17 @@ export interface GenerateOptions {
   timeoutMs?: number;
   thinkingConfig?: { thinkingBudget: number };
   temperature?: number;
+
+  // === ADDED ===
+  // Native tool flags
+  useSearch?: boolean;
+  useCodeExecution?: boolean;
+  useMapsGrounding?: boolean;
+  useVision?: boolean;
+
+  // File/URL context
+  files?: FileMetadata[];
+  urlList?: string[];
 }
 
 export interface GenerateResponse {
@@ -106,35 +104,7 @@ export class GeminiClient {
   private defaultTimeoutMs = 60_000;
   private circuitBreaker = new CircuitBreaker();
 
-  private readonly ACTION_TOOL_MAP: Record<string, ToolConfig> = {
-    search: { tools: [{ googleSearch: {} }] },
-    research: { tools: [{ googleSearch: {} }] },
-    code_execute: { tools: [{ codeExecution: {} }] },
-    code: { tools: [{ codeExecution: {} }] },
-    file_analysis: {
-      tools: [{ fileAnalysis: {} }],
-      requiresFiles: true,
-    },
-    file: {
-      tools: [{ fileAnalysis: {} }],
-      requiresFiles: true,
-    },
-    vision_analysis: { tools: [{ vision: {} }] },
-    vision: { tools: [{ vision: {} }] },
-    maps: { tools: [{ googleMaps: {} }] },
-    url_context: {
-      tools: [{ urlContext: {} }],
-      requiresUrls: true,
-    },
-    url_analysis: {
-      tools: [{ urlContext: {} }],
-      requiresUrls: true,
-    },
-    computer: { tools: [{ computerUse: {} }] },
-    data_analysis: { tools: [{ codeExecution: {} }] },
-    synthesize: { tools: [] },
-    analyze: { tools: [] },
-  };
+  // REMOVED: ACTION_TOOL_MAP
 
   constructor(opts?: { apiKey?: string }) {
     this.ai = new GoogleGenAI({ apiKey: opts?.apiKey });
@@ -336,7 +306,7 @@ export class GeminiClient {
     }
   }
 
-  // ===== Main Multi-Step Method =====
+  // ===== Main Multi-Step Method (Refactored) =====
 
   /**
    * Generate response with tool use capability
@@ -344,30 +314,66 @@ export class GeminiClient {
    */
   async generateWithTools(
     conversationHistory: any[],
-    tools: Tool[],
+    tools: Tool[], // External tools
     options: GenerateOptions = {},
     onChunk?: (text: string) => void
   ): Promise<GenerateResponse> {
     return this.withRetry(async () => {
       const modelName = options.model ?? 'gemini-2.5-flash';
       
-      // Convert conversation history to Gemini format
+      // 1. Build Contents (merging logic from old buildContents)
       const contents = this.formatConversationHistory(conversationHistory);
       
-      // Convert tools to Gemini function declaration format
+      // Get the last user message to append context (files, URLs)
+      const lastUserMessage = contents[contents.length - 1];
+      if (lastUserMessage && lastUserMessage.role === 'user') {
+        const fileParts = (options.files ?? [])
+          .filter((f) => f && f.state === 'ACTIVE' && f.fileUri)
+          .map((f) => ({
+            file_data: { mime_type: f.mimeType, file_uri: f.fileUri },
+          }));
+        
+        const urlParts = (options.urlList ?? []).map((u) => ({ url: u }));
+        
+        if (fileParts.length > 0 || urlParts.length > 0) {
+          // Prepend context parts to the last user message's parts
+          lastUserMessage.parts = [
+            ...fileParts, 
+            ...urlParts, 
+            ...lastUserMessage.parts
+          ];
+        }
+      }
+      
+      // 2. Build Tool Config (Native + External)
+      const toolConfigs: any[] = [];
+      
+      // Add external tools
       const functionDeclarations = tools.length > 0 
         ? this.convertToolsToFunctions(tools) 
         : undefined;
       
+      if (functionDeclarations) {
+        toolConfigs.push({ functionDeclarations });
+      }
+      
+      // Add native tools
+      if (options.useSearch) toolConfigs.push({ googleSearch: {} });
+      if (options.useCodeExecution) toolConfigs.push({ codeExecution: {} });
+      if (options.useMapsGrounding) toolConfigs.push({ googleMaps: {} });
+      if (options.useVision) toolConfigs.push({ vision: {} });
+      
+      // 3. Build final generation config
       const config: any = {
         thinkingConfig: options.thinkingConfig ?? { thinkingBudget: 1024 },
         temperature: options.temperature ?? 0.7,
       };
       
-      if (functionDeclarations) {
-        config.tools = [{ functionDeclarations }];
+      if (toolConfigs.length > 0) {
+        config.tools = toolConfigs;
       }
       
+      // 4. Execute call
       if (options.stream) {
         // Streaming generation
         const generateCall = this.ai.models.generateContentStream({
@@ -412,156 +418,15 @@ export class GeminiClient {
     });
   }
 
-  // ===== Legacy Methods (Maintained for Compatibility) =====
+  // ===== Legacy Methods (REMOVED) =====
+  // REMOVED: streamResponse
+  // REMOVED: executeWithConfig
 
-  async streamResponse(
-    query: string,
-    history: Array<{ role: string; parts: any[] }>,
-    onChunk?: (text: string) => void,
-    opts?: { model?: string; thinkingConfig?: any; timeoutMs?: number }
-  ): Promise<string> {
-    return this.withRetry(async () => {
-      const modelName = opts?.model ?? 'gemini-2.5-flash';
-      const contents = this.buildContents(query, history);
+  // ===== Helper Methods (REMOVED) =====
+  // REMOVED: mapActionToTools
+  // REMOVED: buildContents
 
-      const call: any = this.ai.models.generateContentStream({
-        model: modelName,
-        contents,
-        config: {
-          thinkingConfig: opts?.thinkingConfig ?? { thinkingBudget: 512 },
-        },
-      } as any);
-
-      const streamResp = await this.withTimeout(call, 'streamResponse timed out', opts?.timeoutMs);
-      const response = await this.handleStreamedResponse(streamResp, onChunk);
-      
-      return response.text || '';
-    });
-  }
-
-  async executeWithConfig(
-    prompt: string,
-    history: Array<{ role: string; parts: any[] }>,
-    config: ExecutionConfig,
-    onChunk?: (text: string) => void
-  ): Promise<string> {
-    return this.withRetry(async () => {
-      let tools: Array<Record<string, unknown>> = [];
-
-      const hasFiles = (config.files ?? []).length > 0;
-      const hasUrls = (config.urlList ?? []).length > 0;
-
-      if (config.stepAction) {
-        tools = this.mapActionToTools(config.stepAction, { hasFiles, hasUrls });
-      } else {
-        if (config.useSearch) tools.push({ googleSearch: {} });
-        if (config.useCodeExecution) tools.push({ codeExecution: {} });
-        if (config.useMapsGrounding) tools.push({ googleMaps: {} });
-        if (config.useUrlContext && hasUrls) tools.push({ urlContext: {} });
-        if (config.allowComputerUse) tools.push({ computerUse: {} });
-        if (hasFiles) tools.push({ fileAnalysis: {} });
-        if (config.useVision) tools.push({ vision: {} });
-      }
-
-      const contents = this.buildContents(prompt, history, config.files ?? [], config.urlList ?? []);
-
-      const call = this.ai.models.generateContent({
-        model: config.model ?? 'gemini-2.5-flash',
-        contents,
-        config: {
-          thinkingConfig: config.thinkingConfig ?? { thinkingBudget: 512 },
-          tools: tools.length ? tools : undefined,
-        },
-      } as any);
-
-      const resp: any = await this.withTimeout(call, 'executeWithConfig timed out', config.timeoutMs);
-
-      let text = '';
-      if (typeof resp?.text === 'string') {
-        text = resp.text;
-      } else if (typeof resp?.text === 'function') {
-        text = await resp.text();
-      } else {
-        text = (await this.extractTextFromResponse(resp)) ?? '';
-      }
-
-      if (text && onChunk) {
-        try {
-          onChunk(text);
-        } catch (e) {
-          console.warn('[GeminiClient] onChunk error:', e);
-        }
-      }
-
-      return text || '[no-result]';
-    });
-  }
-
-  // ===== Helper Methods =====
-
-  private mapActionToTools(
-    action: string | undefined,
-    context: { hasFiles: boolean; hasUrls: boolean }
-  ): Array<Record<string, unknown>> {
-    if (!action) return [];
-
-    const key = action.toLowerCase().trim();
-    const config = this.ACTION_TOOL_MAP[key];
-
-    if (!config) {
-      console.warn(`[GeminiClient] Unknown action: ${action}`);
-      return [];
-    }
-
-    if (config.requiresFiles && !context.hasFiles) {
-      console.warn(`[GeminiClient] Action ${action} requires files but none available`);
-      return [];
-    }
-
-    if (config.requiresUrls && !context.hasUrls) {
-      console.warn(`[GeminiClient] Action ${action} requires URLs but none available`);
-      return [];
-    }
-
-    return config.tools;
-  }
-
-  private buildContents(
-    prompt: string,
-    history?: Array<{ role: string; parts: any[] }>,
-    files?: FileMetadata[],
-    urlList?: string[]
-  ): any[] {
-    const contents: any[] = [];
-
-    if (history && history.length) {
-      for (const msg of history) {
-        contents.push({ role: msg.role, parts: msg.parts });
-      }
-    }
-
-    if (files && files.length) {
-      const fileParts = files
-        .filter((f) => f && f.state === 'ACTIVE' && f.fileUri)
-        .map((f) => ({
-          file_data: { mime_type: f.mimeType, file_uri: f.fileUri },
-        }));
-      if (fileParts.length) {
-        contents.push({ parts: fileParts });
-      }
-    }
-
-    if (urlList && urlList.length) {
-      const urlParts = urlList.map((u) => ({ url: u }));
-      contents.push({ parts: urlParts });
-    }
-
-    contents.push({ parts: [{ text: prompt }] });
-
-    return contents;
-  }
-
-  // ===== Files API =====
+  // ===== Files API (Unchanged) =====
 
   async uploadFile(fileDataBase64: string, mimeType: string, displayName: string): Promise<FileMetadata> {
     return this.withRetry(async () => {

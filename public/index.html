@@ -3,7 +3,9 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Suna-Lite - Autonomous AI Agent</title>
+    <meta name="theme-color" content="#10a37f">
+    <meta name="description" content="Suna-Lite - Autonomous AI Agent powered by Gemini">
+    <title>Suna-Lite - AI Assistant</title>
     
     <!-- External Libraries -->
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
@@ -38,7 +40,7 @@
                     <span class="logo">🤖</span>
                     <div>
                         <h2>Suna-Lite</h2>
-                        <p>Autonomous AI Agent</p>
+                        <p>AI Assistant</p>
                     </div>
                 </div>
             </div>
@@ -55,27 +57,27 @@
                 <div class="nav-section">
                     <h3>Capabilities</h3>
                     <div class="capability-grid">
-                        <div class="capability-item" data-tooltip="Web Search">
+                        <div class="capability-item">
                             <span>🔍</span>
                             <span>Search</span>
                         </div>
-                        <div class="capability-item" data-tooltip="Code Execution">
+                        <div class="capability-item">
                             <span>💻</span>
                             <span>Code</span>
                         </div>
-                        <div class="capability-item" data-tooltip="File Analysis">
+                        <div class="capability-item">
                             <span>📄</span>
                             <span>Files</span>
                         </div>
-                        <div class="capability-item" data-tooltip="Vision">
+                        <div class="capability-item">
                             <span>👁️</span>
                             <span>Vision</span>
                         </div>
-                        <div class="capability-item" data-tooltip="Data Analysis">
+                        <div class="capability-item">
                             <span>📊</span>
                             <span>Data</span>
                         </div>
-                        <div class="capability-item" data-tooltip="Multi-Step Tasks">
+                        <div class="capability-item">
                             <span>🔄</span>
                             <span>Tasks</span>
                         </div>
@@ -94,42 +96,41 @@
                 <button class="settings-btn">
                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                         <circle cx="12" cy="12" r="3"></circle>
-                        <path d="M12 1v6m0 6v6m11-7h-6m-6 0H1"></path>
+                        <path d="M12 1v6m0 6v6"></path>
                     </svg>
                     Settings
                 </button>
             </div>
         </aside>
 
-        <!-- Overlay -->
+        <!-- Overlay for mobile -->
         <div class="overlay" id="overlay"></div>
 
         <!-- Main Content -->
         <main class="main-content">
-            <!-- Chat Container -->
             <div class="chat-container">
                 <!-- Welcome Screen -->
                 <div class="welcome-screen" id="welcome-screen">
                     <div class="welcome-content">
                         <div class="welcome-icon">🤖</div>
                         <h1>Welcome to Suna-Lite</h1>
-                        <p>Your autonomous AI assistant with advanced multi-step reasoning and tool execution capabilities</p>
+                        <p>Your autonomous AI assistant with advanced reasoning and tool execution</p>
                         
                         <div class="capabilities-showcase">
                             <div class="capability-card">
                                 <div class="capability-icon">🔍</div>
                                 <h3>Web Search</h3>
-                                <p>Real-time information access</p>
+                                <p>Real-time info</p>
                             </div>
                             <div class="capability-card">
                                 <div class="capability-icon">💻</div>
-                                <h3>Code Execution</h3>
-                                <p>Python & data analysis</p>
+                                <h3>Code</h3>
+                                <p>Python execution</p>
                             </div>
                             <div class="capability-card">
                                 <div class="capability-icon">📄</div>
-                                <h3>File Analysis</h3>
-                                <p>Documents & images</p>
+                                <h3>Files</h3>
+                                <p>Document analysis</p>
                             </div>
                             <div class="capability-card">
                                 <div class="capability-icon">👁️</div>
@@ -139,14 +140,26 @@
                         </div>
 
                         <div class="quick-starters">
-                            <h3>Try these:</h3>
+                            <h3>Get started with:</h3>
                             <div class="suggestion-chips">
-                                <button class="suggestion-chip" onclick="useSuggestion(this)">What's Bitcoin's current price?</button>
-                                <button class="suggestion-chip" onclick="useSuggestion(this)">Analyze this dataset</button>
-                                <button class="suggestion-chip" onclick="useSuggestion(this)">Calculate compound interest</button>
-                                <button class="suggestion-chip" onclick="useSuggestion(this)">Latest AI news</button>
-                                <button class="suggestion-chip" onclick="useSuggestion(this)">Explain quantum computing</button>
-                                <button class="suggestion-chip" onclick="useSuggestion(this)">Generate a plot</button>
+                                <button class="suggestion-chip" onclick="useSuggestion(this)">
+                                    What's Bitcoin's price?
+                                </button>
+                                <button class="suggestion-chip" onclick="useSuggestion(this)">
+                                    Analyze this data
+                                </button>
+                                <button class="suggestion-chip" onclick="useSuggestion(this)">
+                                    Calculate compound interest
+                                </button>
+                                <button class="suggestion-chip" onclick="useSuggestion(this)">
+                                    Latest AI news
+                                </button>
+                                <button class="suggestion-chip" onclick="useSuggestion(this)">
+                                    Explain quantum computing
+                                </button>
+                                <button class="suggestion-chip" onclick="useSuggestion(this)">
+                                    Generate a visualization
+                                </button>
                             </div>
                         </div>
                     </div>
@@ -154,7 +167,7 @@
 
                 <!-- Messages Area -->
                 <div class="messages-area" id="chat-messages">
-                    <!-- Messages will be dynamically added here -->
+                    <!-- Messages dynamically added here -->
                 </div>
 
                 <!-- Typing Indicator -->
@@ -170,22 +183,24 @@
                 </div>
             </div>
 
-            <!-- Input Area - Fixed at bottom -->
+            <!-- Input Area -->
             <div class="input-area">
                 <div class="input-container">
-                    <!-- File Upload Preview -->
+                    <!-- File Preview -->
                     <div class="file-preview" id="file-preview"></div>
                     
                     <div class="input-wrapper">
+                        <!-- Hidden file input -->
                         <input type="file" id="file-input" multiple accept="*/*" style="display: none;">
                         
-                        <button class="attach-btn" onclick="document.getElementById('file-input').click()" 
-                                aria-label="Attach files">
+                        <!-- Attach button -->
+                        <button class="attach-btn" onclick="document.getElementById('file-input').click()" aria-label="Attach files">
                             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                                 <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"></path>
                             </svg>
                         </button>
                         
+                        <!-- Input field with send button -->
                         <div class="input-field">
                             <textarea 
                                 id="user-input"
@@ -203,7 +218,7 @@
                     </div>
                     
                     <div class="input-footer">
-                        <span class="input-hint">Press Enter to send, Shift + Enter for new line</span>
+                        <span class="input-hint">Press Enter to send • Shift+Enter for new line</span>
                     </div>
                 </div>
             </div>
@@ -213,6 +228,7 @@
     <!-- Toast Container -->
     <div class="toast-container" id="toast-container"></div>
 
+    <!-- Custom JS -->
     <script src="chat.js"></script>
 </body>
 </html>

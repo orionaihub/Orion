@@ -1,6 +1,8 @@
-// src/autonomous-agent-simplified.ts - Multi-step autonomous version
+// src/autonomous-agent-simplified.ts - Multi-step autonomous version (Refactored)
 import type { DurableObjectState } from '@cloudflare/workers-types';
 import GeminiClient from './gemini';
+// Import GenerateOptions
+import type { GenerateOptions } from './gemini';
 import type { Env, AgentState, Message } from './types';
 
 interface SqlStorage {
@@ -65,7 +67,7 @@ export class AutonomousAgent {
     }
   }
 
-  // ===== System Prompt =====
+  // ===== System Prompt (Unchanged) =====
 
   private buildSystemPrompt(state: AgentState): string {
     const hasFiles = (state.context?.files?.length ?? 0) > 0;
@@ -95,54 +97,30 @@ ${hasFiles ? '- User has uploaded files available for analysis' : ''}
 Your knowledge cutoff is January 2025. Use tools to access current information when needed.`;
   }
 
-  // ===== Tool Definitions =====
+  // ===== Tool Definitions (Refactored) =====
 
   private getAvailableTools(state: AgentState): Tool[] {
     const tools: Tool[] = [
+      // REMOVED: 'web_search' - This is a native tool, enabled in the 'process' loop
+      // REMOVED: 'code_execute' - This is a native tool, enabled in the 'process' loop
+      // REMOVED: 'analyze_file' - This is a native tool, enabled by passing files
+      
+      /* EXAMPLE: This is where you would add a *truly* external tool
       {
-        name: 'web_search',
-        description: 'Search the web for current information, recent events, or factual data',
-        parameters: {
-          type: 'object',
-          properties: {
-            query: { type: 'string', description: 'Search query' }
-          },
-          required: ['query']
-        }
-      },
-      {
-        name: 'code_execute',
-        description: 'Execute Python code for calculations, data analysis, or processing',
-        parameters: {
-          type: 'object',
-          properties: {
-            code: { type: 'string', description: 'Python code to execute' }
-          },
-          required: ['code']
-        }
+        name: 'post_to_slack',
+        description: 'Posts a message to a Slack channel',
+        parameters: { ... }
       }
+      */
     ];
 
-    // Add file analysis if files are available
-    if ((state.context?.files?.length ?? 0) > 0) {
-      tools.push({
-        name: 'analyze_file',
-        description: 'Analyze uploaded files',
-        parameters: {
-          type: 'object',
-          properties: {
-            file_index: { type: 'number', description: 'Index of file to analyze' },
-            question: { type: 'string', description: 'Question about the file' }
-          },
-          required: ['file_index']
-        }
-      });
-    }
+    // File analysis is now handled natively, so this logic is no longer needed here.
+    // if ((state.context?.files?.length ?? 0) > 0) { ... }
 
     return tools;
   }
 
-  // ===== Tool Execution =====
+  // ===== Tool Execution (Refactored) =====
 
   private async executeTools(toolCalls: ToolCall[], state: AgentState): Promise<ToolResult[]> {
     const results: ToolResult[] = [];
@@ -152,20 +130,17 @@ Your knowledge cutoff is January 2025. Use tools to access current information w
         let result: string;
 
         switch (call.name) {
-          case 'web_search':
-            result = await this.executeWebSearch(call.args.query);
-            results.push({ name: call.name, success: true, result });
-            break;
+          // REMOVED: 'web_search' case
+          // REMOVED: 'code_execute' case
+          // REMOVED: 'analyze_file' case
 
-          case 'code_execute':
-            result = await this.executeCode(call.args.code);
+          /*
+          EXAMPLE: This is where you would handle a *truly* external tool
+          case 'post_to_slack':
+            result = await this.mySlackFunction(call.args.channel, call.args.message);
             results.push({ name: call.name, success: true, result });
             break;
-
-          case 'analyze_file':
-            result = await this.analyzeFile(call.args.file_index, call.args.question, state);
-            results.push({ name: call.name, success: true, result });
-            break;
+          */
 
           default:
             results.push({ 
@@ -186,46 +161,11 @@ Your knowledge cutoff is January 2025. Use tools to access current information w
     return results;
   }
 
-  private async executeWebSearch(query: string): Promise<string> {
-    // Use Gemini's built-in search via executeWithConfig
-    const result = await this.gemini.executeWithConfig(
-      `Search for: ${query}`,
-      [],
-      { useSearch: true, model: 'gemini-2.5-flash' }
-    );
-    return result || 'No search results found';
-  }
+  // REMOVED: executeWebSearch
+  // REMOVED: executeCode
+  // REMOVED: analyzeFile
 
-  private async executeCode(code: string): Promise<string> {
-    // Use Gemini's code execution capability
-    const result = await this.gemini.executeWithConfig(
-      `Execute this code and return the output:\n\`\`\`python\n${code}\n\`\`\``,
-      [],
-      { useCodeExecution: true, model: 'gemini-2.5-flash' }
-    );
-    return result || 'Code execution produced no output';
-  }
-
-  private async analyzeFile(fileIndex: number, question: string | undefined, state: AgentState): Promise<string> {
-    const files = state.context?.files ?? [];
-    if (fileIndex >= files.length) {
-      return 'File index out of range';
-    }
-
-    const file = files[fileIndex];
-    const prompt = question 
-      ? `Analyze this file and answer: ${question}` 
-      : 'Analyze this file and provide a summary';
-
-    const result = await this.gemini.executeWithConfig(
-      prompt,
-      [],
-      { files: [file], model: 'gemini-2.5-flash' }
-    );
-    return result || 'File analysis produced no results';
-  }
-
-  // ===== Main Processing Loop (Multi-step) =====
+  // ===== Main Processing Loop (Refactored) =====
 
   private async process(userMsg: string, ws: WebSocket | null): Promise<void> {
     return this.withStateTransaction(async (state) => {
@@ -236,7 +176,7 @@ Your knowledge cutoff is January 2025. Use tools to access current information w
         throw new Error('Message exceeds maximum size');
       }
 
-      // Save user message
+      // Save user message (unchanged)
       try {
         if (this.sql) {
           this.sql.exec(
@@ -252,7 +192,7 @@ Your knowledge cutoff is January 2025. Use tools to access current information w
         throw e;
       }
 
-      // Build conversation history
+      // Build conversation history (unchanged)
       const systemPrompt = this.buildSystemPrompt(state);
       const history = this.buildHistory();
       
@@ -283,15 +223,28 @@ Your knowledge cutoff is January 2025. Use tools to access current information w
 
           console.log(`[Agent] Turn ${turn}/${this.MAX_TURNS}`);
 
+          // === THIS IS THE KEY CHANGE ===
+          // Define all options for the upgraded generateWithTools call
+          const options: GenerateOptions = {
+            model: 'gemini-2.5-flash',
+            thinkingConfig: { thinkingBudget: 1024 },
+            stream: true,
+
+            // --- Enable Native Tools ---
+            useSearch: true,
+            useCodeExecution: true,
+
+            // --- Pass File/URL Context ---
+            // Native file analysis is enabled simply by passing the files
+            files: state.context?.files ?? [],
+            // urlList: [] // You can add URLs to the state and pass them here
+          };
+          
           // Generate response with tool capability
           const response = await this.gemini.generateWithTools(
             conversationHistory,
-            this.getAvailableTools(state),
-            {
-              model: 'gemini-2.5-flash',
-              thinkingConfig: { thinkingBudget: 1024 },
-              stream: true
-            },
+            this.getAvailableTools(state), // Passes *external* tools (currently [])
+            options, // Passes all other options (native tools, files, etc.)
             (chunk: string) => {
               fullResponse += chunk;
               batcher.add(chunk);
@@ -300,9 +253,9 @@ Your knowledge cutoff is January 2025. Use tools to access current information w
 
           batcher.flush();
 
-          // Check if model used tools
+          // This block now *only* catches *external* tool calls
           if (response.toolCalls && response.toolCalls.length > 0) {
-            console.log(`[Agent] Tool calls detected: ${response.toolCalls.map((t: ToolCall) => t.name).join(', ')}`);
+            console.log(`[Agent] External Tool calls detected: ${response.toolCalls.map((t: ToolCall) => t.name).join(', ')}`);
 
             if (ws) {
               this.send(ws, {
@@ -311,13 +264,13 @@ Your knowledge cutoff is January 2025. Use tools to access current information w
               });
             }
 
-            // Execute tools
+            // Execute *external* tools
             const toolResults = await this.executeTools(response.toolCalls, state);
 
             // Add assistant's response with tool calls to history
             conversationHistory.push({
               role: 'assistant',
-              content: response.text || '[used tools]',
+              content: response.text || '[used external tools]',
               toolCalls: response.toolCalls
             });
 
@@ -336,12 +289,14 @@ Your knowledge cutoff is January 2025. Use tools to access current information w
             continue;
           }
 
-          // No tool calls - model provided final answer
+          // No *external* tool calls.
+          // Native tools (search, code, file) ran inline.
+          // The loop can now stop.
           console.log('[Agent] Final answer received, stopping loop');
           break;
         }
 
-        // Save final response
+        // Save final response (unchanged)
         if (fullResponse) {
           try {
             if (this.sql) {
@@ -373,7 +328,7 @@ Your knowledge cutoff is January 2025. Use tools to access current information w
     });
   }
 
-  // ===== State Management =====
+  // ===== State Management (Unchanged) =====
 
   private async loadState(): Promise<AgentState> {
     let state: AgentState | null = null;
@@ -463,7 +418,7 @@ Your knowledge cutoff is January 2025. Use tools to access current information w
     return hist;
   }
 
-  // ===== WebSocket Management =====
+  // ===== WebSocket Management (Unchanged) =====
 
   private send(ws: WebSocket | null, data: unknown): void {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
@@ -497,7 +452,7 @@ Your knowledge cutoff is January 2025. Use tools to access current information w
     };
   }
 
-  // ===== HTTP Fetch Handler =====
+  // ===== HTTP Fetch Handler (Unchanged) =====
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
@@ -543,7 +498,7 @@ Your knowledge cutoff is January 2025. Use tools to access current information w
     return new Response('Not found', { status: 404 });
   }
 
-  // ===== WebSocket Handlers =====
+  // ===== WebSocket Handlers (Unchanged) =====
 
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
     if (typeof message !== 'string') return;
@@ -586,7 +541,7 @@ Your knowledge cutoff is January 2025. Use tools to access current information w
     this.activeWebSockets.delete(ws);
   }
 
-  // ===== HTTP Handlers =====
+  // ===== HTTP Handlers (Unchanged) =====
 
   private async handleChat(req: Request): Promise<Response> {
     let message: string;

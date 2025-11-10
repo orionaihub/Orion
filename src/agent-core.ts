@@ -49,7 +49,7 @@ export class Agent {
   constructor(gemini: GeminiClient, config: AgentConfig = {}) {
     this.gemini = gemini;
     this.toolRegistry = new ToolRegistry();
-
+    
     this.config = {
       maxHistoryMessages: config.maxHistoryMessages ?? 200,
       maxMessageSize: config.maxMessageSize ?? 100_000,
@@ -88,7 +88,9 @@ export class Agent {
     return this.toolRegistry.getAll();
   }
 
-  // ===== System Prompt (ENHANCED) =====
+  // ===== System Prompt =====
+
+    // ===== System Prompt (ENHANCED) =====
 
   private buildSystemPrompt(state: AgentState): string {
     const toolNames = this.toolRegistry.getAll().map((t) => t.name);
@@ -136,7 +138,7 @@ When a task is complex, you will follow this internal loop.
 `;
   }
 
-  // ===== Main Processing Logic (UNCHANGED) =====
+  // ===== Main Processing Logic =====
 
   /**
    * Process a user message through the agentic loop
@@ -150,7 +152,7 @@ When a task is complex, you will follow this internal loop.
     userMessage: string,
     conversationHistory: Message[],
     state: AgentState,
-    callbacks: AgentCallbacks = {},
+    callbacks: AgentCallbacks = {}
   ): Promise<{ response: string; turns: number }> {
     // Validate message size
     if (userMessage.length > this.config.maxMessageSize) {
@@ -159,11 +161,7 @@ When a task is complex, you will follow this internal loop.
 
     // Build system prompt and format history
     const systemPrompt = this.buildSystemPrompt(state);
-    const formattedHistory = this.formatHistory(
-      conversationHistory,
-      systemPrompt,
-      userMessage,
-    );
+    const formattedHistory = this.formatHistory(conversationHistory, systemPrompt, userMessage);
 
     let turn = 0;
     let fullResponse = '';
@@ -177,7 +175,7 @@ When a task is complex, you will follow this internal loop.
         // Status callback
         if (callbacks.onStatus) {
           callbacks.onStatus(
-            turn === 1 ? 'Thinking...' : `Processing step ${turn}...`,
+            turn === 1 ? 'Thinking...' : `Processing step ${turn}...`
           );
         }
 
@@ -204,7 +202,7 @@ When a task is complex, you will follow this internal loop.
           (chunk: string) => {
             fullResponse += chunk;
             batcher.add(chunk);
-          },
+          }
         );
 
         batcher.flush();
@@ -212,13 +210,11 @@ When a task is complex, you will follow this internal loop.
         // Handle external tool calls
         if (response.toolCalls && response.toolCalls.length > 0) {
           console.log(
-            `[Agent] External tool calls: ${response.toolCalls
-              .map((t) => t.name)
-              .join(', ')}`,
+            `[Agent] External tool calls: ${response.toolCalls.map(t => t.name).join(', ')}`
           );
 
           if (callbacks.onToolUse) {
-            callbacks.onToolUse(response.toolCalls.map((t) => t.name));
+            callbacks.onToolUse(response.toolCalls.map(t => t.name));
           }
 
           // Execute external tools
@@ -233,7 +229,7 @@ When a task is complex, you will follow this internal loop.
 
           // Add tool results to history
           const resultsText = toolResults
-            .map((r) => `${r.name}: ${r.success ? 'Success' : 'Failed'}\n${r.result}`)
+            .map(r => `${r.name}: ${r.success ? 'Success' : 'Failed'}\n${r.result}`)
             .join('\n\n');
 
           formattedHistory.push({
@@ -266,21 +262,17 @@ When a task is complex, you will follow this internal loop.
     }
   }
 
-  // ===== Tool Execution (UNCHANGED) =====
+  // ===== Tool Execution =====
 
   private async executeTools(
     toolCalls: ToolCall[],
-    state: AgentState,
+    state: AgentState
   ): Promise<ToolResult[]> {
     const results: ToolResult[] = [];
 
     for (const call of toolCalls) {
       try {
-        const result = await this.toolRegistry.execute(
-          call.name,
-          call.args,
-          state,
-        );
+        const result = await this.toolRegistry.execute(call.name, call.args, state);
         results.push(result);
       } catch (e) {
         results.push({
@@ -294,14 +286,16 @@ When a task is complex, you will follow this internal loop.
     return results;
   }
 
-  // ===== History Formatting (UNCHANGED) =====
+  // ===== History Formatting =====
 
   private formatHistory(
     messages: Message[],
     systemPrompt: string,
-    currentUserMessage: string,
+    currentUserMessage: string
   ): any[] {
-    const formatted: any[] = [{ role: 'system', content: systemPrompt }];
+    const formatted: any[] = [
+      { role: 'system', content: systemPrompt },
+    ];
 
     // Add previous messages
     for (const msg of messages) {
@@ -320,11 +314,11 @@ When a task is complex, you will follow this internal loop.
     return formatted;
   }
 
-  // ===== Chunk Batching (UNCHANGED) =====
+  // ===== Chunk Batching =====
 
   private createChunkBatcher(
     onChunk?: ChunkCallback,
-    flushInterval = 50,
+    flushInterval = 50
   ): { add: (chunk: string) => void; flush: () => void } {
     let buffer = '';
     let timer: ReturnType<typeof setTimeout> | null = null;

@@ -2,6 +2,7 @@ import type { AgentState, Message } from './types';
 import type { GeminiClient, GenerateOptions } from './gemini';
 import type { Tool, ToolCall, ToolResult } from './tools/types';
 import { ToolRegistry } from './tools/registry';
+import { buildSystemPrompt } from './prompts/system-prompt';
 
 export interface AgentConfig {
   maxHistoryMessages?: number;
@@ -41,15 +42,15 @@ export class Agent {
     this.config = {
       maxHistoryMessages: config.maxHistoryMessages ?? 200,
       maxMessageSize: config.maxMessageSize ?? 100_000,
-      maxTurns: config.maxTurns ?? 40, // increased base
-      model: config.model ?? 'gemini-1.5-flash',
-      thinkingBudget: config.thinkingBudget ?? 4096, // raised base
+      maxTurns: config.maxTurns ?? 50, // increased for 2.5 Flash
+      model: config.model ?? 'gemini-2.0-flash-exp', // Updated to 2.5 Flash
+      thinkingBudget: config.thinkingBudget ?? 8192, // increased for 2.5 Flash
       temperature: config.temperature ?? 0.7,
       useSearch: config.useSearch ?? true,
       useCodeExecution: config.useCodeExecution ?? true,
       useMapsGrounding: config.useMapsGrounding ?? false,
       useVision: config.useVision ?? false,
-      tokenBudget: config.tokenBudget ?? 200_000, // raised base
+      tokenBudget: config.tokenBudget ?? 1_000_000, // 2.5 Flash has 1M context
     };
   }
 
@@ -75,52 +76,6 @@ export class Agent {
     return this.toolRegistry.getAll();
   }
 
-  // ===== System Prompt (Hardened for Convergence) =====
-  private buildSystemPrompt(state: AgentState): string {
-    const hasFiles = (state.context?.files?.length ?? 0) > 0;
-    const toolNames = this.toolRegistry.getAll().map(t => t.name);
-    const hasExternalTools = toolNames.length > 0;
-    const cutoffDate = 'November 2025';
-
-    return `You are a lightweight autonomous general intelligence agent powered by Gemini 1.5 Flash — designed for speed, precision, and true independence.
-
-GEMINI 1.5 FLASH SUPERPOWERS:
-- 1M token context → deep chain-of-thought
-- Native tools run inline instantly
-- Lightning-fast streaming & structured reasoning
-
-AUTONOMOUS WORKFLOW (PRIORITIZE INTERNAL THINKING):
-1. PLAN FIRST — ALWAYS use step-by-step CoT in <thinking> tags:
-   <thinking>
-   • Goal: [restate user intent]
-   • Subtasks: [1. ..., 2. ..., 3. ...]
-   • Knowledge gaps: [list only real unknowns]
-   </thinking>
-
-2. SOLVE TOOL-FREE IF POSSIBLE — 70% of tasks don’t need tools. Use knowledge (cutoff: ${cutoffDate}) and reasoning.
-
-3. USE NATIVE TOOLS ONLY WHEN NECESSARY:
-   - Current events → search
-   - Math/data → code execution
-   - Images/files → vision
-   - Location → maps grounding
-
-4. EXTERNAL TOOLS (${hasExternalTools ? toolNames.join(', ') : 'none'}) → only for custom actions.
-
-5. FINALIZE:
-   - Wrap complete answer in <FINAL_ANSWER>...</FINAL_ANSWER>
-   - If incomplete and no tools needed, use <EVOLVE>brief reason</EVOLVE>
-
-CRITICAL CONVERGENCE RULES:
-- ALWAYS close <FINAL_ANSWER>...</FINAL_ANSWER> even if thinkingBudget exhausts.
-- If deeper reasoning needed without tools, end with <EVOLVE>reason</EVOLVE>
-- NEVER output naked text after <thinking> without a terminal tag.
-- Self-check: "Did I close the tag? Is this ready for the user?"
-- Files available: ${hasFiles ? 'Yes → analyze inline' : 'No'}
-
-Be concise yet thorough (200–800 tokens/turn). Think aloud. Act decisively.`;
-  }
-
   // ===== Main Processing Logic =====
   async processMessage(
     userMessage: string,
@@ -139,15 +94,26 @@ Be concise yet thorough (200–800 tokens/turn). Think aloud. Act decisively.`;
     const fileCount = state.context?.files?.length ?? 0;
     const complexityScore = messageTokens + historyTokens + fileCount * 20_000;
 
-    const localThinkingBudget = complexityScore > 30_000 ? 8192 : this.config.thinkingBudget;
-    const localTokenBudget = complexityScore > 30_000 ? 500_000 : this.config.tokenBudget;
-    const localMaxTurns = complexityScore > 30_000 ? 50 : this.config.maxTurns;
+    // 2.5 Flash handles larger contexts better
+    const localThinkingBudget = complexityScore > 50_000 ? 16384 : this.config.thinkingBudget;
+    const localTokenBudget = complexityScore > 50_000 ? 1_000_000 : this.config.tokenBudget;
+    const localMaxTurns = complexityScore > 50_000 ? 60 : this.config.maxTurns;
 
-    if (complexityScore > 30_000) {
-      callbacks.onStatus?.('Complex task detected — boosting budgets (thinking: 8k, tokens: 500k, turns: 50)');
+    if (complexityScore > 50_000) {
+      callbacks.onStatus?.('Complex task detected — boosting budgets (thinking: 16k, tokens: 1M, turns: 60)');
     }
 
-    const systemPrompt = this.buildSystemPrompt(state);
+    const hasFiles = (state.context?.files?.length ?? 0) > 0;
+    const toolNames = this.toolRegistry.getAll().map(t => t.name);
+    const hasExternalTools = toolNames.length > 0;
+
+    const systemPrompt = buildSystemPrompt({
+      hasFiles,
+      toolNames,
+      hasExternalTools,
+      model: this.config.model,
+    });
+
     let history = this.formatHistory(conversationHistory, systemPrompt, userMessage);
     history = await this.trimHistory(history, localTokenBudget);
 
@@ -172,7 +138,7 @@ Be concise yet thorough (200–800 tokens/turn). Think aloud. Act decisively.`;
           useMapsGrounding: this.config.useMapsGrounding,
           useVision: this.config.useVision,
           files: state.context?.files ?? [],
-          stopSequences: [], // Removed — caused early truncation
+          stopSequences: [],
         };
 
         const response = await this.gemini.generateWithTools(
@@ -212,7 +178,7 @@ Be concise yet thorough (200–800 tokens/turn). Think aloud. Act decisively.`;
           const toolResults = await this.executeTools(response.toolCalls, state, signal);
 
           const resultsText = toolResults
-            .map(r => `${r.name}: ${r.success ? 'Success' : 'Failed'}\n${r.result.substring(0, 1500)}`)
+            .map(r => `${r.name}: ${r.success ? 'Success' : 'Failed'}\n${r.result.substring(0, 2000)}`)
             .join('\n\n');
 
           history.push({
@@ -266,7 +232,7 @@ Be concise yet thorough (200–800 tokens/turn). Think aloud. Act decisively.`;
     }
   }
 
-  // ===== Per-Tool Timeout (30s each) =====
+  // ===== Per-Tool Timeout (45s for 2.5 Flash) =====
   private async executeTools(
     toolCalls: ToolCall[],
     state: AgentState,
@@ -277,7 +243,7 @@ Be concise yet thorough (200–800 tokens/turn). Think aloud. Act decisively.`;
         try {
           const toolPromise = this.toolRegistry.execute(call.name, call.args, state);
           const timeoutPromise = new Promise<never>((_, reject) =>
-            setTimeout(() => reject(new Error('Tool timeout (30s)')), 30_000)
+            setTimeout(() => reject(new Error('Tool timeout (45s)')), 45_000)
           );
           const result = await Promise.race([toolPromise, timeoutPromise]);
           return {
@@ -293,7 +259,7 @@ Be concise yet thorough (200–800 tokens/turn). Think aloud. Act decisively.`;
               result: `Failed after retry: ${String(e)}`,
             };
           }
-          await new Promise(r => setTimeout(r, 600));
+          await new Promise(r => setTimeout(r, 800));
         }
       }
       return { name: call.name, success: false, result: 'Unknown error' };
@@ -380,4 +346,4 @@ Be concise yet thorough (200–800 tokens/turn). Think aloud. Act decisively.`;
       flush,
     };
   }
-}""
+}

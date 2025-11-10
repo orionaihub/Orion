@@ -43,7 +43,7 @@ export class Agent {
       maxHistoryMessages: config.maxHistoryMessages ?? 200,
       maxMessageSize: config.maxMessageSize ?? 100_000,
       maxTurns: config.maxTurns ?? 40,
-      model: config.model ?? 'gemini-1.5-flash',
+      model: config.model ?? 'gemini-2.5-flash',
       thinkingBudget: config.thinkingBudget ?? 4096,
       temperature: config.temperature ?? 0.7,
       useSearch: config.useSearch ?? true,

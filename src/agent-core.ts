@@ -1,4 +1,4 @@
-// src/agent-core.ts - Lightweight Autonomous Agent (Gemini 1.5 Flash Optimized - Fully Fixed Nov 2025)
+// src/agent-core.ts - Fixed Autonomous Agent (Gemini 2.5 Flash)
 import type { AgentState, Message } from './types';
 import type { GeminiClient, GenerateOptions } from './gemini';
 import type { Tool, ToolCall, ToolResult } from './tools/types';
@@ -42,15 +42,15 @@ export class Agent {
     this.config = {
       maxHistoryMessages: config.maxHistoryMessages ?? 200,
       maxMessageSize: config.maxMessageSize ?? 100_000,
-      maxTurns: config.maxTurns ?? 40, // increased base
+      maxTurns: config.maxTurns ?? 40,
       model: config.model ?? 'gemini-1.5-flash',
-      thinkingBudget: config.thinkingBudget ?? 4096, // raised base
+      thinkingBudget: config.thinkingBudget ?? 4096,
       temperature: config.temperature ?? 0.7,
       useSearch: config.useSearch ?? true,
       useCodeExecution: config.useCodeExecution ?? true,
       useMapsGrounding: config.useMapsGrounding ?? false,
       useVision: config.useVision ?? false,
-      tokenBudget: config.tokenBudget ?? 200_000, // raised base
+      tokenBudget: config.tokenBudget ?? 200_000,
     };
   }
 
@@ -76,53 +76,48 @@ export class Agent {
     return this.toolRegistry.getAll();
   }
 
-  // ===== System Prompt (Hardened for Convergence) =====
+  // ===== System Prompt (Fixed for Better Convergence) =====
   private buildSystemPrompt(state: AgentState): string {
     const hasFiles = (state.context?.files?.length ?? 0) > 0;
     const toolNames = this.toolRegistry.getAll().map(t => t.name);
     const hasExternalTools = toolNames.length > 0;
     const cutoffDate = 'November 2025';
 
-    return `You are a lightweight autonomous general intelligence agent powered by Gemini 1.5 Flash — designed for speed, precision, and true independence.
+    return `You are an autonomous agent powered by Gemini 2.5 Flash with advanced reasoning capabilities.
 
-GEMINI 1.5 FLASH SUPERPOWERS:
-- 1M token context → deep chain-of-thought
-- Native tools run inline instantly
-- Lightning-fast streaming & structured reasoning
-
-AUTONOMOUS WORKFLOW (PRIORITIZE INTERNAL THINKING):
-1. PLAN FIRST — ALWAYS use step-by-step CoT in <thinking> tags:
+WORKFLOW:
+1. THINK FIRST - Use <thinking> tags for chain-of-thought:
    <thinking>
-   • Goal: [restate user intent]
-   • Subtasks: [1. ..., 2. ..., 3. ...]
-   • Knowledge gaps: [list only real unknowns]
+   - Goal: [what user wants]
+   - Plan: [step by step]
+   - Tools needed: [list or "none"]
    </thinking>
 
-2. SOLVE TOOL-FREE IF POSSIBLE — 70% of tasks don’t need tools. Use knowledge (cutoff: ${cutoffDate}) and reasoning.
+2. SOLVE - Use your knowledge (cutoff: ${cutoffDate}) when possible. Only use tools when necessary:
+   ${this.config.useSearch ? '- Search: current events/recent information' : ''}
+   ${this.config.useCodeExecution ? '- Code: complex calculations/data analysis' : ''}
+   ${hasExternalTools ? `- External tools: ${toolNames.join(', ')}` : ''}
 
-3. USE NATIVE TOOLS ONLY WHEN NECESSARY:
-   - Current events → search
-   - Math/data → code execution
-   - Images/files → vision
-   - Location → maps grounding
+3. RESPOND - Wrap your final answer:
+   <FINAL_ANSWER>
+   [Your complete response to the user]
+   </FINAL_ANSWER>
 
-4. EXTERNAL TOOLS (${hasExternalTools ? toolNames.join(', ') : 'none'}) → only for custom actions.
+4. IF MORE REASONING NEEDED (no tools):
+   <EVOLVE>Brief explanation of what to refine</EVOLVE>
 
-5. FINALIZE:
-   - Wrap complete answer in <FINAL_ANSWER>...</FINAL_ANSWER>
-   - If incomplete and no tools needed, use <EVOLVE>brief reason</EVOLVE>
+CRITICAL RULES:
+- ALWAYS close your tags properly
+- ALWAYS provide <FINAL_ANSWER> when task is complete
+- Tool results will be provided back to you - analyze them and continue
+- Never output naked text without a closing tag
+- Be concise (200-800 tokens per turn)
+${hasFiles ? '- Files are available for analysis' : ''}
 
-CRITICAL CONVERGENCE RULES:
-- ALWAYS close <FINAL_ANSWER>...</FINAL_ANSWER> even if thinkingBudget exhausts.
-- If deeper reasoning needed without tools, end with <EVOLVE>reason</EVOLVE>
-- NEVER output naked text after <thinking> without a terminal tag.
-- Self-check: "Did I close the tag? Is this ready for the user?"
-- Files available: ${hasFiles ? 'Yes → analyze inline' : 'No'}
-
-Be concise yet thorough (200–800 tokens/turn). Think aloud. Act decisively.`;
+Stay focused. Think step-by-step. Complete the task.`;
   }
 
-  // ===== Main Processing Logic =====
+  // ===== Main Processing Logic (FIXED) =====
   async processMessage(
     userMessage: string,
     conversationHistory: Message[],
@@ -145,7 +140,7 @@ Be concise yet thorough (200–800 tokens/turn). Think aloud. Act decisively.`;
     const localMaxTurns = complexityScore > 30_000 ? 50 : this.config.maxTurns;
 
     if (complexityScore > 30_000) {
-      callbacks.onStatus?.('Complex task detected — boosting budgets (thinking: 8k, tokens: 500k, turns: 50)');
+      callbacks.onStatus?.('Complex task detected — boosting budgets');
     }
 
     const systemPrompt = this.buildSystemPrompt(state);
@@ -153,14 +148,14 @@ Be concise yet thorough (200–800 tokens/turn). Think aloud. Act decisively.`;
     history = await this.trimHistory(history, localTokenBudget);
 
     let turn = 0;
-    let fullResponse = '';
-    const batcher = this.createChunkBatcher(callbacks.onChunk);
+    let accumulatedResponse = ''; // Accumulate final answer text
+    let consecutiveEmptyTurns = 0; // Track empty responses
+    let turnsWithoutProgress = 0; // Track stagnation
 
     try {
       while (turn < localMaxTurns) {
         turn++;
         callbacks.onStatus?.(turn === 1 ? 'Planning autonomously...' : `Turn ${turn}/${localMaxTurns}...`);
-
         console.log(`%c[Agent] Turn ${turn}/${localMaxTurns}`, 'color: #00ff88');
 
         const options: GenerateOptions = {
@@ -173,15 +168,17 @@ Be concise yet thorough (200–800 tokens/turn). Think aloud. Act decisively.`;
           useMapsGrounding: this.config.useMapsGrounding,
           useVision: this.config.useVision,
           files: state.context?.files ?? [],
-          stopSequences: [], // Removed — caused early truncation
         };
+
+        let turnResponse = '';
+        const batcher = this.createChunkBatcher(callbacks.onChunk);
 
         const response = await this.gemini.generateWithTools(
           history,
           this.toolRegistry.getAll(),
           options,
           (chunk: string) => {
-            fullResponse += chunk;
+            turnResponse += chunk;
             batcher.add(chunk);
           },
           signal
@@ -189,77 +186,154 @@ Be concise yet thorough (200–800 tokens/turn). Think aloud. Act decisively.`;
 
         batcher.flush();
 
-        // === Always push assistant message first ===
-        history.push({
-          role: 'assistant',
-          content: response.text || fullResponse || '[empty]',
-          toolCalls: response.toolCalls,
-        });
-        history = await this.trimHistory(history, localTokenBudget);
+        // Use the complete response text
+        const fullTurnText = response.text || turnResponse;
+        
+        // Check for empty response
+        if (!fullTurnText.trim()) {
+          consecutiveEmptyTurns++;
+          if (consecutiveEmptyTurns >= 2) {
+            console.warn('[Agent] Multiple empty responses - forcing completion');
+            break;
+          }
+          // Prompt model to continue
+          history.push({ role: 'user', content: 'Please provide your response.' });
+          continue;
+        }
+        
+        consecutiveEmptyTurns = 0;
 
-        // === Robust Final Answer Detection (accepts unclosed) ===
-        const finalMatch = fullResponse.match(/<FINAL_ANSWER>([\s\S]*?)<\/FINAL_ANSWER>/i) ||
-                           fullResponse.match(/<FINAL_ANSWER>([\s\S]*)/i);
+        // === Check for FINAL_ANSWER first (before adding to history) ===
+        const finalMatch = fullTurnText.match(/<FINAL_ANSWER>([\s\S]*?)<\/FINAL_ANSWER>/i) ||
+                           fullTurnText.match(/<FINAL_ANSWER>([\s\S]*)/i); // Handle unclosed
+        
         if (finalMatch) {
-          fullResponse = finalMatch[1].trim();
-          console.log('%c[Agent] Final answer delivered', 'color: gold');
-          break;
+          console.log('%c[Agent] ✓ Final answer detected', 'color: gold');
+          accumulatedResponse = finalMatch[1].trim();
+          
+          // Add the message to history for completeness
+          history.push({
+            role: 'assistant',
+            content: fullTurnText,
+            toolCalls: response.toolCalls,
+          });
+          
+          break; // Exit loop - task complete
         }
 
-        // === Tool Calls ===
-        if (response.toolCalls?.length) {
+        // === Check for tool calls ===
+        if (response.toolCalls && response.toolCalls.length > 0) {
+          console.log(`%c[Agent] Executing ${response.toolCalls.length} tool(s)`, 'color: cyan');
           callbacks.onToolUse?.(response.toolCalls.map(t => t.name));
 
+          // Add assistant message with tool calls
+          history.push({
+            role: 'assistant',
+            content: fullTurnText,
+            toolCalls: response.toolCalls,
+          });
+
+          // Execute tools
           const toolResults = await this.executeTools(response.toolCalls, state, signal);
 
+          // Format results properly for Gemini
           const resultsText = toolResults
-            .map(r => `${r.name}: ${r.success ? 'Success' : 'Failed'}\n${r.result.substring(0, 1500)}`)
-            .join('\n\n');
+            .map(r => {
+              const status = r.success ? '✓ Success' : '✗ Failed';
+              const output = r.result.substring(0, 2000); // Prevent token overflow
+              return `Tool: ${r.name}\nStatus: ${status}\nResult:\n${output}`;
+            })
+            .join('\n\n---\n\n');
 
+          // Add tool results as user message (Gemini pattern)
           history.push({
             role: 'user',
-            content: `Tool Results:\n${resultsText}`,
+            content: `Tool execution results:\n\n${resultsText}\n\nAnalyze these results and continue with your task.`,
           });
 
           history = await this.trimHistory(history, localTokenBudget);
-          fullResponse = '';
+          turnsWithoutProgress = 0; // Reset - we made progress
           continue;
         }
 
-        // === Evolve Tag ===
-        const evolveMatch = fullResponse.match(/<EVOLVE>([\s\S]*?)<\/EVOLVE>/i);
+        // === Check for EVOLVE tag ===
+        const evolveMatch = fullTurnText.match(/<EVOLVE>([\s\S]*?)<\/EVOLVE>/i);
         if (evolveMatch) {
           const reason = evolveMatch[1].trim() || 'continue refinement';
+          console.log(`%c[Agent] Evolving: ${reason}`, 'color: orange');
+          
+          // Add assistant message
+          history.push({
+            role: 'assistant',
+            content: fullTurnText,
+          });
+
+          // Continue evolution
           history.push({
             role: 'user',
-            content: `Continue evolving: ${reason}`,
+            content: `Continue: ${reason}`,
           });
-          fullResponse = '';
+
+          history = await this.trimHistory(history, localTokenBudget);
+          turnsWithoutProgress = 0;
           continue;
         }
 
-        // === Fallback Convergence ===
-        if (turn > 1) {
-          console.log('%c[Agent] No terminal tag — assuming final (consecutive text turn)', 'color: orange');
-          break;
-        }
+        // === No recognized tags - handle stagnation ===
+        turnsWithoutProgress++;
+        
+        // Add message to history
+        history.push({
+          role: 'assistant',
+          content: fullTurnText,
+        });
 
-        if (turn >= 4) {
+        // Force completion after repeated turns without progress
+        if (turnsWithoutProgress >= 3) {
+          console.warn('[Agent] No progress for 3 turns - requesting finalization');
           history.push({
             role: 'user',
-            content: 'You have not used <FINAL_ANSWER> or <EVOLVE> recently. Finalize the answer now.',
+            content: 'You must now finalize your answer. Wrap your complete response in <FINAL_ANSWER> tags.',
           });
-          fullResponse = '';
+          turnsWithoutProgress = 0; // Reset counter
           continue;
         }
 
-        // First turn no tags → natural continuation
-        fullResponse = '';
+        // Early turns without tags - assume thinking/planning
+        if (turn <= 2) {
+          console.log('[Agent] Early turn without tags - continuing');
+          continue;
+        }
+
+        // Prompt for finalization
+        history.push({
+          role: 'user',
+          content: 'Please provide your final answer using <FINAL_ANSWER> tags, or use <EVOLVE> if more reasoning is needed.',
+        });
+        
+        history = await this.trimHistory(history, localTokenBudget);
       }
 
-      const tokensUsed = await this.gemini.countTokens?.(history) ?? Math.ceil(fullResponse.length / 4);
-      callbacks.onDone?.(turn, fullResponse.length, tokensUsed);
-      return { response: fullResponse.trim(), turns: turn, tokensUsed };
+      // === Fallback if no final answer was extracted ===
+      if (!accumulatedResponse.trim() && history.length > 0) {
+        // Get last assistant message
+        for (let i = history.length - 1; i >= 0; i--) {
+          if (history[i].role === 'assistant') {
+            accumulatedResponse = history[i].content || '';
+            break;
+          }
+        }
+      }
+
+      const tokensUsed = await this.gemini.countTokens?.(history) ?? Math.ceil(accumulatedResponse.length / 4);
+      callbacks.onDone?.(turn, accumulatedResponse.length, tokensUsed);
+      
+      return { 
+        response: accumulatedResponse.trim() || 'Task completed with no text output.', 
+        turns: turn, 
+        tokensUsed 
+      };
+
     } catch (e: any) {
       console.error('[Agent] Fatal error:', e);
       callbacks.onError?.(e.message || String(e));
@@ -267,7 +341,7 @@ Be concise yet thorough (200–800 tokens/turn). Think aloud. Act decisively.`;
     }
   }
 
-  // ===== Per-Tool Timeout (30s each) =====
+  // ===== Tool Execution with Timeout =====
   private async executeTools(
     toolCalls: ToolCall[],
     state: AgentState,
@@ -280,18 +354,20 @@ Be concise yet thorough (200–800 tokens/turn). Think aloud. Act decisively.`;
           const timeoutPromise = new Promise<never>((_, reject) =>
             setTimeout(() => reject(new Error('Tool timeout (30s)')), 30_000)
           );
+          
           const result = await Promise.race([toolPromise, timeoutPromise]);
+          
           return {
             name: call.name,
             success: true,
-            result: typeof result === 'string' ? result : JSON.stringify(result),
+            result: typeof result === 'string' ? result : JSON.stringify(result, null, 2),
           };
-        } catch (e) {
+        } catch (e: any) {
           if (attempt === 2) {
             return {
               name: call.name,
               success: false,
-              result: `Failed after retry: ${String(e)}`,
+              result: `Failed after retry: ${e.message || String(e)}`,
             };
           }
           await new Promise(r => setTimeout(r, 600));
@@ -308,9 +384,10 @@ Be concise yet thorough (200–800 tokens/turn). Think aloud. Act decisively.`;
     );
   }
 
-  // ===== Token-Aware History Trimming (with override) =====
+  // ===== Token-Aware History Trimming =====
   private async trimHistory(history: any[], budgetOverride?: number): Promise<any[]> {
     const budget = budgetOverride ?? this.config.tokenBudget;
+    
     if (!this.gemini.countTokens) {
       return history.slice(-this.config.maxHistoryMessages);
     }
@@ -319,6 +396,7 @@ Be concise yet thorough (200–800 tokens/turn). Think aloud. Act decisively.`;
     let used = await this.gemini.countTokens([system]);
     const kept = [system];
 
+    // Keep most recent messages within budget
     for (let i = history.length - 1; i > 0; i--) {
       const msgTokens = await this.gemini.countTokens([history[i]]);
       if (used + msgTokens > budget) break;
@@ -326,6 +404,7 @@ Be concise yet thorough (200–800 tokens/turn). Think aloud. Act decisively.`;
       kept.unshift(history[i]);
     }
 
+    console.log(`[Agent] History trimmed: ${history.length} → ${kept.length} messages (${used} tokens)`);
     return kept;
   }
 
@@ -341,8 +420,9 @@ Be concise yet thorough (200–800 tokens/turn). Think aloud. Act decisively.`;
       const text = Array.isArray(msg.parts)
         ? msg.parts.map((p: any) => p.text || '').join('\n')
         : msg.content || '';
+      
       formatted.push({
-        role: msg.role === 'model' ? 'model' : 'user',
+        role: msg.role === 'model' ? 'assistant' : msg.role,
         content: text,
       });
     }
@@ -351,7 +431,7 @@ Be concise yet thorough (200–800 tokens/turn). Think aloud. Act decisively.`;
     return formatted;
   }
 
-  // ===== Cloudflare Workers-Compatible Chunk Batcher =====
+  // ===== Chunk Batcher =====
   private createChunkBatcher(
     onChunk?: ChunkCallback,
     flushInterval = 50
@@ -375,7 +455,7 @@ Be concise yet thorough (200–800 tokens/turn). Think aloud. Act decisively.`;
       add: (chunk: string) => {
         buffer += chunk;
         if (!handle) {
-          handle = self.setTimeout(flush, flushInterval);
+          handle = setTimeout(flush, flushInterval);
         }
       },
       flush,

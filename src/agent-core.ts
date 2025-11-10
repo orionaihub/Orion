@@ -157,12 +157,17 @@ When a task is complex, you will follow this internal loop.
     userMessage: string,
     conversationHistory: Message[],
     state: AgentState,
-    callbacks: AgentCallbacks = {},
+    callbacks: AgentCallbacks = {}
   ): Promise<{ response: string; turns: number }> {
-    // ... [Initial setup: validation, systemPrompt, formattedHistory, batcher] ...
+    // Validate message size
+    if (userMessage.length > this.config.maxMessageSize) {
+      throw new Error('Message exceeds maximum size');
+    }
 
-    // Set a flag to track if the last turn was a forced execution turn
-    let wasExecutionPhase = false;
+    // Build system prompt and format history
+    const systemPrompt = this.buildSystemPrompt(state);
+    const formattedHistory = this.formatHistory(conversationHistory, systemPrompt, userMessage);
+
     let turn = 0;
     let fullResponse = '';
     const batcher = this.createChunkBatcher(callbacks.onChunk);
@@ -175,13 +180,13 @@ When a task is complex, you will follow this internal loop.
         // Status callback
         if (callbacks.onStatus) {
           callbacks.onStatus(
-            turn === 1 ? 'Thinking...' : `Processing step ${turn}...`,
+            turn === 1 ? 'Thinking...' : `Processing step ${turn}...`
           );
         }
 
         console.log(`[Agent] Turn ${turn}/${this.config.maxTurns}`);
 
-        // Build generation options (UNCHANGED)
+        // Build generation options
         const options: GenerateOptions = {
           model: this.config.model,
           thinkingConfig: { thinkingBudget: this.config.thinkingBudget },
@@ -202,27 +207,23 @@ When a task is complex, you will follow this internal loop.
           (chunk: string) => {
             fullResponse += chunk;
             batcher.add(chunk);
-          },
+          }
         );
 
         batcher.flush();
-        const responseText = fullResponse.trim();
-        const hasExternalToolCalls = response.toolCalls && response.toolCalls.length > 0;
 
-        // --- PHASE 1: Handle Tool Calls (Planning or Action) ---
-        if (hasExternalToolCalls) {
+        // Handle external tool calls
+        if (response.toolCalls && response.toolCalls.length > 0) {
           console.log(
-            `[Agent] External tool calls: ${response.toolCalls!
-              .map((t) => t.name)
-              .join(', ')}`,
+            `[Agent] External tool calls: ${response.toolCalls.map(t => t.name).join(', ')}`
           );
 
           if (callbacks.onToolUse) {
-            callbacks.onToolUse(response.toolCalls!.map((t) => t.name));
+            callbacks.onToolUse(response.toolCalls.map(t => t.name));
           }
 
           // Execute external tools
-          const toolResults = await this.executeTools(response.toolCalls!, state);
+          const toolResults = await this.executeTools(response.toolCalls, state);
 
           // Add assistant's response with tool calls to history
           formattedHistory.push({
@@ -233,92 +234,39 @@ When a task is complex, you will follow this internal loop.
 
           // Add tool results to history
           const resultsText = toolResults
-            .map((r) => `${r.name}: ${r.success ? 'Success' : 'Failed'}\n${r.result}`)
+            .map(r => `${r.name}: ${r.success ? 'Success' : 'Failed'}\n${r.result}`)
             .join('\n\n');
 
           formattedHistory.push({
             role: 'user',
             content: `Tool Results:\n${resultsText}`,
           });
-          
-          const wasPlanNextStep = response.toolCalls!.some(c => c.name === 'planNextStep');
-
-          if (wasPlanNextStep) {
-              // --- PLANNING PHASE RESULT ---
-              // The agent just finished planning a step. We force it to EXECUTE it next.
-              const currentStep = response.toolCalls!.find(c => c.name === 'planNextStep')?.args?.currentStep || 'the next planned step';
-
-              formattedHistory.push({
-                  role: 'user',
-                  content: `[EXECUTE PHASE] Plan acknowledged. Your current step is to execute: "${currentStep}". You must now perform the *action* required to complete this step (e.g., call search implicitly, run code implicitly, or call a specific action tool). Do NOT call 'planNextStep' on this turn.`,
-              });
-              wasExecutionPhase = true;
-          } else {
-              // --- ACTION PHASE RESULT (External Tool) ---
-              // A regular tool (like 'calculator') was run. The agent must reflect and plan the next step.
-              formattedHistory.push({
-                role: 'user',
-                content: `[PLANNING PHASE] The previous action is complete. Please reflect on the tool results and call 'planNextStep' with your updated plan and the next step.`,
-              });
-              wasExecutionPhase = false;
-          }
 
           // Reset for next turn
           fullResponse = '';
           continue;
         }
 
-        // --- PHASE 2: Handle Native/Text Response ---
-        
-        // Check if this text response is the final answer (synthesis).
-        if (wasExecutionPhase && !responseText.includes('Plan:') && responseText.length > 500) {
-            // Heuristic for a final answer: It was an execution phase, and the text is long
-            // and doesn't contain the 'Plan:' structure.
-            console.log('[Agent] Final synthesis received, stopping loop.');
-            break; 
-        }
-
-        // If it was an execution phase but the agent just printed its thoughts/plan update (like your example)
-        if (wasExecutionPhase && (responseText.includes('Plan:') || responseText.includes('Current Step:'))) {
-            // The agent performed an implicit action (e.g., Search) but then immediately wrote a new plan 
-            // as text instead of calling the tool. This breaks the loop.
-            console.log('[Agent] Implicit action complete. Forcing reflection.');
-
-            // Add the model's text response to history
-            formattedHistory.push({
-                role: 'assistant',
-                content: responseText,
-            });
-
-            // Force the agent back into the planning state
-            formattedHistory.push({
-                role: 'user',
-                content: `[PLANNING PHASE] Action complete. You provided text reflection and a new step. Now, you MUST formalize this by calling 'planNextStep' with your updated thoughts and the next action item.`,
-            });
-
-            wasExecutionPhase = false;
-            fullResponse = '';
-            continue;
-        }
-
-        // --- FINAL TERMINATION ---
-        
-        // If we reach here, it's either a simple one-shot answer, or the synthesis text.
-        console.log('[Agent] Final answer received, stopping loop.');
+        // No external tool calls - native tools ran inline
+        console.log('[Agent] Final answer received, stopping loop');
         break;
       }
 
-      // ... [Final cleanup/callbacks] ...
+      // Done callback
       if (callbacks.onDone) {
         callbacks.onDone(turn, fullResponse.length);
       }
 
       return { response: fullResponse, turns: turn };
     } catch (e) {
-      // ... [Error handling] ...
+      console.error('[Agent] Process error:', e);
+      if (callbacks.onError) {
+        callbacks.onError(String(e));
+      }
       throw e;
     }
   }
+
 
 
   // ===== Tool Execution =====

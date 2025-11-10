@@ -85,36 +85,46 @@ export class Agent {
 
     return `You are an autonomous agent powered by Gemini 2.5 Flash with advanced reasoning capabilities.
 
-WORKFLOW:
-1. THINK FIRST - Use <thinking> tags for chain-of-thought:
+MANDATORY WORKFLOW - FOLLOW EXACTLY:
+
+1. THINK (optional) - Use <thinking> for planning:
    <thinking>
    - Goal: [what user wants]
-   - Plan: [step by step]
-   - Tools needed: [list or "none"]
+   - Plan: [steps]
+   - Tools: [list or "none"]
    </thinking>
 
-2. SOLVE - Use your knowledge (cutoff: ${cutoffDate}) when possible. Only use tools when necessary:
+2. ACT - Use tools if needed:
    ${this.config.useSearch ? '- Search: current events/recent information' : ''}
-   ${this.config.useCodeExecution ? '- Code: complex calculations/data analysis' : ''}
+   ${this.config.useCodeExecution ? '- Code: calculations/data analysis' : ''}
    ${hasExternalTools ? `- External tools: ${toolNames.join(', ')}` : ''}
 
-3. RESPOND - Wrap your final answer:
+3. **RESPOND - YOU MUST ALWAYS USE THIS TAG FOR FINAL OUTPUT:**
    <FINAL_ANSWER>
-   [Your complete response to the user]
+   Your complete response to the user goes here.
+   Include all analysis, summaries, and conclusions.
    </FINAL_ANSWER>
 
-4. IF MORE REASONING NEEDED (no tools):
-   <EVOLVE>Brief explanation of what to refine</EVOLVE>
+   **CRITICAL**: After using tools OR after your analysis is complete, you MUST wrap your response in <FINAL_ANSWER> tags. Do NOT just output text directly.
 
-CRITICAL RULES:
-- ALWAYS close your tags properly
-- ALWAYS provide <FINAL_ANSWER> when task is complete
-- Tool results will be provided back to you - analyze them and continue
-- Never output naked text without a closing tag
+4. IF you need more thinking without tools:
+   <EVOLVE>Brief reason</EVOLVE>
+
+EXAMPLES OF CORRECT BEHAVIOR:
+❌ WRONG: "Here's a summary: [content]" (no tags)
+✅ CORRECT: "<FINAL_ANSWER>Here's a summary: [content]</FINAL_ANSWER>"
+
+❌ WRONG: After tool results, output analysis directly
+✅ CORRECT: After tool results, wrap analysis in <FINAL_ANSWER>
+
+RULES:
+- Tool results are provided back to you - analyze them then use <FINAL_ANSWER>
+- Knowledge cutoff: ${cutoffDate}
 - Be concise (200-800 tokens per turn)
-${hasFiles ? '- Files are available for analysis' : ''}
+${hasFiles ? '- Files available for analysis' : ''}
+- **NEVER output your final response without <FINAL_ANSWER> tags**
 
-Stay focused. Think step-by-step. Complete the task.`;
+Remember: Every complete response to the user needs <FINAL_ANSWER> tags!`;
   }
 
   // ===== Main Processing Logic (FIXED) =====
@@ -248,7 +258,7 @@ Stay focused. Think step-by-step. Complete the task.`;
           // Add tool results as user message (Gemini pattern)
           history.push({
             role: 'user',
-            content: `Tool execution results:\n\n${resultsText}\n\nAnalyze these results and continue with your task.`,
+            content: `Tool execution results:\n\n${resultsText}\n\n⚠️ IMPORTANT: Analyze these results and provide your FINAL ANSWER wrapped in <FINAL_ANSWER> tags. Example:\n<FINAL_ANSWER>\n[Your analysis and summary here]\n</FINAL_ANSWER>`,
           });
 
           history = await this.trimHistory(history, localTokenBudget);
@@ -279,7 +289,7 @@ Stay focused. Think step-by-step. Complete the task.`;
           continue;
         }
 
-        // === No recognized tags - handle stagnation ===
+        // === No recognized tags - check if this looks like a final answer ===
         turnsWithoutProgress++;
         
         // Add message to history
@@ -288,12 +298,27 @@ Stay focused. Think step-by-step. Complete the task.`;
           content: fullTurnText,
         });
 
+        // Heuristic: If response is substantial (>100 chars) and looks complete, treat as final
+        const looksLikeFinalAnswer = fullTurnText.length > 100 && 
+                                      !fullTurnText.includes('need more') &&
+                                      !fullTurnText.includes('let me') &&
+                                      (fullTurnText.includes('summary') || 
+                                       fullTurnText.includes('conclusion') ||
+                                       fullTurnText.includes('Here\'s') ||
+                                       fullTurnText.includes('In summary'));
+        
+        if (turnsWithoutProgress >= 2 && looksLikeFinalAnswer) {
+          console.warn('[Agent] Detected complete response without tags - accepting as final');
+          accumulatedResponse = fullTurnText;
+          break;
+        }
+
         // Force completion after repeated turns without progress
         if (turnsWithoutProgress >= 3) {
-          console.warn('[Agent] No progress for 3 turns - requesting finalization');
+          console.warn('[Agent] No progress for 3 turns - forcing finalization');
           history.push({
             role: 'user',
-            content: 'You must now finalize your answer. Wrap your complete response in <FINAL_ANSWER> tags.',
+            content: '⚠️ CRITICAL: You must wrap your response in <FINAL_ANSWER> tags. Example:\n<FINAL_ANSWER>\nYour complete answer here\n</FINAL_ANSWER>\n\nDo this now.',
           });
           turnsWithoutProgress = 0; // Reset counter
           continue;
@@ -305,10 +330,10 @@ Stay focused. Think step-by-step. Complete the task.`;
           continue;
         }
 
-        // Prompt for finalization
+        // Prompt for finalization with stronger language
         history.push({
           role: 'user',
-          content: 'Please provide your final answer using <FINAL_ANSWER> tags, or use <EVOLVE> if more reasoning is needed.',
+          content: 'IMPORTANT: Wrap your final response in <FINAL_ANSWER> tags. If you need more analysis, use <EVOLVE> tags. Do not output text without these tags.',
         });
         
         history = await this.trimHistory(history, localTokenBudget);

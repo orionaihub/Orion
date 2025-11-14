@@ -1,4 +1,4 @@
-// src/durable-storage.ts - Durable Object Storage Management
+// src/durable-storage.ts
 import type { DurableObjectState } from '@cloudflare/workers-types';
 import type { AgentState, Message } from './types';
 
@@ -11,8 +11,8 @@ interface SqlStorage {
 }
 
 /**
- * Manages persistent storage for Durable Objects
- * Handles SQLite operations and state management
+ * Durable Object storage wrapper for SQLite + DO ephemeral state.
+ * Compatible with D1-in-DO SQL binding.
  */
 export class DurableStorage {
   private state: DurableObjectState;
@@ -26,37 +26,46 @@ export class DurableStorage {
     this.initialize();
   }
 
-  // ===== Initialization =====
+  // --------------------------------------
+  // Initialization
+  // --------------------------------------
 
   private initialize(): void {
     try {
-      if (this.sql) {
-        this.sql.exec(`
-          CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            role TEXT NOT NULL,
-            parts TEXT NOT NULL,
-            timestamp INTEGER NOT NULL
-          );
-          CREATE TABLE IF NOT EXISTS kv (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-          );
-          CREATE INDEX IF NOT EXISTS idx_msg_ts ON messages(timestamp);
-        `);
-      }
+      if (!this.sql) return;
+
+      // MUST be 1 statement per exec() — D1 inside DO does not allow multi-statement exec.
+      this.sql.exec(`
+        CREATE TABLE IF NOT EXISTS messages (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          role TEXT NOT NULL,
+          parts TEXT NOT NULL,
+          timestamp INTEGER NOT NULL
+        )
+      `);
+
+      this.sql.exec(`
+        CREATE TABLE IF NOT EXISTS kv (
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL
+        )
+      `);
+
+      this.sql.exec(`
+        CREATE INDEX IF NOT EXISTS idx_msg_ts ON messages(timestamp)
+      `);
+
     } catch (e) {
       console.error('[DurableStorage] SQLite init failed:', e);
     }
   }
 
-  // ===== Message Operations =====
+  // --------------------------------------
+  // Message Operations
+  // --------------------------------------
 
   async saveMessage(role: 'user' | 'model', parts: Array<{ text: string }>): Promise<void> {
-    if (!this.sql) {
-      console.warn('[DurableStorage] SQLite not available');
-      return;
-    }
+    if (!this.sql) return;
 
     try {
       this.sql.exec(
@@ -74,38 +83,48 @@ export class DurableStorage {
   getMessages(limit?: number): Message[] {
     if (!this.sql) return [];
 
-    const actualLimit = Math.min(limit ?? this.maxHistoryMessages, this.maxHistoryMessages);
-    const rows = this.sql
-      .exec(`SELECT role, parts, timestamp FROM messages ORDER BY timestamp DESC LIMIT ?`, actualLimit)
-      .toArray();
+    try {
+      const actualLimit = Math.min(limit ?? this.maxHistoryMessages, this.maxHistoryMessages);
 
-    const messages: Message[] = [];
+      const rows = this.sql
+        .exec(
+          `SELECT role, parts, timestamp
+           FROM messages
+           ORDER BY timestamp DESC
+           LIMIT ?`,
+          actualLimit
+        )
+        .toArray();
 
-    for (const r of rows.reverse()) {
-      try {
-        const parts = JSON.parse(r.parts as string);
-        if (parts) {
+      const messages: Message[] = [];
+
+      for (const r of rows.reverse()) {
+        try {
+          const parts = JSON.parse(r.parts as string);
           messages.push({
             role: r.role as 'user' | 'model',
             parts,
             timestamp: r.timestamp as number,
           });
+        } catch (e) {
+          console.warn('[DurableStorage] Failed to parse message:', e);
         }
-      } catch (e) {
-        console.warn('[DurableStorage] Failed to parse message:', e);
       }
-    }
 
-    // Remove consecutive duplicate user messages
-    let i = messages.length - 1;
-    while (i > 0) {
-      if (messages[i].role === 'user' && messages[i - 1].role === 'user') {
-        messages.splice(i, 1);
+      // Deduplicate consecutive user messages
+      let i = messages.length - 1;
+      while (i > 0) {
+        if (messages[i].role === 'user' && messages[i - 1].role === 'user') {
+          messages.splice(i, 1);
+        }
+        i--;
       }
-      i--;
-    }
 
-    return messages;
+      return messages;
+    } catch (e) {
+      console.error('[DurableStorage] Failed to get messages:', e);
+      return [];
+    }
   }
 
   async clearMessages(): Promise<void> {
@@ -120,23 +139,28 @@ export class DurableStorage {
     }
   }
 
-  // ===== State Operations =====
+  // --------------------------------------
+  // State (Session) Operations
+  // --------------------------------------
 
   async loadState(): Promise<AgentState> {
     let state: AgentState | null = null;
 
     try {
       if (this.sql) {
-        const row = this.sql.exec(`SELECT value FROM kv WHERE key = ?`, 'state').one();
-        if (row && typeof row.value === 'string') {
-          state = JSON.parse(row.value);
+        const rows = this.sql
+          .exec(`SELECT value FROM kv WHERE key = ?`, 'state')
+          .toArray();
+
+        if (rows.length === 1) {
+          state = JSON.parse(rows[0].value as string);
         }
       }
     } catch (e) {
-      console.error('[DurableStorage] Failed to load state:', e);
+      console.log('[DurableStorage] No existing state found (creating new)');
     }
 
-    // Create default state if none exists
+    // Create a default state if none exists
     if (!state || !state.sessionId) {
       state = {
         conversationHistory: [],
@@ -150,18 +174,15 @@ export class DurableStorage {
   }
 
   async saveState(state: AgentState): Promise<void> {
-    if (!this.sql) {
-      console.warn('[DurableStorage] SQLite not available');
-      return;
-    }
+    if (!this.sql) return;
 
     try {
-      const stateStr = JSON.stringify(state);
       this.sql.exec(
-        `INSERT INTO kv (key, value) VALUES (?, ?)
+        `INSERT INTO kv (key, value)
+         VALUES (?, ?)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
         'state',
-        stateStr
+        JSON.stringify(state)
       );
     } catch (e) {
       console.error('[DurableStorage] Failed to save state:', e);
@@ -173,14 +194,16 @@ export class DurableStorage {
     if (!this.sql) return;
 
     try {
-      this.sql.exec('DELETE FROM kv WHERE key = ?', 'state');
+      this.sql.exec(`DELETE FROM kv WHERE key = ?`, 'state');
     } catch (e) {
       console.error('[DurableStorage] Failed to clear state:', e);
       throw e;
     }
   }
 
-  // ===== Transaction Management =====
+  // --------------------------------------
+  // Transaction Management
+  // --------------------------------------
 
   async withTransaction<T>(fn: (state: AgentState) => Promise<T>): Promise<T> {
     return this.state.blockConcurrencyWhile(async () => {
@@ -191,7 +214,9 @@ export class DurableStorage {
     });
   }
 
-  // ===== Utility Methods =====
+  // --------------------------------------
+  // Utility Methods
+  // --------------------------------------
 
   async clearAll(): Promise<void> {
     if (!this.sql) return;
@@ -206,8 +231,8 @@ export class DurableStorage {
     }
   }
 
-  getStatus(): { 
-    sessionId: string | null; 
+  getStatus(): {
+    sessionId: string | null;
     lastActivity: number | null;
     messageCount: number;
   } {
@@ -217,17 +242,25 @@ export class DurableStorage {
 
     try {
       if (this.sql) {
-        // Get state
-        const stateRow = this.sql.exec(`SELECT value FROM kv WHERE key = ?`, 'state').one();
-        if (stateRow) {
-          const state = JSON.parse(stateRow.value as string);
+        // Load state safely
+        const rows = this.sql
+          .exec(`SELECT value FROM kv WHERE key = ?`, 'state')
+          .toArray();
+
+        if (rows.length === 1) {
+          const state = JSON.parse(rows[0].value as string);
           sessionId = state?.sessionId ?? null;
           lastActivity = state?.lastActivityAt ?? null;
         }
 
-        // Get message count
-        const countRow = this.sql.exec(`SELECT COUNT(*) as count FROM messages`).one();
-        messageCount = countRow?.count ?? 0;
+        // Count messages
+        const countRows = this.sql
+          .exec(`SELECT COUNT(*) AS count FROM messages`)
+          .toArray();
+
+        if (countRows.length === 1) {
+          messageCount = countRows[0].count ?? 0;
+        }
       }
     } catch (e) {
       console.error('[DurableStorage] Failed to get status:', e);
@@ -236,8 +269,9 @@ export class DurableStorage {
     return { sessionId, lastActivity, messageCount };
   }
 
-  // Allow external access to the Durable Object state for advanced use cases
   getDurableObjectState(): DurableObjectState {
     return this.state;
   }
 }
+
+export default DurableStorage;

@@ -1,4 +1,4 @@
-// src/gemini.ts - LLM Wrapper (Refactored)
+// src/gemini.ts - LLM Wrapper (Refactored + Embedding support)
 import { GoogleGenAI } from '@google/genai';
 import type { FileMetadata } from './types';
 
@@ -87,8 +87,16 @@ class CircuitBreaker {
 }
 
 /**
- * Gemini API Client - Pure LLM wrapper
- * Handles only communication with Gemini API
+ * Gemini API Client - Pure LLM wrapper + Embedding helpers
+ *
+ * Notes:
+ * - Default embedding model: "text-embedding-004" (Free tier friendly)
+ * - Embedding methods:
+ *    - embedText(text, opts) => Promise<number[]>
+ *    - embedBatch(texts[], opts) => Promise<number[][]>
+ *
+ * If your GoogleGenAI SDK exposes a different embedding method name, adapt
+ * the internal call in callEmbedApi() accordingly.
  */
 export class GeminiClient {
   private ai: ReturnType<typeof GoogleGenAI>;
@@ -97,11 +105,15 @@ export class GeminiClient {
   private defaultTimeoutMs = 60_000;
   private circuitBreaker = new CircuitBreaker();
 
+  // Embedding defaults
+  private readonly DEFAULT_EMBED_MODEL = 'text-embedding-004';
+  private readonly DEFAULT_EMBED_DIM = 768; // expected dimensionality; used only for validation
+
   constructor(opts?: { apiKey?: string }) {
     this.ai = new GoogleGenAI({ apiKey: opts?.apiKey });
   }
 
-  // ===== Main Generation Method =====
+  // ===== Main Generation Method (unchanged public surface) =====
 
   /**
    * Generate content with optional tool support
@@ -161,7 +173,152 @@ export class GeminiClient {
     });
   }
 
-  // ===== File Management =====
+  // ===== Embedding API (new) =====
+
+  /**
+   * Embed a single text string and return a normalized vector (number[]).
+   * Non-breaking: small helper used by MemoryTool.
+   */
+  async embedText(text: string, opts?: { model?: string; normalize?: boolean; timeoutMs?: number }): Promise<number[]> {
+    if (typeof text !== 'string') throw new Error('embedText expects a string');
+    const model = opts?.model ?? this.DEFAULT_EMBED_MODEL;
+    const timeoutMs = opts?.timeoutMs ?? this.defaultTimeoutMs;
+    const res = await this.withRetry(async () => {
+      const raw = await this.callEmbedApi([text], { model, timeoutMs });
+      if (!raw || !Array.isArray(raw) || raw.length === 0) throw new Error('Empty embedding response');
+      const vec = raw[0];
+      return opts?.normalize === false ? vec : this.normalize(vec);
+    });
+    return res;
+  }
+
+  /**
+   * Embed a batch of texts. Returns an array of vectors aligned with the input order.
+   * Handles chunking internally if texts are long (but you can pre-chunk if desired).
+   */
+  async embedBatch(texts: string[], opts?: { model?: string; normalize?: boolean; timeoutMs?: number; batchSize?: number }): Promise<number[][]> {
+    if (!Array.isArray(texts)) throw new Error('embedBatch expects string[]');
+    const model = opts?.model ?? this.DEFAULT_EMBED_MODEL;
+    const timeoutMs = opts?.timeoutMs ?? this.defaultTimeoutMs;
+    const batchSize = opts?.batchSize ?? 16;
+
+    const allEmbeddings: number[][] = [];
+    // Batch the inputs to avoid large single calls
+    for (let i = 0; i < texts.length; i += batchSize) {
+      const slice = texts.slice(i, i + batchSize);
+      const raw = await this.withRetry(async () => {
+        return await this.callEmbedApi(slice, { model, timeoutMs });
+      });
+      if (!raw || !Array.isArray(raw)) throw new Error('Invalid embedding batch response');
+      for (const v of raw) {
+        allEmbeddings.push(opts?.normalize === false ? v : this.normalize(v));
+      }
+    }
+
+    return allEmbeddings;
+  }
+
+  /**
+   * Low-level embedding caller.
+   * Adapts to the SDK you have: many SDKs expose `ai.models.embedContent(...)` or `ai.embeddings.create(...)`.
+   *
+   * NOTE: If your GoogleGenAI SDK uses a different method name, update this function accordingly.
+   */
+  private async callEmbedApi(texts: string[], opts: { model: string; timeoutMs: number }): Promise<number[][]> {
+    // Defensive: remove empty strings and coerce input
+    const clean = texts.map(t => (typeof t === 'string' ? t : String(t)));
+    if (clean.length === 0) return [];
+
+    // Preferential API call paths (try to be compatible with multiple SDK variants)
+    // 1) try ai.models.embedContent(...)
+    // 2) try ai.embeddings.create(...)
+    // 3) fallback: try ai.models.generateContent with "embed" task (rare)
+    try {
+      // Attempt path #1
+      if (typeof (this.ai as any)?.models?.embedContent === 'function') {
+        const call = (this.ai as any).models.embedContent({
+          model: opts.model,
+          input: clean,
+        });
+        const resp = await this.withTimeout(call, 'embedContent timeout', opts.timeoutMs);
+        // normalize expected shape:
+        // { embeddings: [{ values: number[] }, ...] } or { data: [{ embedding: number[] }, ...] }
+        const embeddings: number[][] = [];
+        if (resp?.embeddings && Array.isArray(resp.embeddings)) {
+          for (const e of resp.embeddings) {
+            if (Array.isArray(e?.values)) embeddings.push(e.values);
+            else if (Array.isArray(e)) embeddings.push(e);
+            else if (Array.isArray(e?.vector)) embeddings.push(e.vector);
+          }
+        } else if (resp?.data && Array.isArray(resp.data)) {
+          for (const d of resp.data) {
+            if (Array.isArray(d?.embedding)) embeddings.push(d.embedding);
+          }
+        } else if (Array.isArray(resp)) {
+          // some SDKs return raw array
+          for (const item of resp) {
+            if (Array.isArray(item)) embeddings.push(item);
+          }
+        }
+        if (embeddings.length > 0) return embeddings;
+      }
+
+      // Attempt path #2
+      if (typeof (this.ai as any)?.embeddings?.create === 'function') {
+        const call = (this.ai as any).embeddings.create({
+          model: opts.model,
+          input: clean,
+        });
+        const resp = await this.withTimeout(call, 'embeddings.create timeout', opts.timeoutMs);
+        // expected resp.data[].embedding
+        const embeddings: number[][] = [];
+        if (resp?.data && Array.isArray(resp.data)) {
+          for (const d of resp.data) {
+            if (Array.isArray(d?.embedding)) embeddings.push(d.embedding);
+          }
+        }
+        if (embeddings.length > 0) return embeddings;
+      }
+
+      // Attempt path #3 (less likely)
+      if (typeof (this.ai as any)?.models?.generateContent === 'function') {
+        // Some SDKs allow specifying taskType/embed via generateContent
+        const call = (this.ai as any).models.generateContent({
+          model: opts.model,
+          contents: clean.map(c => ({ text: c })),
+          config: { task: 'embed' },
+        });
+        const resp = await this.withTimeout(call, 'generateContent(embed) timeout', opts.timeoutMs);
+        // try to parse embeddings
+        if (resp?.embeddings && Array.isArray(resp.embeddings)) {
+          return resp.embeddings.map((b: any) => Array.isArray(b.values) ? b.values : b);
+        }
+      }
+
+      // If none matched, throw to trigger fallback path
+      throw new Error('No compatible embedding API found on GoogleGenAI SDK instance');
+    } catch (err) {
+      console.error('[GeminiClient] callEmbedApi error:', err);
+      throw err;
+    }
+  }
+
+  /**
+   * Normalize vector to unit length (cosine similarity).
+   * Returns a new array.
+   */
+  private normalize(vec: number[]): number[] {
+    if (!Array.isArray(vec) || vec.length === 0) return vec;
+    let sumSq = 0;
+    for (let i = 0; i < vec.length; i++) {
+      const v = Number(vec[i]) || 0;
+      sumSq += v * v;
+    }
+    const mag = Math.sqrt(sumSq) || 1;
+    return vec.map(v => Number(v) / mag);
+  }
+
+  // ===== File Management (unchanged public surface) =====
 
   async uploadFile(
     fileDataBase64: string,
@@ -171,9 +328,9 @@ export class GeminiClient {
     return this.withRetry(async () => {
       const buffer = Buffer.from(fileDataBase64, 'base64');
       const uploadResp: any = await this.withTimeout(
-        this.ai.files.upload({ 
-          file: buffer as any, 
-          config: { mimeType, displayName } 
+        this.ai.files.upload({
+          file: buffer as any,
+          config: { mimeType, displayName }
         }),
         'uploadFile timed out'
       );
@@ -218,7 +375,7 @@ export class GeminiClient {
     }
   }
 
-  // ===== Internal Helper Methods =====
+  // ===== Internal Helper Methods (unchanged gen flow) =====
 
   private formatConversationHistory(history: any[]): any[] {
     return history.map(msg => {
@@ -496,7 +653,7 @@ export class GeminiClient {
     const tm = ms ?? this.defaultTimeoutMs;
     return Promise.race([
       promise,
-      new Promise<T>((_, reject) => 
+      new Promise<T>((_, reject) =>
         setTimeout(() => reject(new Error(errorMsg)), tm)
       ),
     ]);

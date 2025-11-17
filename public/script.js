@@ -1,414 +1,444 @@
-/*  Orion-Chat ‑ fixed frontend  */
-/*  fixes: 1) typo “frentend” → “frontend”
-          2) undeclared i18n helpers
-          3) race on ws.send while CONNECTING
-          4) marked hljs called before libs loaded
-          5) orphan ws on page unload
-          6) double-send on rapid <Enter>
-          7) missing LBS/geo helper stubs          */
+/* script.js — FIXED VERSION WITH BETTER ERROR HANDLING */
 
-/* ---------- 0.  tiny helpers ---------- */
-const sleep = ms => new Promise(r => setTimeout(r, ms));
-const escapeHtml = text => {                       // keep util local
-  const d = document.createElement('div');
-  d.textContent = String(text);
+/* ---------- Utility ---------- */
+
+function $(id) { return document.getElementById(id); }
+
+function escapeHtml(str) {
+  const d = document.createElement("div");
+  d.textContent = str;
   return d.innerHTML;
-};
-
-/* ---------- 1.  wait for libs ---------- */
-let libsReady = false;
-function waitLibs() {
-  return new Promise(res => {
-    const t = setInterval(() => {
-      if (typeof marked !== 'undefined' && typeof hljs !== 'undefined') {
-        clearInterval(t);
-        libsReady = true;
-        res();
-      }
-    }, 60);
-  });
 }
 
-/* ---------- 2.  DOM cache ---------- */
-const $ = id => document.getElementById(id);
-const chatContainer   = $('chat-container');
-const chatMessages    = $('messages-wrapper');
-const welcomeScreen   = $('welcome-message');
-const userInput       = $('chat-input');
-const sendButton      = $('send-button');
-const typingIndicator = $('typing-indicator');
-const typingText      = $('typing-text');
-const fileInput       = $('file-input');
-const filePreview     = $('file-preview');
-const sidebar         = $('sidebar');
-const menuBtn         = $('menu-btn');
-const overlay         = $('overlay');
-
-/* ---------- 3.  state ---------- */
-let ws, isConnecting = false, reconnectAttempts = 0;
-let isProcessing = false, currentMessageEl = null;
-let pendingFiles = [], conversationStarted = false;
-const MAX_RECONNECT_DELAY = 30000;
-
-/* ---------- 4.  init ---------- */
-window.addEventListener('DOMContentLoaded', async () => {
-  await waitLibs();                       // ← make sure libs exist
-  configureMarked();
-  loadChatHistory();
-  connectWebSocket();
-  setupFileUpload();
-  setupInputHandlers();
-  setupSidebarToggle();
-  checkMobileView();
-});
-window.addEventListener('resize', checkMobileView);
-window.addEventListener('beforeunload', () => ws && ws.close()); // tidy-up
-
-/* ---------- 5.  marked ---------- */
-function configureMarked() {
-  marked.setOptions({
-    breaks: true,
-    gfm: true,
-    headerIds: false,
-    mangle: false,
-    highlight(code, lang) {
-      if (lang && hljs.getLanguage(lang)) {
-        try { return hljs.highlight(code, {language: lang}).value; }
-        catch {}
-      }
-      return hljs.highlightAuto(code).value;
-    }
-  });
+function renderMarkdown(md) {
+  const html = marked.parse(md || "");
+  const w = document.createElement("div");
+  w.innerHTML = html;
+  w.querySelectorAll("pre code").forEach(c => hljs.highlightElement(c));
+  return w.innerHTML;
 }
 
-/* ---------- 6.  websocket ---------- */
-async function connectWebSocket() {
-  if ((ws && ws.readyState === WebSocket.OPEN) || isConnecting) return;
-  isConnecting = true;
-  updateConnectionStatus('Connecting…', 'bg-gray-500');
+/* ---------- DOM ---------- */
 
-  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const port = location.port ? ':' + location.port : '';
-  const url = `${protocol}//${location.hostname}${port}/api/ws`;
+const sessionsDrawer = $("sessions-drawer");
+const openDrawerBtn = $("open-drawer-btn");
+const closeDrawerBtn = $("close-drawer-btn");
+const sessionsList = $("sessions-list");
+const selectedSession = $("selected-session");
+const newSessionBtn = $("new-session-btn");
 
+const messagesWrapper = $("messages-wrapper");
+const chatForm = $("chat-form");
+const chatInput = $("chat-input");
+const sendButton = $("send-button");
+const fileInput = $("file-input");
+const filePreview = $("file-preview");
+
+const typingIndicator = $("typing-indicator");
+const clearSessionBtn = $("clear-session-btn");
+const statusDot = $("status-dot");
+const statusText = $("status-text");
+
+/* ---------- State ---------- */
+
+let sessionId = localStorage.getItem("orion:sessionId") || null;
+let ws = null;
+let wsOpen = false;
+let streamingEl = null;
+let streamBuffer = '';
+let isSending = false;
+let reconnectAttempts = 0;
+const MAX_RECONNECT_ATTEMPTS = 3;
+
+/* ---------- Status ---------- */
+
+function setStatus(t, c) {
+  statusText.textContent = t;
+  statusDot.className = `w-2 h-2 rounded-full ${c}`;
+}
+
+function showTyping(t = "Thinking…") {
+  typingIndicator.textContent = t;
+  typingIndicator.classList.remove("hidden");
+}
+
+function hideTyping() {
+  typingIndicator.classList.add("hidden");
+}
+
+function scrollBottom() {
+  const el = document.getElementById("messages-area");
+  if (el) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+}
+
+/* ---------- Sessions ---------- */
+
+async function loadSessions() {
   try {
-    ws = new WebSocket(url);
+    const r = await fetch("/api/sessions");
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const d = await r.json();
+    renderSessions(d.sessions || []);
   } catch (e) {
-    console.error('WS create error', e);
-    isConnecting = false;
-    scheduleReconnect(); return;
+    console.error('Failed to load sessions:', e);
+    sessionsList.innerHTML = `<div class="text-sm text-red-400 p-2">Failed to load sessions</div>`;
   }
-
-  ws.onopen = () => {
-    isConnecting = false; reconnectAttempts = 0;
-    updateConnectionStatus('Connected', 'bg-teal-500');
-  };
-  ws.onclose = () => { isConnecting = false; updateConnectionStatus('Disconnected', 'bg-red-500'); scheduleReconnect(); };
-  ws.onerror = e => { console.error('WS error', e); updateConnectionStatus('Error', 'bg-red-500'); };
-  ws.onmessage = e => {
-    try { handleServerMessage(JSON.parse(e.data)); }
-    catch (err) { console.error('Bad json', err, e.data); }
-  };
 }
 
-function scheduleReconnect() {
-  const delay = Math.min(1000 * Math.pow(2, reconnectAttempts++), MAX_RECONNECT_DELAY);
-  setTimeout(connectWebSocket, delay);
-}
-
-/* ---------- 7.  mobile ---------- */
-function checkMobileView() {
-  const mobile = window.innerWidth <= 768;
-  sidebar.classList.toggle('-translate-x-full', mobile);
-  overlay.classList.toggle('hidden', true);
-}
-function setupSidebarToggle() {
-  menuBtn?.addEventListener('click', () => {
-    sidebar.classList.toggle('-translate-x-full');
-    overlay.classList.toggle('hidden');
-  });
-  overlay?.addEventListener('click', () => {
-    sidebar.classList.add('-translate-x-full');
-    overlay.classList.add('hidden');
-  });
-  $('new-chat-btn')?.addEventListener('click', () => {
-    clearChat();
-    if (window.innerWidth <= 768) { sidebar.classList.add('-translate-x-full'); overlay.classList.add('hidden'); }
-  });
-}
-
-/* ---------- 8.  file upload ---------- */
-function setupFileUpload() {
-  fileInput.addEventListener('change', async e => {
-    const files = Array.from(e.target.files);
-    for (const file of files) {
-      if (file.size > 20 * 1024 * 1024) { addToast(`${file.name} too large`, 'error'); continue; }
+function renderSessions(list) {
+  sessionsList.innerHTML = "";
+  if (!list.length) {
+    sessionsList.innerHTML = `<div class="text-sm text-gray-500 p-2">No sessions. Tap New.</div>`;
+    selectedSession.textContent = "none";
+    return;
+  }
+  list.forEach(s => {
+    const i = document.createElement("div");
+    i.className = "flex items-center justify-between p-2 rounded hover:bg-white/5";
+    i.innerHTML = `
+      <div class="flex-1 min-w-0">
+        <div class="text-sm font-medium truncate">${escapeHtml(s.title || s.sessionId)}</div>
+        <div class="text-xs text-gray-400 truncate">${new Date(s.lastActivityAt || s.createdAt).toLocaleString()}</div>
+      </div>
+      <div class="flex items-center gap-2 ml-3">
+        <button class="text-xs px-2 py-1 bg-white/10 rounded open-btn">Open</button>
+        <button class="text-xs px-2 py-1 bg-red-600 rounded delete-btn">Del</button>
+      </div>`;
+    i.querySelector(".open-btn").onclick = e => { e.stopPropagation(); selectSession(s.sessionId); };
+    i.querySelector(".delete-btn").onclick = async e => {
+      e.stopPropagation();
+      if (!confirm("Delete this session?")) return;
       try {
-        const base64 = await fileToBase64(file);
-        pendingFiles.push({data: base64.split(',')[1], mimeType: file.type, name: file.name, size: file.size});
-        addFileChip(file);
-        addToast(`Added ${file.name}`, 'success');
-      } catch { addToast(`Failed ${file.name}`, 'error'); }
-    }
-    fileInput.value = ''; updateFilePreview();
+        await fetch(`/api/sessions/${encodeURIComponent(s.sessionId)}`, { method: "DELETE" });
+        if (sessionId === s.sessionId) {
+          sessionId = null;
+          localStorage.removeItem("orion:sessionId");
+          messagesWrapper.innerHTML = "";
+          selectedSession.textContent = "none";
+        }
+        loadSessions();
+      } catch (err) {
+        console.error('Delete failed:', err);
+        alert('Failed to delete session');
+      }
+    };
+    sessionsList.appendChild(i);
   });
-}
-function fileToBase64(file) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result);
-    reader.onerror = reject;
-    reader.readAsDataURL(file);
-  });
-}
-function addFileChip(file) {
-  const chip = document.createElement('div');
-  chip.className = 'flex items-center gap-2 px-3 py-1 rounded-full bg-white/10 text-xs text-white';
-  chip.dataset.fileName = file.name;
-  chip.innerHTML = `
-    <span>${getFileIcon(file.type, file.name)}</span>
-    <span class="truncate max-w-[150px]">${escapeHtml(file.name)}</span>
-    <span class="text-gray-400">(${formatFileSize(file.size)})</span>
-    <button type="button" class="text-gray-400 hover:text-white transition-colors ml-1" onclick="removeFileChip('${escapeHtml(file.name)}')" aria-label="Remove file">
-      <svg class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor"><path d="M6.28 5.22a.75.75 0 00-1.06 1.06L8.94 10l-3.72 3.72a.75.75 0 101.06 1.06L10 11.06l3.72 3.72a.75.75 0 101.06-1.06L11.06 10l3.72-3.72a.75.75 0 00-1.06-1.06L10 8.94 6.28 5.22z"/></svg>
-    </button>`;
-  filePreview.appendChild(chip);
-}
-window.removeFileChip = function(name) {
-  pendingFiles = pendingFiles.filter(f => f.name !== name);
-  document.querySelectorAll(`[data-file-name="${CSS.escape(name)}"]`).forEach(el => el.remove());
-  updateFilePreview();
-};
-function updateFilePreview() {} // placeholder
-function formatFileSize(b) {
-  return b < 1024 ? b + ' B' : b < 1048576 ? (b / 1024).toFixed(1) + ' KB' : (b / 1048576).toFixed(1) + ' MB';
-}
-function getFileIcon(mime, name) {
-  if (mime.startsWith('image/')) return '🖼️';
-  if (mime.includes('pdf')) return '📄';
-  if (mime.includes('word') || name.endsWith('.doc') || name.endsWith('.docx')) return '📝';
-  if (mime.includes('sheet') || name.endsWith('.csv') || name.endsWith('.xlsx')) return '📊';
-  if (mime.includes('json')) return '📋';
-  if (mime.includes('text')) return '📃';
-  return '📎';
 }
 
-/* ---------- 9.  input ---------- */
-function setupInputHandlers() {
-  const form = $('chat-form');
-  userInput.addEventListener('input', () => {
-    userInput.style.height = 'auto';
-    userInput.style.height = Math.min(userInput.scrollHeight, 200) + 'px';
-  });
-  if (form) {
-    form.addEventListener('submit', e => { e.preventDefault(); sendMessage(); });
-  } else {
-    userInput.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); } });
-    sendButton.addEventListener('click', sendMessage);
-  }
-  const toolsBtn = $('tools-btn'), toolsPopup = $('tools-popup');
-  if (toolsBtn && toolsPopup) {
-    toolsBtn.addEventListener('click', () => toolsPopup.classList.toggle('pointer-events-none'));
-    document.addEventListener('click', e => {
-      if (!toolsPopup.contains(e.target) && !toolsBtn.contains(e.target)) toolsPopup.classList.add('pointer-events-none');
+/* ---------- Create Session ---------- */
+
+async function createSession(auto = false) {
+  const title = auto ? "New Chat" : (prompt("Session title:", "New Chat") || "New Chat");
+  try {
+    const r = await fetch("/api/sessions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title })
     });
-  }
-}
-
-/* ---------- 10.  send ---------- */
-async function sendMessage() {
-  const msg = userInput.value.trim();
-  if ((msg === '' && pendingFiles.length === 0) || isProcessing) return;
-  if (!ws || ws.readyState !== WebSocket.OPEN) {
-    addToast('Connecting…', 'info');
-    connectWebSocket();
-    await sleep(1200);
-    if (!ws || ws.readyState !== WebSocket.OPEN) { addToast('Still connecting – please retry', 'error'); return; }
-  }
-  isProcessing = true; disableInput();
-  hideWelcome();
-  addUserMessage(msg || 'Sent files for analysis.');
-  userInput.value = ''; userInput.style.height = 'auto';
-  showTypingIndicator('Processing…');
-  try {
-    ws.send(JSON.stringify({type: 'user_message', content: msg, files: pendingFiles}));
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const d = await r.json();
+    sessionId = d.sessionId;
+    localStorage.setItem("orion:sessionId", sessionId);
+    messagesWrapper.innerHTML = "";
+    selectedSession.textContent = d.sessionId;
+    filePreview.innerHTML = "";
+    clearSessionBtn.classList.remove("hidden");
+    console.log('Created session:', sessionId);
   } catch (e) {
-    console.error('send error', e);
-    addToast('Send failed – please retry', 'error');
-    isProcessing = false; enableInput(true); hideTypingIndicator();
+    console.error('Create session failed:', e);
+    alert("Cannot create session");
   }
 }
 
-/* ---------- 11.  server messages ---------- */
-function handleServerMessage(d) {
-  switch (d.type) {
-    case 'status':
-      updateTypingIndicator(d.message); break;
-    case 'chunk':
-      if (!currentMessageEl) { hideWelcome(); currentMessageEl = createMessageElement('assistant'); }
-      appendToMessage(currentMessageEl, d.content);
-      scrollToBottom(true);
+async function selectSession(id) {
+  sessionId = id;
+  localStorage.setItem("orion:sessionId", id);
+  selectedSession.textContent = id;
+  closeWs();
+  await loadHistory();
+  clearSessionBtn.classList.remove("hidden");
+  sessionsDrawer.classList.add("translate-y-full");
+  console.log('Selected session:', id);
+}
+
+/* ---------- History ---------- */
+
+async function loadHistory() {
+  if (!sessionId) return;
+  messagesWrapper.innerHTML = "";
+  try {
+    const r = await fetch(`/api/history?session_id=${encodeURIComponent(sessionId)}`);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const d = await r.json();
+    if (!d.messages.length) {
+      messagesWrapper.innerHTML = `<div class="p-6 text-center text-gray-400">No messages yet. Start chatting!</div>`;
+      return;
+    }
+    d.messages.forEach(m => {
+      const role = m.role === "model" ? "assistant" : "user";
+      const text = (m.parts || []).map(p => p.text || "").join("\n");
+      if (role === "user") insertUserBubble(text);
+      else insertAssistantBubble(text);
+    });
+    scrollBottom();
+  } catch (e) {
+    console.error('Load history failed:', e);
+    messagesWrapper.innerHTML = `<div class="p-6 text-center text-red-400">Failed to load history</div>`;
+  }
+}
+
+/* ---------- Render Messages ---------- */
+
+function insertUserBubble(t) {
+  const r = document.createElement("div");
+  r.className = "message justify-end";
+  r.innerHTML = `
+    <div class="msg-bubble msg-user">${escapeHtml(t)}</div>
+    <div class="avatar bg-gray-700 ml-3 text-sm">You</div>`;
+  messagesWrapper.appendChild(r);
+  scrollBottom();
+}
+
+function insertAssistantBubble(md) {
+  const r = document.createElement("div");
+  r.className = "message";
+  r.innerHTML = `
+    <div class="avatar bg-gradient-to-br from-teal-500 to-indigo-600 mr-3">O</div>
+    <div class="msg-bubble msg-assistant message-content">${renderMarkdown(md)}</div>`;
+  messagesWrapper.appendChild(r);
+  scrollBottom();
+}
+
+function startStreamingBubble() {
+  streamingEl = document.createElement("div");
+  streamingEl.className = "message";
+  streamingEl.innerHTML = `
+    <div class="avatar bg-gradient-to-br from-teal-500 to-indigo-600 mr-3">O</div>
+    <div class="msg-bubble msg-assistant message-stream"></div>`;
+  messagesWrapper.appendChild(streamingEl);
+  streamBuffer = '';
+  scrollBottom();
+}
+
+function appendChunk(t) {
+  if (!streamingEl) startStreamingBubble();
+  streamBuffer += t;
+  const b = streamingEl.querySelector(".message-stream");
+  b.textContent = streamBuffer;
+  scrollBottom();
+}
+
+function finalizeStreaming() {
+  if (!streamingEl) return;
+  const b = streamingEl.querySelector(".message-stream");
+  b.innerHTML = renderMarkdown(streamBuffer);
+  streamingEl = null;
+  streamBuffer = '';
+  scrollBottom();
+}
+
+/* ---------- WebSocket ---------- */
+
+function closeWs() {
+  try {
+    if (ws) {
+      ws.close();
+      ws = null;
+    }
+  } catch (e) {
+    console.error('WS close error:', e);
+  }
+  wsOpen = false;
+  setStatus("Disconnected", "bg-red-500");
+}
+
+async function openWs() {
+  if (!sessionId) {
+    console.error('Cannot open WS: no sessionId');
+    return false;
+  }
+
+  closeWs();
+  
+  const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+  const wsUrl = `${protocol}//${location.host}/api/ws?session_id=${encodeURIComponent(sessionId)}`;
+  
+  console.log('Opening WebSocket:', wsUrl);
+
+  return new Promise((resolve, reject) => {
+    try {
+      ws = new WebSocket(wsUrl);
+      
+      ws.onopen = () => {
+        wsOpen = true;
+        reconnectAttempts = 0;
+        setStatus("Connected", "bg-teal-500");
+        console.log('WebSocket connected');
+        resolve(true);
+      };
+
+      ws.onmessage = e => {
+        try {
+          const msg = JSON.parse(e.data);
+          handleWsMessage(msg);
+        } catch (err) {
+          console.error("WS parse error:", err);
+        }
+      };
+
+      ws.onclose = () => {
+        wsOpen = false;
+        setStatus("Disconnected", "bg-red-500");
+        console.log('WebSocket closed');
+        
+        // Auto-reconnect if we were in the middle of something
+        if (isSending && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+          reconnectAttempts++;
+          console.log(`Reconnect attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS}`);
+          setTimeout(() => openWs(), 2000);
+        }
+      };
+
+      ws.onerror = err => {
+        console.error('WebSocket error:', err);
+        setStatus("Error", "bg-red-500");
+        reject(err);
+      };
+
+    } catch (err) {
+      console.error('Failed to create WebSocket:', err);
+      reject(err);
+    }
+  });
+}
+
+function handleWsMessage(m) {
+  console.log('WS message:', m.type);
+  
+  switch (m.type) {
+    case "status":
+      showTyping(m.content || "Processing...");
       break;
-    case 'tool_use':
-      if (d.tools?.length) showToolUse(d.tools); break;
-    case 'done':
-      hideTypingIndicator();
-      if (currentMessageEl) finalizeMessage(currentMessageEl);
-      currentMessageEl = null; isProcessing = false; enableInput(false);
-      scrollToBottom(true);
-      pendingFiles = []; filePreview.innerHTML = ''; updateFilePreview();
+    case "chunk":
+      if (m.content) {
+        showTyping();
+        appendChunk(m.content);
+      }
       break;
-    case 'error':
-      hideTypingIndicator(); addToast(`Error: ${d.error}`, 'error');
-      currentMessageEl = null; isProcessing = false; enableInput(true);
+    case "complete":
+      hideTyping();
+      finalizeStreaming();
+      isSending = false;
+      sendButton.disabled = false;
+      chatInput.disabled = false;
+      console.log('Message complete');
+      break;
+    case "error":
+      hideTyping();
+      alert("Server error: " + (m.error || 'Unknown error'));
+      isSending = false;
+      sendButton.disabled = false;
+      chatInput.disabled = false;
       break;
   }
 }
-function showToolUse(tools) {
-  if (!currentMessageEl) { hideWelcome(); currentMessageEl = createMessageElement('assistant'); }
-  const div = document.createElement('div');
-  div.className = 'text-xs text-gray-400 mt-2 p-2 bg-white/5 rounded border border-white/10';
-  div.innerHTML = `🔧 Using: **${tools.join(', ')}**`;
-  currentMessageEl.querySelector('.message-content').appendChild(div);
-  scrollToBottom(true);
-}
 
-/* ---------- 12.  message DOM ---------- */
-function createMessageElement(role) {
-  const isUser = role === 'user';
-  const wrap = document.createElement('div'); wrap.className = 'p-4 md:p-6';
-  const el = document.createElement('div'); el.className = 'flex items-start gap-4 max-w-4xl mx-auto';
-  el.innerHTML = `
-    <div class="w-8 h-8 flex-shrink-0 rounded-full flex items-center justify-center text-white ${isUser ? 'bg-gray-500' : 'bg-teal-600'}">
-      ${isUser ? '👤' : `<svg class="w-5 h-5" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09z"/></svg>`}
-    </div>
-    <div class="flex-1 min-w-0">
-      <h3 class="font-semibold mb-2">${isUser ? 'You' : 'Orion'}</h3>
-      <div class="message-content text-gray-200"></div>
-    </div>`;
-  wrap.appendChild(el); chatMessages.appendChild(wrap); return el;
-}
-function appendToMessage(el, txt) {
-  const content = el.querySelector('.message-content');
-  if (!content.dataset.streaming) { content.dataset.streaming = 'true'; content.dataset.rawContent = ''; }
-  content.dataset.rawContent += txt;
-  content.textContent = content.dataset.rawContent;
-}
-function finalizeMessage(el) {
-  const content = el.querySelector('.message-content');
-  const raw = content.dataset.rawContent || content.textContent;
-  content.innerHTML = marked.parse(raw);
-  content.querySelectorAll('pre code').forEach(b => hljs.highlightElement(b));
-  delete content.dataset.streaming; delete content.dataset.rawContent;
-}
-function addUserMessage(txt, scroll = true) {
-  const el = createMessageElement('user');
-  el.querySelector('.message-content').textContent = txt;
-  if (scroll) scrollToBottom(true);
-}
-function addAssistantMessage(txt, scroll = true) {
-  const el = createMessageElement('assistant');
-  el.querySelector('.message-content').innerHTML = marked.parse(txt);
-  el.querySelectorAll('pre code').forEach(b => hljs.highlightElement(b));
-  if (scroll) scrollToBottom(false);
-}
+/* ---------- Send Message ---------- */
 
-/* ---------- 13.  typing ---------- */
-function showTypingIndicator(msg = 'Thinking…') {
-  typingText.textContent = msg; typingIndicator.classList.remove('hidden'); scrollToBottom(true);
-}
-function updateTypingIndicator(msg) { typingText.textContent = msg; }
-function hideTypingIndicator() { typingIndicator.classList.add('hidden'); }
+async function sendMessage(t) {
+  if (!sessionId) {
+    alert("No session selected");
+    return;
+  }
 
-/* ---------- 14.  input lock ---------- */
-function disableInput() { userInput.disabled = true; sendButton.disabled = true; }
-function enableInput(focus = true) {
-  userInput.disabled = false; sendButton.disabled = false; if (focus) userInput.focus();
-}
+  if (isSending) {
+    console.log('Already sending, ignoring duplicate request');
+    return;
+  }
 
-/* ---------- 15.  scroll ---------- */
-function scrollToBottom(smooth = false) {
-  chatContainer?.scrollTo({top: chatContainer.scrollHeight, behavior: smooth ? 'smooth' : 'auto'});
-}
+  isSending = true;
+  sendButton.disabled = true;
+  chatInput.disabled = true;
 
-/* ---------- 16.  connection status ---------- */
-function updateConnectionStatus(txt, cls) {
-  $('status-indicator')?.classList?.replace(/bg-\w+-500/, cls);
-  $('status-text') && ($('status-text').textContent = txt);
-}
+  insertUserBubble(t || "(message)");
+  showTyping("Connecting...");
 
-/* ---------- 17.  toast ---------- */
-function addToast(msg, type = 'info') {
-  const colors = {error: 'bg-red-600', success: 'bg-teal-600', info: 'bg-blue-600'};
-  const t = document.createElement('div');
-  t.className = `fixed bottom-5 right-5 p-3 rounded-lg shadow-xl z-50 text-white text-sm transition transform translate-x-full opacity-0`;
-  t.classList.add(colors[type] || colors.info);
-  t.textContent = msg;
-  document.body.appendChild(t);
-  setTimeout(() => t.classList.remove('translate-x-full', 'opacity-0'), 10);
-  setTimeout(() => { t.classList.add('translate-x-full', 'opacity-0'); setTimeout(() => t.remove(), 300); }, 3000);
-}
-
-/* ---------- 18.  history ---------- */
-async function loadChatHistory() {
   try {
-    const r = await fetch('/api/history');
-    if (!r.ok) return;
-    const j = await r.json();
-    if (j.messages?.length) {
-      hideWelcome();
-      j.messages.forEach(m => {
-        const role = m.role === 'model' ? 'assistant' : 'user';
-        const text = m.parts?.filter(p => p.text).map(p => p.text).join('\n');
-        if (text) role === 'user' ? addUserMessage(text, false) : addAssistantMessage(text, false);
-      });
-      scrollToBottom(false);
+    // Ensure WebSocket is open
+    if (!wsOpen) {
+      console.log('Opening WebSocket connection...');
+      await openWs();
     }
-  } catch (e) { console.error('history', e); }
+
+    if (!wsOpen) {
+      throw new Error('Failed to establish WebSocket connection');
+    }
+
+    // Send message via WebSocket (use "user_message" to match DO)
+    console.log('Sending message via WebSocket');
+    ws.send(JSON.stringify({
+      type: "user_message",
+      content: t
+    }));
+
+    chatInput.value = "";
+    
+  } catch (e) {
+    console.error('Send failed:', e);
+    hideTyping();
+    alert("Failed to send message: " + e.message);
+    isSending = false;
+    sendButton.disabled = false;
+    chatInput.disabled = false;
+  }
 }
 
-/* ---------- 19.  clear ---------- */
-window.clearChat = async function() {
-  if (!confirm('Start a new chat? Conversation will be lost.')) return;
-  try {
-    const r = await fetch('/api/clear', {method: 'POST'});
-    if (r.ok) {
-      chatMessages.innerHTML = '';
-      pendingFiles = []; filePreview.innerHTML = ''; conversationStarted = false;
-      chatMessages.innerHTML = `
-        <div id="welcome-message" class="text-center py-20 px-4">
-          <div class="inline-block bg-gradient-to-br from-teal-500 to-blue-600 rounded-full p-3 mb-6 shadow-lg">
-            <svg class="w-10 h-10 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09z"/></svg>
-          </div>
-          <h2 class="text-3xl md:text-4xl font-bold text-white mb-4">How can I help you today?</h2>
-          <p class="text-gray-400 mb-8">I can search the web, execute code, analyze files, and help with complex tasks</p>
-          <div class="flex flex-wrap gap-2 justify-center max-w-2xl mx-auto">
-            <button onclick="useSuggestion(this)" class="px-4 py-2 bg-white/5 hover:bg-white/10 rounded-full text-sm transition-colors">What's Bitcoin's price? 💰</button>
-            <button onclick="useSuggestion(this)" class="px-4 py-2 bg-white/5 hover:bg-white/10 rounded-full text-sm transition-colors">Analyze this dataset 📊</button>
-            <button onclick="useSuggestion(this)" class="px-4 py-2 bg-white/5 hover:bg-white/10 rounded-full text-sm transition-colors">Write Python code 💻</button>
-            <button onclick="useSuggestion(this)" class="px-4 py-2 bg-white/5 hover:bg-white/10 rounded-full text-sm transition-colors">Latest AI news 🔍</button>
-          </div>
-        </div>`;
-      window.welcomeScreen = $('welcome-message');
-      addToast('Chat cleared', 'success');
-    }
-  } catch (e) { console.error('clear', e); addToast('Failed to clear chat', 'error'); }
+/* ---------- Events ---------- */
+
+chatForm.onsubmit = e => {
+  e.preventDefault();
+  const t = chatInput.value.trim();
+  if (!t) return;
+  sendMessage(t);
 };
 
-/* ---------- 20.  suggestions ---------- */
-window.useSuggestion = function(el) {
-  const txt = el.textContent.trim().replace(/[\uD800-\uDBFF\uDC00-\uDFFF].*$/g, '').trim();
-  userInput.value = txt;
-  userInput.style.height = 'auto';
-  userInput.style.height = Math.min(userInput.scrollHeight, 200) + 'px';
-  userInput.focus();
+newSessionBtn.onclick = () => createSession(false);
+openDrawerBtn.onclick = () => sessionsDrawer.classList.remove("translate-y-full");
+closeDrawerBtn.onclick = () => sessionsDrawer.classList.add("translate-y-full");
+
+clearSessionBtn.onclick = async () => {
+  if (!sessionId) return;
+  if (!confirm("Clear conversation?")) return;
+  try {
+    await fetch(`/api/clear?session_id=${encodeURIComponent(sessionId)}`, { 
+      method: "POST" 
+    });
+    messagesWrapper.innerHTML = "";
+    console.log('Conversation cleared');
+  } catch (e) {
+    console.error('Clear failed:', e);
+    alert('Failed to clear conversation');
+  }
 };
 
-/* ---------- 21.  welcome ---------- */
-function hideWelcome() {
-  if (!conversationStarted) { welcomeScreen?.classList.add('hidden'); conversationStarted = true; }
-}
+/* ---------- Init ---------- */
 
-/* ---------- 22.  geo stub (optional) ---------- */
-/*  if you actually need LBS, implement the real call here  */
-window.getCurrentPosition = async () => ({lat: 0, lon: 0, addr: 'Earth'});
+(async function init() {
+  console.log('Initializing Orion Chat...');
+  setStatus("Disconnected", "bg-red-500");
+  
+  await loadSessions();
+  
+  if (sessionId) {
+    console.log('Restoring session:', sessionId);
+    selectedSession.textContent = sessionId;
+    await loadHistory();
+    clearSessionBtn.classList.remove("hidden");
+  } else {
+    console.log('Creating new session...');
+    await createSession(true);
+  }
+  
+  console.log('Initialization complete');
+})();
